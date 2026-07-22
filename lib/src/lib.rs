@@ -25,6 +25,7 @@ pub struct RPCConfig {
   pub enable_ipc_connector: bool,
   pub enable_websocket_connector: bool,
   pub enable_secondary_events: bool,
+  pub port: u16,
 }
 
 impl Default for RPCConfig {
@@ -34,6 +35,7 @@ impl Default for RPCConfig {
       enable_ipc_connector: true,
       enable_websocket_connector: true,
       enable_secondary_events: true,
+      port: 1337,
     }
   }
 }
@@ -177,7 +179,7 @@ impl RPCServer {
         },
       ))),
       client_connector: Arc::new(Mutex::new(ClientConnector::new(
-        1337,
+        self.config.port,
         server::utils::CONNECTION_REPONSE.to_string(),
         ipc_event_receiver,
         proc_event_receiver,
