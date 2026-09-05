@@ -38,7 +38,7 @@ jobs:
           components: rustfmt
 
       - name: Rustfmt check
-        run: cargo fmt --manifest-path ./Cargo.toml --workspace -- --check
+        run: cargo fmt --manifest-path ./Cargo.toml --all -- --check
 
   clippy:
     runs-on: ${{ matrix.platform }}

@@ -2,9 +2,8 @@
   <h1>rsRPC</h1>
 
   <div align="center">
-    <img src="https://img.shields.io/github/actions/workflow/status/SpikeHD/rsRPC/build.yml" />
-    <img src="https://img.shields.io/github/actions/workflow/status/SpikeHD/rsRPC/code_quality.yml?label=code quality" />
-    <img src="https://img.shields.io/github/repo-size/SpikeHD/rsRPC" />
+    <img src="https://img.shields.io/github/actions/workflow/status/yiesko/rsRPC/build.yml" />
+    <img src="https://img.shields.io/github/repo-size/yiesko/rsRPC" />
   </div>
   <p>Alternative Discord RPC server CLI tool and Rust library, inspired by <a href="https://github.com/OpenAsar/arRPC">arRPC</a></p>
 </div>
