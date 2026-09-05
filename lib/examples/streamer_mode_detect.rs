@@ -1,8 +1,12 @@
 use rsrpc::RPCConfig;
 
 pub fn main() {
-  // When running as a binary, enable logs
-  std::env::set_var("RSRPC_LOGS_ENABLED", "1");
+  // When running as a binary, enable logs.
+  // SAFETY: called on the main thread at startup, before any other thread
+  // exists, so no concurrent environment access can occur.
+  unsafe {
+    std::env::set_var("RSRPC_LOGS_ENABLED", "1");
+  }
 
   // Create new client and stuff
   let mut client = rsrpc::RPCServer::from_json_str(

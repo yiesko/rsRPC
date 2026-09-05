@@ -8,16 +8,28 @@ use server::{
 };
 use std::{
   path::PathBuf,
-  sync::{mpsc, Arc, Mutex},
+  sync::{Arc, Mutex, mpsc},
 };
 
 pub mod cmd;
+pub mod commands;
 pub mod detection;
 mod logger;
 mod server;
 mod url_params;
 
+#[cfg(test)]
+mod tests;
+
 pub type ProcessCallback = dyn FnMut(ProcessScanState) + Send + Sync;
+
+/// Minimal game info returned by [`RPCServer::detect_once`].
+#[derive(Clone, Debug)]
+pub struct DetectedGame {
+  pub id: String,
+  pub name: String,
+  pub pid: Option<u64>,
+}
 
 #[derive(Clone, Debug)]
 pub struct RPCConfig {
@@ -26,6 +38,12 @@ pub struct RPCConfig {
   pub enable_websocket_connector: bool,
   pub enable_secondary_events: bool,
   pub port: u16,
+  pub msgpack_port: u16,
+  pub ws_port_start: u16,
+  pub ws_port_end: u16,
+  pub scan_interval_secs: u64,
+  pub db_url: Option<String>,
+  pub enable_db_update: bool,
 }
 
 impl Default for RPCConfig {
@@ -36,6 +54,12 @@ impl Default for RPCConfig {
       enable_websocket_connector: true,
       enable_secondary_events: true,
       port: 1337,
+      msgpack_port: 1338,
+      ws_port_start: 6463,
+      ws_port_end: 6472,
+      scan_interval_secs: 5,
+      db_url: None,
+      enable_db_update: false,
     }
   }
 }
@@ -88,6 +112,46 @@ impl RPCServer {
       .unwrap_or_else(|_| panic!("RPCServer could not find file: {:?}", file.display()));
 
     Self::from_json_str(detectable.as_str(), config)
+  }
+
+  /**
+   * Create a new RPCServer using the bundled snapshot of Discord's detectable
+   * games database. This works fully offline.
+   */
+  pub fn from_bundled(config: RPCConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    Self::from_json_str(detection::BUNDLED_DETECTABLE, config)
+  }
+
+  /**
+   * Run a single process scan without starting any threads/connectors.
+   * Used by `--list-detected` diagnostics (main DB only; custom overrides
+   * require a running server via `append_detectables`).
+   */
+  pub fn detect_once(&self) -> Result<Vec<DetectedGame>, Box<dyn std::error::Error>> {
+    let (tx, _rx) = mpsc::channel();
+    let server = ProcessServer::new(
+      self
+        .detectable
+        .lock()
+        .map_err(|e| format!("detectable lock poisoned: {e}"))?
+        .to_vec(),
+      tx,
+      ProcessEventListeners::default(),
+      None,
+      false,
+    );
+
+    Ok(
+      server
+        .scan_for_processes()?
+        .iter()
+        .map(|a| DetectedGame {
+          id: a.id.clone(),
+          name: a.name.clone(),
+          pid: a.pid,
+        })
+        .collect(),
+    )
   }
 
   /**
@@ -177,21 +241,32 @@ impl RPCServer {
         ProcessEventListeners {
           on_process_scan_complete: self.on_process_scan_complete.clone(),
         },
+        self.config.db_url.clone(),
+        self.config.enable_db_update,
       ))),
       client_connector: Arc::new(Mutex::new(ClientConnector::new(
         self.config.port,
+        self.config.msgpack_port,
         server::utils::CONNECTION_REPONSE.to_string(),
         ipc_event_receiver,
         proc_event_receiver,
         ws_event_reciever,
       ))),
       ipc_connector: Arc::new(Mutex::new(IpcConnector::new(ipc_event_sender))),
-      ws_connector: Arc::new(Mutex::new(WebsocketConnector::new(ws_event_sender))),
+      ws_connector: Arc::new(Mutex::new(WebsocketConnector::new(
+        ws_event_sender,
+        self.config.ws_port_start,
+        self.config.ws_port_end,
+      ))),
     };
 
     log!(
       "[RPC Server] Starting client connector on port {}...",
       connectors.client_connector.lock().unwrap().port
+    );
+    log!(
+      "[RPC Server] MessagePack bridge on port {}",
+      connectors.client_connector.lock().unwrap().msgpack_port
     );
     connectors.client_connector.lock().unwrap().start();
 
@@ -204,7 +279,11 @@ impl RPCServer {
 
     if config.enable_process_scanner {
       log!("[RPC Server] Starting process server...");
-      connectors.process_server.lock().unwrap().start();
+      connectors
+        .process_server
+        .lock()
+        .unwrap()
+        .start(std::time::Duration::from_secs(config.scan_interval_secs));
     }
 
     if config.enable_websocket_connector || config.enable_secondary_events {

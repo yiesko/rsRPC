@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use crate::cmd::ActivityCmd;
 use crate::log;
 
-use super::ipc_utils::{handle_stream, IpcFacilitator};
+use super::ipc_utils::{IpcFacilitator, handle_stream};
 
 #[derive(Clone)]
 pub struct IpcConnector {

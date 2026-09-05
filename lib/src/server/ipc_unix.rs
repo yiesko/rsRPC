@@ -4,14 +4,14 @@ use interprocess::local_socket::{
 };
 use std::env;
 use std::io::ErrorKind;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
 use crate::cmd::ActivityCmd;
 use crate::log;
 
-use super::ipc_utils::{handle_stream, IpcFacilitator};
+use super::ipc_utils::{IpcFacilitator, handle_stream};
 
 fn get_socket_path() -> String {
   let xdg_runtime_dir = env::var("XDG_RUNTIME_DIR").unwrap_or_default();

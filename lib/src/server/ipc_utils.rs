@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::{
   cmd::{ActivityCmd, ActivityCmdArgs},
-  log,
+  commands, log,
   server::utils,
 };
 
@@ -82,7 +82,10 @@ pub fn send_empty(
 ) -> Result<(), mpsc::SendError<ActivityCmd>> {
   log!("[IPC] Sending empty activity");
 
+  // NOTE: cmd MUST be SET_ACTIVITY — event_loop routes anything else to
+  // broadcast_raw, which would silently drop the clear (stuck presence).
   let activity = ActivityCmd {
+    cmd: "SET_ACTIVITY".to_string(),
     args: Some(ActivityCmdArgs {
       activity: None,
       code: None,
@@ -159,7 +162,22 @@ pub fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut Stream) {
 
         if data.v != 1 {
           log!("[IPC] Invalid version: {}", data.v);
-          continue;
+          let resp = encode(
+            PacketType::Close,
+            r#"{"code":4004,"message":"Invalid version"}"#,
+          );
+          let _ = stream.write_all(&resp);
+          break;
+        }
+
+        if data.client_id.is_empty() {
+          log!("[IPC] Invalid client_id (empty)");
+          let resp = encode(
+            PacketType::Close,
+            r#"{"code":4000,"message":"Invalid client_id"}"#,
+          );
+          let _ = stream.write_all(&resp);
+          break;
         }
 
         ipc.set_handshake(true);
@@ -204,7 +222,7 @@ pub fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut Stream) {
         ipc.set_pid(args.pid.unwrap_or_default());
         ipc.set_nonce(activity_cmd.nonce.to_string());
 
-        match ipc.event_sender().send(activity_cmd) {
+        match ipc.event_sender().send(activity_cmd.clone()) {
           Ok(_) => (),
           Err(err) => log!("[IPC] Error sending activity command: {}", err),
         }
@@ -212,8 +230,11 @@ pub fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut Stream) {
         // "IPC will echo back every command you send as a response.
         //  Use this as a lock-step feature to avoid flooding messages.
         //  Can be used to validate messages such as the Presence or Subscribes."
-        // XXX: arRPC does some editing of the message, setting data.name: "", data.type: 0, evt: null etc... why?
-        let resp = encode(PacketType::Frame, &message);
+        // Echo arRPC-style, with data.name: "", data.type: 0 etc. so RPC
+        // libraries (e.g. pypresence) don't break on the response.
+        activity_cmd.fix();
+        let response = commands::set_activity_response(&activity_cmd).unwrap_or(message);
+        let resp = encode(PacketType::Frame, &response);
 
         match stream.write_all(&resp) {
           Ok(_) => (),

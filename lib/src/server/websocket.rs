@@ -1,18 +1,20 @@
 use std::{
   collections::HashMap,
-  sync::{mpsc, Arc, Mutex},
+  sync::{Arc, Mutex, mpsc},
 };
 
+use serde_json::Value;
 use simple_websockets::{Event, EventHub, Message, Responder};
 
 use crate::{
   cmd::{ActivityCmd, ActivityCmdArgs},
-  log,
+  commands, log,
   server::utils::CONNECTION_REPONSE,
   url_params::get_url_params,
 };
 
-type ActivityResponder = (Option<ActivityCmd>, Responder);
+// (last activity, client_id from the connect query, responder)
+type ActivityResponder = (Option<ActivityCmd>, Option<String>, Responder);
 
 #[derive(Clone)]
 pub struct WebsocketConnector {
@@ -23,10 +25,23 @@ pub struct WebsocketConnector {
 }
 
 impl WebsocketConnector {
-  pub fn new(event_sender: mpsc::Sender<ActivityCmd>) -> Self {
-    // Try starting websocket server on ports 6463 - 6472
-    for port in 6463..6472 {
-      match simple_websockets::launch(port) {
+  pub fn new(
+    event_sender: mpsc::Sender<ActivityCmd>,
+    ws_port_start: u16,
+    ws_port_end: u16,
+  ) -> Self {
+    // Try starting websocket server on the configured range, bound to
+    // loopback only (games always connect to 127.0.0.1).
+    for port in ws_port_start..=ws_port_end {
+      let listener = match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(listener) => listener,
+        Err(_) => {
+          log!("[Websocket] Failed to start server on port {}", port);
+          continue;
+        }
+      };
+
+      match simple_websockets::launch_from_listener(listener) {
         Ok(server) => {
           log!("[Websocket] Server started on port {}", port);
           return Self {
@@ -70,21 +85,33 @@ impl WebsocketConnector {
               .get("encoding")
               .unwrap_or(&"json".to_string())
               .clone();
+            let ws_client_id = url_params.get("client_id").cloned();
 
             log!("[Websocket] Client {} connected", client_id);
 
             if version != "1" || encoding != "json" {
-              log!("[Websocket] Invalid connection from client {}", client_id);
+              log!(
+                "[Websocket] Invalid connection from client {} (v={}, encoding={}), closing",
+                client_id,
+                version,
+                encoding
+              );
+              responder.close();
               continue;
             }
 
             responder.send(Message::Text(CONNECTION_REPONSE.to_string()));
 
-            clients.insert(client_id, (None, responder));
+            clients.insert(client_id, (None, ws_client_id, responder));
           }
           Event::Disconnect(client_id) => {
             log!("[Websocket] Client {} disconnected", client_id);
-            let responder = clients.remove(&client_id).unwrap();
+            let responder = match clients.remove(&client_id) {
+              Some(responder) => responder,
+              // A client that was never inserted (invalid handshake) was
+              // closed directly, nothing to clean up.
+              None => continue,
+            };
 
             handle_disconnect(client_id, &event_sender, &responder);
           }
@@ -95,7 +122,10 @@ impl WebsocketConnector {
               message
             );
 
-            let responder = clients.get_mut(&client_id).unwrap();
+            let responder = match clients.get_mut(&client_id) {
+              Some(responder) => responder,
+              None => continue,
+            };
             let message = match message {
               Message::Text(text) => text,
               _ => "".to_string(),
@@ -112,7 +142,7 @@ impl WebsocketConnector {
             };
 
             // If origin isn't a Discord URL, ignore
-            let origin = responder.1.connection_details().headers.get("origin");
+            let origin = responder.2.connection_details().headers.get("origin");
 
             if let Some(origin) = origin {
               let value = origin.to_str().unwrap_or_default();
@@ -129,22 +159,21 @@ impl WebsocketConnector {
             }
 
             match event.cmd.as_str() {
-              "INVITE_BROWSER" => {
+              "INVITE_BROWSER" | "GUILD_TEMPLATE_BROWSER" => {
                 if !secondary_events {
                   continue;
                 }
 
-                handle_invite(&event, &event_sender, &responder.1)
+                handle_browser_command(&event, &event_sender, &responder.2)
               }
+              "DEEP_LINK" => handle_deep_link(&event, &responder.2),
+              "CONNECTIONS_CALLBACK" => handle_connections_callback(&event, &responder.2),
               "SET_ACTIVITY" => {
                 if !set_activity {
                   continue;
                 }
 
                 handle_set_activity(&event, &event_sender, responder)
-              }
-              "DEEP_LINK" => {
-                log!("[Websocket] Deep link unimplemented. PRs are open!");
               }
               _ => {
                 log!("[Websocket] Unknown command: {}", event.cmd);
@@ -157,18 +186,21 @@ impl WebsocketConnector {
   }
 }
 
-fn event_args_as_hashmap(args: Option<ActivityCmdArgs>) -> HashMap<String, String> {
+fn event_args_as_hashmap(args: Option<ActivityCmdArgs>) -> HashMap<String, Value> {
   // Serde serialize the args
   let args = match args {
-    Some(args) => serde_json::to_string(&args).unwrap_or("".to_string()),
-    None => "{}".to_string(),
+    Some(args) => serde_json::to_value(&args).unwrap_or(Value::Null),
+    None => Value::Null,
   };
 
-  // Re-deserialize the args as a hashmap
-  serde_json::from_str::<HashMap<String, String>>(&args).unwrap_or_default()
+  // Re-deserialize the args as a hashmap, preserving value types
+  match args {
+    Value::Object(map) => map.into_iter().collect(),
+    _ => HashMap::new(),
+  }
 }
 
-fn handle_invite(
+fn handle_browser_command(
   event: &ActivityCmd,
   event_sender: &mpsc::Sender<ActivityCmd>,
   responder: &Responder,
@@ -190,15 +222,61 @@ fn handle_invite(
   responder.send(Message::Text(serde_json::to_string(&response).unwrap()));
 }
 
+fn handle_deep_link(event: &ActivityCmd, responder: &Responder) {
+  let response = ActivityCmd {
+    application_id: event.application_id.clone(),
+    cmd: event.cmd.clone(),
+    args: None,
+    data: None,
+    evt: None,
+    nonce: event.nonce.clone(),
+  };
+
+  responder.send(Message::Text(serde_json::to_string(&response).unwrap()));
+}
+
+fn handle_connections_callback(event: &ActivityCmd, responder: &Responder) {
+  let mut data = HashMap::new();
+  data.insert("code".to_string(), Value::Number(1000.into()));
+
+  let response = ActivityCmd {
+    application_id: event.application_id.clone(),
+    cmd: event.cmd.clone(),
+    args: None,
+    data: Some(data),
+    evt: Some("ERROR".to_string()),
+    nonce: event.nonce.clone(),
+  };
+
+  responder.send(Message::Text(serde_json::to_string(&response).unwrap()));
+}
+
 fn handle_set_activity(
   event: &ActivityCmd,
   event_sender: &mpsc::Sender<ActivityCmd>,
   responder: &mut ActivityResponder,
 ) {
+  // Fall back to the client_id provided on connect (query param) when the
+  // command itself does not carry an application_id.
+  let mut event = event.clone();
+  if event.application_id.is_none() {
+    event.application_id = responder.1.clone();
+  }
+
+  // Apply field fixes so the confirmation reply carries labels/urls (fix is
+  // idempotent, so the event_loop applying it again is harmless).
+  event.fix();
+
   // Set the last activity for the client
   responder.0 = Some(event.clone());
 
   event_sender.send(event.clone()).unwrap();
+
+  // Confirm to the game client (arRPC-shaped reply); some RPC libraries
+  // wait for this before considering the presence set.
+  if let Some(response) = commands::set_activity_response(&event) {
+    responder.2.send(Message::Text(response));
+  }
 }
 
 fn handle_disconnect(

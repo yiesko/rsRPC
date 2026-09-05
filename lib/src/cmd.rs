@@ -18,7 +18,7 @@ pub struct ActivityCmd {
   pub application_id: Option<String>,
   pub cmd: String,
   pub args: Option<ActivityCmdArgs>,
-  pub data: Option<HashMap<String, String>>,
+  pub data: Option<HashMap<String, Value>>,
   pub evt: Option<String>,
   pub nonce: Value,
 }
@@ -74,36 +74,46 @@ impl ActivityCmd {
 
   pub fn fix_buttons(&mut self) {
     // If `buttons` are an array of objects, we need to map the labels to `buttons` (as a string array) and the urls to `metadata.button_urls` (as an array of strings)
-    if let Some(activity) = self.args.as_mut().and_then(|args| args.activity.as_mut()) {
-      if let Some(buttons) = activity.buttons.as_mut() {
-        let mut button_urls: Vec<String> = vec![];
-        let mut button_labels: Vec<Value> = vec![];
+    if let Some(activity) = self.args.as_mut().and_then(|args| args.activity.as_mut())
+      && let Some(buttons) = activity.buttons.as_mut()
+    {
+      let mut button_urls: Vec<String> = vec![];
+      let mut button_labels: Vec<Value> = vec![];
 
-        for b in buttons {
-          if let Some(label) = b.get("label") {
-            // Unless the provider of the actvity REALLY screwed up, we can safely assume this is a string
-            button_labels.push(label.clone());
+      for b in buttons.iter() {
+        match b {
+          // Already a plain label, keep it as-is
+          Value::String(_) => button_labels.push(b.clone()),
+          Value::Object(map) => {
+            if let Some(label) = map.get("label") {
+              button_labels.push(label.clone());
+            }
+            if let Some(url) = map.get("url").and_then(|url| url.as_str()) {
+              button_urls.push(url.to_string());
+            }
           }
-          if let Some(url) = b.get("url") {
-            button_urls.push(url.as_str().unwrap_or("").to_string());
-          }
+          other => button_labels.push(other.clone()),
         }
+      }
 
+      // Only attach metadata when there are actual urls to attach
+      if !button_urls.is_empty() {
         activity.metadata = Some(Metadata {
           button_urls: Some(button_urls),
           ..activity.metadata.clone().unwrap_or_default()
         });
-
-        activity.buttons = Some(button_labels);
       }
+
+      activity.buttons = Some(button_labels);
     }
   }
 
   pub fn fix_flags(&mut self) {
-    if let Some(activity) = self.args.as_mut().and_then(|args| args.activity.as_mut()) {
-      if activity.instance.unwrap_or(false) && activity.flags.is_none() {
-        activity.flags = Some(1);
-      }
+    if let Some(activity) = self.args.as_mut().and_then(|args| args.activity.as_mut())
+      && activity.instance.unwrap_or(false)
+      && activity.flags.is_none()
+    {
+      activity.flags = Some(1);
     }
   }
 }
@@ -189,7 +199,7 @@ pub struct Activity {
 
 #[skip_serializing_none]
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
-pub struct TimeoutValue(i64);
+pub struct TimeoutValue(pub(crate) i64);
 
 #[skip_serializing_none]
 #[derive(Clone, Serialize, Deserialize, Debug)]

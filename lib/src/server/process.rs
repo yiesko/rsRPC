@@ -1,16 +1,17 @@
 use aho_corasick::{AhoCorasick, PatternID};
-use std::sync::atomic::AtomicBool;
-use std::sync::mpsc;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc;
 use std::time::Duration;
 use std::vec;
 
 #[cfg(not(target_os = "linux"))]
 use sysinfo::System;
 
-use crate::log;
 use crate::ProcessCallback;
+use crate::log;
 
 use super::super::DetectableActivity;
 
@@ -29,6 +30,9 @@ pub struct Exec {
   pid: u64,
   path: String,
   arguments: Option<String>,
+  /// Steam AppId from `/proc/<pid>/environ` (`SteamAppId=...`), set by the
+  /// Steam client / Proton for games it launches (incl. non-Steam shortcuts).
+  steam_app_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -48,10 +52,21 @@ pub struct ProcessServer {
   custom_detectable_indexes: Arc<Mutex<Vec<[usize; 2]>>>,
   custom_detectable_ac: Arc<Mutex<Option<AhoCorasick>>>,
 
-  pub detectable_list: Vec<Arc<DetectableActivity>>,
+  pub detectable_list: Arc<Mutex<Vec<Arc<DetectableActivity>>>>,
+  /// Steam AppId (`third_party_skus` distributor `steam`) -> activity index.
+  /// Lets us detect store games whose DB entry ships empty `executables`.
+  steam_map: Arc<Mutex<HashMap<String, usize>>>,
+  /// Normalized game name -> activity index, for the conservative exe-stem
+  /// fallback (exact, multi-word names only, e.g. `how to fish`).
+  name_map: Arc<Mutex<HashMap<String, usize>>>,
   pub event_sender: mpsc::Sender<ProcessDetectedEvent>,
 
   event_listeners: Arc<Mutex<ProcessEventListeners>>,
+
+  /// Source URL for the detectable games database (auto-refresh).
+  db_url: Option<String>,
+  /// Refresh the detectable games database periodically when set.
+  enable_db_update: bool,
 
   #[cfg(not(target_os = "linux"))]
   sysinfo: Arc<Mutex<System>>,
@@ -64,16 +79,21 @@ impl ProcessServer {
     detectable: Vec<Arc<DetectableActivity>>,
     event_sender: mpsc::Sender<ProcessDetectedEvent>,
     event_listeners: ProcessEventListeners,
+    db_url: Option<String>,
+    enable_db_update: bool,
   ) -> Self {
     log!("[Process Scanner] Building Aho-Corasick patterns for main detectable activities...");
     let (ac, idx) = build_ac_patterns(&detectable);
+    let (steam_map, name_map) = build_aux_maps(&detectable);
     log!("[Process Scanner] Done!");
 
     ProcessServer {
       scanning: Arc::new(AtomicBool::new(false)),
       detected_list: Arc::new(Mutex::new(vec![])),
       custom_detectables: Arc::new(Mutex::new(vec![])),
-      detectable_list: detectable,
+      detectable_list: Arc::new(Mutex::new(detectable)),
+      steam_map: Arc::new(Mutex::new(steam_map)),
+      name_map: Arc::new(Mutex::new(name_map)),
       event_sender,
 
       // Aho-Corasick matching with detectables mapping
@@ -85,6 +105,10 @@ impl ProcessServer {
       // Event listeners
       event_listeners: Arc::new(Mutex::new(event_listeners)),
 
+      // Detectable database auto-refresh
+      db_url,
+      enable_db_update,
+
       // sysinfo System
       #[cfg(not(target_os = "linux"))]
       sysinfo: Arc::new(Mutex::new(System::new())),
@@ -93,13 +117,31 @@ impl ProcessServer {
 
   fn update_custom_detectables(&self) {
     log!("[Process Scanner] Updating Aho-Corasick patterns for custom detectable activities...");
-    let (ac, idx) = build_ac_patterns(&self.custom_detectables.lock().unwrap());
+    let (ac, idx) = build_ac_patterns_allow_all_os(&self.custom_detectables.lock().unwrap());
     if !idx.is_empty() {
       *self.custom_detectable_ac.lock().unwrap() = Some(ac);
     } else {
       *self.custom_detectable_ac.lock().unwrap() = None;
     }
     *self.custom_detectable_indexes.lock().unwrap() = idx;
+    log!("[Process Scanner] Done!");
+  }
+
+  /**
+   * Replace the main detectable games database at runtime (used by the
+   * periodic refresh), rebuilding the Aho-Corasick automaton.
+   */
+  fn update_main_detectables(&self, detectable: Vec<DetectableActivity>) {
+    log!("[Process Scanner] Rebuilding Aho-Corasick patterns for main detectable activities...");
+    let detectable: Vec<Arc<DetectableActivity>> = detectable.into_iter().map(Arc::new).collect();
+    let (ac, idx) = build_ac_patterns(&detectable);
+    let (steam_map, name_map) = build_aux_maps(&detectable);
+
+    *self.detectable_list.lock().unwrap() = detectable;
+    *self.detectable_ac.lock().unwrap() = ac;
+    *self.detectable_indexes.lock().unwrap() = idx;
+    *self.steam_map.lock().unwrap() = steam_map;
+    *self.name_map.lock().unwrap() = name_map;
     log!("[Process Scanner] Done!");
   }
 
@@ -122,11 +164,31 @@ impl ProcessServer {
     self.update_custom_detectables();
   }
 
-  pub fn start(&self) {
-    let wait_time = Duration::from_secs(10);
+  pub fn start(&self, scan_interval: Duration) {
+    let wait_time = scan_interval;
     let clone = self.clone();
 
     self.update_custom_detectables();
+
+    // Periodically refresh the detectable games database (like pog5-rsrpc)
+    if clone.enable_db_update && clone.db_url.is_some() {
+      let db_clone = clone.clone();
+      std::thread::spawn(move || {
+        loop {
+          let url = db_clone.db_url.clone().unwrap();
+          match fetch_detectable(&url) {
+            Ok(detectable) => db_clone.update_main_detectables(detectable),
+            Err(err) => {
+              log!(
+                "[Process Scanner] Error updating detectable database: {}",
+                err
+              );
+            }
+          }
+          std::thread::sleep(Duration::from_secs(3600));
+        }
+      });
+    }
 
     std::thread::spawn(move || {
       // Run the process scan repeatedly (every 3 seconds)
@@ -246,6 +308,8 @@ impl ProcessServer {
             .collect::<Vec<_>>()
             .join(" ")
         }),
+        // sysinfo doesn't expose environ here; Steam matching is Linux-only for now
+        steam_app_id: None,
       });
     }
 
@@ -270,28 +334,29 @@ impl ProcessServer {
       let entry = entry?;
       let path = entry.path();
 
-      if let Ok(cmdline) = fs::read_to_string(path.join("cmdline")) {
-        if !cmdline.is_empty() {
-          let mut cmd_iter = cmdline.split('\0');
-          let (cmd_path, cmd_args) = (
-            cmd_iter.next().unwrap_or("").to_string(),
-            cmd_iter.collect::<Vec<_>>().join(" "),
-          );
-          processes.push(Exec {
-            pid: path
-              .file_name()
-              .ok_or("Invalid path")?
-              .to_str()
-              .ok_or("Invalid path")?
-              .parse::<u64>()?,
-            path: cmd_path,
-            arguments: if cmd_args.is_empty() {
-              None
-            } else {
-              Some(cmd_args)
-            },
-          });
-        }
+      if let Ok(cmdline) = fs::read_to_string(path.join("cmdline"))
+        && !cmdline.is_empty()
+      {
+        let mut cmd_iter = cmdline.split('\0');
+        let (cmd_path, cmd_args) = (
+          cmd_iter.next().unwrap_or("").to_string(),
+          cmd_iter.collect::<Vec<_>>().join(" "),
+        );
+        processes.push(Exec {
+          pid: path
+            .file_name()
+            .ok_or("Invalid path")?
+            .to_str()
+            .ok_or("Invalid path")?
+            .parse::<u64>()?,
+          path: cmd_path,
+          arguments: if cmd_args.is_empty() {
+            None
+          } else {
+            Some(cmd_args)
+          },
+          steam_app_id: read_steam_app_id(&path),
+        });
       }
     }
 
@@ -315,8 +380,18 @@ impl ProcessServer {
 
     let mut obs_open = false;
 
-    let ac = self.detectable_ac.lock().unwrap();
-    let custom_ac = self.custom_detectable_ac.lock().unwrap();
+    let ac = self
+      .detectable_ac
+      .lock()
+      .map_err(|e| format!("detectable_ac lock poisoned: {e}"))?;
+    let custom_ac = self
+      .custom_detectable_ac
+      .lock()
+      .map_err(|e| format!("custom_detectable_ac lock poisoned: {e}"))?;
+    let detectable_list = self
+      .detectable_list
+      .lock()
+      .map_err(|e| format!("detectable_list lock poisoned: {e}"))?;
 
     let mut reversed_path = String::with_capacity(256);
 
@@ -338,68 +413,83 @@ impl ProcessServer {
           obs_open = true;
         }
 
-        // Aho-Corasick matching
-        reversed_path.clear();
-        reversed_path.extend(process_path.chars().rev());
+        // Aho-Corasick matching against the path and its 64-bit-stripped
+        // variants (so `wow64.exe` also matches a `wow.exe` pattern, like
+        // arrpc/pog5-rsrpc).
+        let mut found: Option<(Arc<DetectableActivity>, usize)> = None;
+        'variants: for variant in path_variants(&process_path) {
+          reversed_path.clear();
+          reversed_path.extend(variant.chars().rev());
 
-        let (obj, exe_index) = if let Some(mat) = ac.find(&reversed_path) {
-          let pattern_id: PatternID = mat.pattern();
-          let exe_index = self.detectable_indexes.lock().unwrap()[pattern_id.as_usize()];
-          (&self.detectable_list[exe_index[0]], exe_index[1])
-        } else if let Some(custom_ac) = custom_ac.as_ref() {
-          if let Some(mat) = custom_ac.find(&reversed_path) {
+          if let Some(mat) = ac.find(&reversed_path) {
+            let pattern_id: PatternID = mat.pattern();
+            let exe_index = self.detectable_indexes.lock().unwrap()[pattern_id.as_usize()];
+            found = Some((detectable_list[exe_index[0]].clone(), exe_index[1]));
+          } else if let Some(custom_ac) = custom_ac.as_ref()
+            && let Some(mat) = custom_ac.find(&reversed_path)
+          {
             let pattern_id: PatternID = mat.pattern();
             let exe_index = self.custom_detectable_indexes.lock().unwrap()[pattern_id.as_usize()];
-            (
-              &self.custom_detectables.lock().unwrap()[exe_index[0]],
+            found = Some((
+              self.custom_detectables.lock().unwrap()[exe_index[0]].clone(),
               exe_index[1],
-            )
-          } else {
-            return None;
+            ));
           }
-        } else {
-          return None;
+
+          if found.is_some() {
+            break 'variants;
+          }
+        }
+
+        // No executable-name hit: try Steam AppId, then the conservative
+        // exe-stem == game-name fallback. Both cover DB entries that ship
+        // empty `executables` (e.g. How to Fish) with no overrides.json.
+        let (obj, exe_index) = match found {
+          Some(found) => found,
+          None => {
+            return match_aux_process(
+              &process_path,
+              process.steam_app_id.as_deref(),
+              process.pid,
+              &self.steam_map,
+              &self.name_map,
+              &detectable_list,
+            );
+          }
         };
 
-        // Argument checks
+        // Argument checks: when the database declares `arguments` for an
+        // executable, the process command line must contain them (parity with
+        // arrpc/pog5-rsrpc, e.g. TF2 `-game tf`, Garry's Mod `-game garrysmod`).
         let executable = &obj.executables.as_ref().unwrap()[exe_index];
 
         if let Some(exec_args) = &executable.arguments {
-          // Only require argument checks if executable starts with '>'
-          // like Minecraft: { arguments: "net.minecraft.client.main.Main", is_launcher: false, name: ">java", … }
-          // Other games might provide arguments but not necessary be checked
-          // like Left 4 Dead 2: { arguments: "-game left4dead2", is_launcher: false, name: "left 4 dead 2/left4dead2.exe", … }
-          if executable.name.starts_with(">")
-            && !process
-              .arguments
-              .as_ref()
-              .is_some_and(|args| args.contains(exec_args))
-          {
+          let has_args = process
+            .arguments
+            .as_ref()
+            .is_some_and(|args| args.contains(exec_args));
+          if !has_args {
             return None;
           }
         }
 
-        let mut new_activity = (**obj).clone();
-        new_activity.pid = Some(process.pid);
-        new_activity.timestamp = Some(format!(
-          "{:?}",
-          std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
-        ));
-        Some(Arc::new(new_activity))
+        Some(stamp_activity(&obj, process.pid))
       })
       .collect();
 
-    if let Some(callback) = self
+    let callback = self
       .event_listeners
       .lock()
-      .unwrap()
+      .map_err(|e| format!("event_listeners lock poisoned: {e}"))?
       .on_process_scan_complete
-      .as_ref()
-    {
-      callback.lock().unwrap()(ProcessScanState { obs_open });
+      .clone();
+
+    if let Some(callback) = callback.as_ref() {
+      callback
+        .lock()
+        .map_err(|e| format!("process callback lock poisoned: {e}"))?(ProcessScanState {
+        obs_open,
+      });
     }
 
     detected_list.shrink_to_fit();
@@ -410,7 +500,203 @@ impl ProcessServer {
   }
 }
 
+fn os_matches(os: &str) -> bool {
+  match std::env::consts::OS {
+    "windows" => os == "win32",
+    "macos" => os == "darwin",
+    "linux" => os == "linux",
+    _ => true,
+  }
+}
+
+/// Read `SteamAppId` from `/proc/<pid>/environ` (set by Steam/Proton for
+/// every game process it launches, including non-Steam shortcuts).
+#[cfg(target_os = "linux")]
+fn read_steam_app_id(proc_path: &std::path::Path) -> Option<String> {
+  let env = std::fs::read(proc_path.join("environ")).ok()?;
+  for entry in env.split(|b| *b == 0) {
+    if let Some(id) = entry.strip_prefix(b"SteamAppId=")
+      && let Ok(id) = std::str::from_utf8(id)
+    {
+      let id = id.trim();
+      if !id.is_empty() {
+        return Some(id.to_string());
+      }
+    }
+  }
+  None
+}
+
+fn normalize_name(name: &str) -> String {
+  name.to_lowercase().trim().to_string()
+}
+
+/// Conservative gate for the exe-stem fallback: exact, multi-word names with
+/// a minimum length. Keeps generic stems (`fish`, `steam`, `game`, `reaper`)
+/// from ever matching same-named DB entries.
+pub(crate) fn name_matchable(normalized: &str) -> bool {
+  normalized.contains(' ') && normalized.chars().count() >= 6
+}
+
+/// Executable stem of an already-normalized (`/`-separated, lowercase) path,
+/// without extension: `/games/how to fish.exe` -> `how to fish`.
+pub(crate) fn exe_stem(normalized_path: &str) -> String {
+  let base = normalized_path
+    .rsplit('/')
+    .next()
+    .unwrap_or(normalized_path);
+  match base.rfind('.') {
+    Some(dot) if dot > 0 => base[..dot].to_string(),
+    _ => base.to_string(),
+  }
+}
+
+fn stamp_activity(obj: &Arc<DetectableActivity>, pid: u64) -> Arc<DetectableActivity> {
+  let mut new_activity = (**obj).clone();
+  new_activity.pid = Some(pid);
+  new_activity.timestamp = Some(format!(
+    "{:?}",
+    std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .unwrap()
+      .as_millis()
+  ));
+  Arc::new(new_activity)
+}
+
+/// Auxiliary lookup maps over the main DB:
+/// Steam store id -> activity index, normalized game name -> activity index.
+pub(crate) fn build_aux_maps(
+  detectables: &[Arc<DetectableActivity>],
+) -> (HashMap<String, usize>, HashMap<String, usize>) {
+  let mut steam_map = HashMap::new();
+  let mut name_map = HashMap::new();
+
+  for (index, activity) in detectables.iter().enumerate() {
+    if let Some(skus) = activity.third_party_skus.as_ref() {
+      for sku in skus {
+        if sku.distributor == "steam"
+          && let Some(id) = sku.id.as_ref()
+          && !id.is_empty()
+        {
+          steam_map.entry(id.clone()).or_insert(index);
+        }
+      }
+    }
+
+    // Only matchable names participate in the exe-stem fallback, so generic
+    // stems (`fish`, `steam`, `game`) can never collide with `Fish`/`Steam`.
+    let normalized = normalize_name(&activity.name);
+    if name_matchable(&normalized) {
+      name_map.entry(normalized).or_insert(index);
+    }
+  }
+
+  log!(
+    "[Process Scanner] Aux maps: {} steam ids, {} matchable names",
+    steam_map.len(),
+    name_map.len()
+  );
+
+  (steam_map, name_map)
+}
+
+/// Last-resort matching for processes no executable pattern hit.
+/// 1. `SteamAppId` (store games with empty `executables`, legit Steam).
+/// 2. Exact exe-stem == multi-word game name (shortcuts/renamed exes).
+///
+/// Custom overrides (`append_detectables`) always win: they run first via AC.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn match_aux_process(
+  process_path: &str,
+  steam_app_id: Option<&str>,
+  pid: u64,
+  steam_map: &Mutex<HashMap<String, usize>>,
+  name_map: &Mutex<HashMap<String, usize>>,
+  detectable_list: &[Arc<DetectableActivity>],
+) -> Option<Arc<DetectableActivity>> {
+  if let Some(appid) = steam_app_id
+    && let Some(&idx) = steam_map.lock().unwrap().get(appid)
+    && let Some(obj) = detectable_list.get(idx)
+  {
+    log!(
+      "[Process Scanner] Steam match: {} (appid {})",
+      obj.name,
+      appid
+    );
+    return Some(stamp_activity(obj, pid));
+  }
+
+  let stem = exe_stem(process_path);
+  if name_matchable(&stem)
+    && let Some(&idx) = name_map.lock().unwrap().get(&stem)
+    && let Some(obj) = detectable_list.get(idx)
+  {
+    log!(
+      "[Process Scanner] Name match: {} (exe stem `{}`)",
+      obj.name,
+      stem
+    );
+    return Some(stamp_activity(obj, pid));
+  }
+
+  None
+}
+
+/**
+ * Fetch the detectable games database from a URL, trimming it with
+ * `detection::trim_detectable` before parsing.
+ */
+fn fetch_detectable(url: &str) -> Result<Vec<DetectableActivity>, Box<dyn std::error::Error>> {
+  let body = ureq::get(url)
+    .call()?
+    .into_body()
+    .with_config()
+    .limit(64 * 1024 * 1024)
+    .read_to_string()?;
+
+  // Try the trimmed form first; on failure, use the raw body (serde ignores extras)
+  if let Ok(trimmed) = super::super::detection::trim_detectable(&body)
+    && let Ok(parsed) = serde_json::from_str::<Vec<DetectableActivity>>(&trimmed)
+  {
+    return Ok(parsed);
+  }
+  Ok(serde_json::from_str(&body)?)
+}
+
+/**
+ * Generate matching variants of a process path, removing 64-bit markers
+ * (parity with arrpc/pog5-rsrpc). E.g. `/games/wow64.exe` produces
+ * `/games/wow.exe` which matches a `wow.exe` database entry.
+ */
+fn path_variants(path: &str) -> Vec<String> {
+  let mut variants = Vec::with_capacity(5);
+  variants.push(path.to_string());
+
+  for marker in ["64", ".x64", "x64", "_64"] {
+    let variant = path.replace(marker, "");
+    if variant != path && !variants.contains(&variant) {
+      variants.push(variant);
+    }
+  }
+
+  variants
+}
+
 fn build_ac_patterns(detectables: &[Arc<DetectableActivity>]) -> (AhoCorasick, Vec<[usize; 2]>) {
+  build_ac_patterns_with_os_filter(detectables, true)
+}
+
+fn build_ac_patterns_allow_all_os(
+  detectables: &[Arc<DetectableActivity>],
+) -> (AhoCorasick, Vec<[usize; 2]>) {
+  build_ac_patterns_with_os_filter(detectables, false)
+}
+
+fn build_ac_patterns_with_os_filter(
+  detectables: &[Arc<DetectableActivity>],
+  enforce_os: bool,
+) -> (AhoCorasick, Vec<[usize; 2]>) {
   let mut exe_patterns: Vec<String> = Vec::new();
   let mut exe_indexes: Vec<[usize; 2]> = Vec::new();
 
@@ -418,6 +704,14 @@ fn build_ac_patterns(detectables: &[Arc<DetectableActivity>]) -> (AhoCorasick, V
     if let Some(executables) = &activity.executables {
       for (exe_index, executable) in executables.iter().enumerate() {
         if executable.is_launcher {
+          continue;
+        }
+
+        // Only build patterns for executables that could run on this platform
+        // For custom overrides (enforce_os=false) we skip the OS filter entirely
+        // so that win32 executables can be detected on Linux via Proton/Wine
+        // — this is the fix for NFS HP Remastered etc that only ships win32 entries.
+        if enforce_os && !executable.os.is_empty() && !os_matches(&executable.os) {
           continue;
         }
 
@@ -439,14 +733,3 @@ fn build_ac_patterns(detectables: &[Arc<DetectableActivity>]) -> (AhoCorasick, V
 
   (AhoCorasick::new(exe_patterns).unwrap(), exe_indexes)
 }
-
-// pub fn name_no_ext(name: &String) -> String {
-//   if name.contains('.') {
-//     // Split the name by the dot
-//     let split: Vec<&str> = name.split('.').collect();
-
-//     return split[0].to_string();
-//   }
-
-//   name.to_owned()
-// }

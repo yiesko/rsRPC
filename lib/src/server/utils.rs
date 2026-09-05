@@ -17,6 +17,7 @@ pub static CONNECTION_REPONSE: &str = r#"
       "cdn_host": "cdn.discordapp.com",
       "environment": "production"
     }
-  }
+  },
+  "nonce": null
 }
 "#;

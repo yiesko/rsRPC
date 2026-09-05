@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 static LOGS_ENABLED: AtomicBool = AtomicBool::new(false);
 static LOGS_INIT: Once = Once::new();
