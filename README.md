@@ -92,11 +92,12 @@ Uses the main DB only; `overrides.json` diagnostics require a running server.
 ## Building the binary
 
 1. Clone the repository
-2. Generate the offline detectable snapshot (requires network once; the
-   output `lib/resources/detectable.json` is gitignored by design):
-   `cargo run --manifest-path tools/updater/Cargo.toml`
-3. `cargo build -p rsrpc-cli --release`
-4. Your file will be in `target/release/`
+2. `cargo build -p rsrpc-cli --release`
+3. Your file will be in `target/release/`
+
+The offline snapshot `lib/resources/detectable.json` is committed, so a
+fresh clone builds without network access to Discord. To refresh it, run
+`cargo run --manifest-path tools/updater/Cargo.toml`.
 
 ## Using as a library
 
@@ -201,8 +202,7 @@ Notes:
 * Benchmarks (JSON vs MessagePack): `cargo bench`
 
 Unit tests live in `lib/src/tests/` (one module per area), integration
-tests in `lib/tests/`, benchmarks in `lib/benches/`. All of them need the
-generated snapshot - run the updater once first (see "Building the binary").
+tests in `lib/tests/`, benchmarks in `lib/benches/`.
 
 ## Credits
 
