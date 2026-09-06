@@ -10,7 +10,7 @@
 
 # Features
 
-* Process detection (with 64-bit path normalization like arrpc/pog5-rsrpc, plus Steam AppId and conservative exe-stem fallback for DB entries with empty `executables`)
+* Process detection (with 64-bit path normalization like arrpc/pog5-rsrpc, plus Steam AppId, conservative exe-stem fallback and install-folder fallback for DB entries with empty `executables` — e.g. Hydra/non-Steam layouts; bare-exe launches are retried against the process cwd; SIGSTOP'd processes count as absent)
 * IPC/Socket-based RPC detection
 * Websocket-based RPC detection (loopback only)
 * Bridge that forwards game activities to web clients via both a **JSON** port (`1337`) and a **MessagePack** port (`1338`)
