@@ -199,3 +199,105 @@ fn path_variants_into_matches_legacy_semantics() {
   assert!(many.len() <= 5);
   assert!(many.iter().all(|v| !v.is_empty()));
 }
+
+#[test]
+fn parse_stat_state_reads_after_comm() {
+  use crate::server::process::parse_stat_state;
+
+  // comm may contain spaces and parens; state is the field after the
+  // LAST ')'. Shapes from proc(5).
+  assert_eq!(parse_stat_state("1234 (fish) S 1 2 3"), Some('S'));
+  assert_eq!(
+    parse_stat_state("61442 (PenguinHotel-Win64-Shipping.exe) T 1 2 3"),
+    Some('T')
+  );
+  assert_eq!(parse_stat_state("99 (weird (name)) R 1"), Some('R'));
+  assert_eq!(parse_stat_state("garbage without parens"), None);
+  assert_eq!(parse_stat_state("1 (x)"), None);
+  assert_eq!(parse_stat_state(""), None);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn own_running_process_is_not_suspended() {
+  use crate::server::process::is_suspended;
+
+  // The test runner itself is running (R/S), never stopped.
+  assert!(!is_suspended(u64::from(std::process::id())));
+}
+
+#[test]
+fn bare_exe_detects_missing_directories_only() {
+  use crate::server::process::bare_exe;
+
+  assert_eq!(bare_exe("/doomx64.exe"), Some("doomx64.exe"));
+  assert_eq!(bare_exe("/DOOMX64.EXE"), Some("DOOMX64.EXE"));
+  assert_eq!(bare_exe("/games/doom/doomx64.exe"), None);
+  assert_eq!(bare_exe("/"), None);
+  assert_eq!(bare_exe(""), None);
+}
+
+#[test]
+fn ac_probe_needs_directories_that_cwd_reconstructs() {
+  use std::sync::Arc;
+
+  use crate::detection::{DetectableActivity, Executable};
+  use crate::server::process::{ProcessEventListeners, ProcessServer};
+
+  let entry = DetectableActivity {
+    bot_public: None,
+    bot_require_code_grant: None,
+    cover_image: None,
+    description: None,
+    developers: None,
+    executables: Some(vec![Executable {
+      name: "doom/doomx64.exe".to_string(),
+      is_launcher: false,
+      os: "linux".to_string(),
+      arguments: None,
+    }]),
+    flags: None,
+    guild_id: None,
+    hook: true,
+    icon: None,
+    id: "424242424242424242".to_string(),
+    name: "Doom Eternal Probe".to_string(),
+    publishers: None,
+    rpc_origins: None,
+    splash: None,
+    third_party_skus: None,
+    type_field: None,
+    verify_key: None,
+    primary_sku_id: None,
+    slug: None,
+    aliases: None,
+    overlay: None,
+    overlay_compatibility_hook: None,
+    privacy_policy_url: None,
+    terms_of_service_url: None,
+    eula_id: None,
+    deeplink_uri: None,
+    tags: None,
+    pid: None,
+    timestamp: None,
+  };
+  let arcs = vec![Arc::new(entry)];
+  let (_tx, _rx) = std::sync::mpsc::channel();
+  let server = ProcessServer::new(
+    arcs.clone(),
+    _tx,
+    ProcessEventListeners::default(),
+    None,
+    false,
+  );
+  let reversed = |path: &str| path.chars().rev().collect::<String>();
+  // Bare exe alone misses (no directories for the suffix to anchor on)...
+  assert!(server.ac_probe(&reversed("/doomx64.exe"), &arcs).is_none());
+  // ...while the cwd-joined candidate hits the same entry.
+  assert_eq!(
+    server
+      .ac_probe(&reversed("/games/doom/doomx64.exe"), &arcs)
+      .map(|(obj, _)| obj.id.clone()),
+    Some("424242424242424242".to_string())
+  );
+}

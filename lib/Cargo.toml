@@ -21,7 +21,7 @@ ureq = { version = "3", default-features = false, features = ["rustls", "charset
 sysinfo = { version = "0.39.6", default-features = false, features = ["system", "multithread"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-winapi = { version = "0.3", features = ["namedpipeapi", "winbase"] }
+winapi = { version = "0.3", features = ["namedpipeapi", "winbase", "heapapi"] }
 
 [dev-dependencies]
 criterion = "0.8.2"

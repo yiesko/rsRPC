@@ -360,12 +360,28 @@ impl ClientConnector {
       log!("[Client Connector] No clients connected, skipping");
       return;
     }
+    drop(json_clients);
+    drop(msgpack_clients);
 
-    for responder in json_clients.values() {
-      responder.send(Message::Text(payload.json.clone()));
-    }
-    for responder in msgpack_clients.values() {
-      responder.send(Message::Binary(payload.msgpack.clone()));
+    // Backpressure: Responder::send reports dead clients. Prune them so a
+    // stuck bridge client cannot pin memory (its queued frames) forever.
+    // One log per pruned client: removal means it never logs again.
+    for (clients, payload) in [
+      (&self.json_clients, Message::Text(payload.json.clone())),
+      (
+        &self.msgpack_clients,
+        Message::Binary(payload.msgpack.clone()),
+      ),
+    ] {
+      let mut clients = clients.lock().unwrap();
+      let dead: Vec<u64> = clients
+        .iter()
+        .filter_map(|(id, responder)| (!responder.send(payload.clone())).then_some(*id))
+        .collect();
+      for id in dead {
+        log!("[Client Connector] Pruning dead bridge client {id}");
+        clients.remove(&id);
+      }
     }
   }
 

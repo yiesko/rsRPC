@@ -245,3 +245,38 @@ fn fix_flags_keeps_existing_flags() {
   let activity = cmd.args.unwrap().activity.unwrap();
   assert_eq!(activity.flags, Some(8));
 }
+
+#[test]
+fn bridge_payload_preserves_buttons_and_metadata() {
+  // End-to-end through the bridge encoder (arrpc #141): what a game
+  // sends must reach bridge clients untouched.
+  let mut cmd = parse_cmd(
+    r#"{
+        "cmd": "SET_ACTIVITY",
+        "args": {
+          "pid": 42,
+          "activity": {
+            "name": "Test",
+            "details": "Racing",
+            "buttons": [
+              { "label": "Join", "url": "https://example.com/join" },
+              { "label": "Watch", "url": "https://example.com/watch" }
+            ]
+          }
+        },
+        "nonce": "n"
+      }"#,
+  );
+  let cached = crate::commands::cached_activity(&mut cmd).expect("encodes");
+  let payload: serde_json::Value = serde_json::from_str(&cached.json).expect("valid json");
+  let activity = &payload["activity"];
+  assert_eq!(activity["details"], "Racing");
+  assert_eq!(activity["buttons"], json!(["Join", "Watch"]));
+  assert_eq!(
+    activity["metadata"]["button_urls"],
+    json!(["https://example.com/join", "https://example.com/watch"])
+  );
+  // MessagePack twin carries the same activity.
+  let decoded: serde_json::Value = rmp_serde::from_slice(&cached.msgpack).expect("valid msgpack");
+  assert_eq!(decoded["activity"]["buttons"], json!(["Join", "Watch"]));
+}

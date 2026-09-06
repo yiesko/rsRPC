@@ -369,6 +369,34 @@ impl ProcessServer {
     Ok(processes)
   }
 
+  /// Single reversed-path AC probe (main DB, then custom overrides).
+  /// Shared lookup half of the scan: direct-path and cwd-joined probes
+  /// match identically through here.
+  pub(crate) fn ac_probe(
+    &self,
+    reversed_path: &str,
+    detectable_list: &[Arc<DetectableActivity>],
+  ) -> Option<(Arc<DetectableActivity>, usize)> {
+    let ac = self.detectable_ac.lock().unwrap();
+    if let Some(mat) = ac.find(reversed_path) {
+      let pattern_id: PatternID = mat.pattern();
+      let exe_index = self.detectable_indexes.lock().unwrap()[pattern_id.as_usize()];
+      return Some((detectable_list[exe_index[0]].clone(), exe_index[1]));
+    }
+    let custom = self.custom_detectable_ac.lock().unwrap();
+    if let Some(custom_ac) = custom.as_ref()
+      && let Some(mat) = custom_ac.find(reversed_path)
+    {
+      let pattern_id: PatternID = mat.pattern();
+      let exe_index = self.custom_detectable_indexes.lock().unwrap()[pattern_id.as_usize()];
+      return Some((
+        self.custom_detectables.lock().unwrap()[exe_index[0]].clone(),
+        exe_index[1],
+      ));
+    }
+    None
+  }
+
   pub fn scan_for_processes(
     &self,
   ) -> Result<Vec<Arc<DetectableActivity>>, Box<dyn std::error::Error>> {
@@ -386,14 +414,6 @@ impl ProcessServer {
 
     let mut obs_open = false;
 
-    let ac = self
-      .detectable_ac
-      .lock()
-      .map_err(|e| format!("detectable_ac lock poisoned: {e}"))?;
-    let custom_ac = self
-      .custom_detectable_ac
-      .lock()
-      .map_err(|e| format!("custom_detectable_ac lock poisoned: {e}"))?;
     let detectable_list = self
       .detectable_list
       .lock()
@@ -431,24 +451,34 @@ impl ProcessServer {
         'variants: for variant in &variant_bufs[..variant_count] {
           reversed_path.clear();
           reversed_path.extend(variant.chars().rev());
-
-          if let Some(mat) = ac.find(&reversed_path) {
-            let pattern_id: PatternID = mat.pattern();
-            let exe_index = self.detectable_indexes.lock().unwrap()[pattern_id.as_usize()];
-            found = Some((detectable_list[exe_index[0]].clone(), exe_index[1]));
-          } else if let Some(custom_ac) = custom_ac.as_ref()
-            && let Some(mat) = custom_ac.find(&reversed_path)
-          {
-            let pattern_id: PatternID = mat.pattern();
-            let exe_index = self.custom_detectable_indexes.lock().unwrap()[pattern_id.as_usize()];
-            found = Some((
-              self.custom_detectables.lock().unwrap()[exe_index[0]].clone(),
-              exe_index[1],
-            ));
-          }
-
+          found = self.ac_probe(&reversed_path, &detectable_list);
           if found.is_some() {
             break 'variants;
+          }
+        }
+
+        // Proton bare-exe probe (DOOM Eternal case): argv[0] without
+        // directories plus the process cwd often reconstructs the install
+        // path the DB knows. Only for bare exes (paths with directories
+        // already had their full match above); one readlink per miss.
+        if found.is_none()
+          && let Some(exe) = bare_exe(&process_path)
+          && let Some(cwd) = read_cwd(process.pid)
+        {
+          let candidate = format!("{cwd}/{exe}");
+          log!(
+            "[Process Scanner] Bare exe, probing cwd-joined path for pid {}",
+            process.pid
+          );
+          let variant_count = path_variants_into(&candidate, &mut variant_bufs);
+          'cwd: for variant in &variant_bufs[..variant_count] {
+            reversed_path.clear();
+            reversed_path.extend(variant.chars().rev());
+            found = self.ac_probe(&reversed_path, &detectable_list);
+            if found.is_some() {
+              log!("[Process Scanner] Cwd match for pid {}", process.pid);
+              break 'cwd;
+            }
           }
         }
 
@@ -485,6 +515,17 @@ impl ProcessServer {
           if !has_args {
             return None;
           }
+        }
+
+        // Suspended (SIGSTOP'd) games are not being played: drop the match
+        // so the scan reports them absent (and clears). Checked here — once
+        // per hit — never for the whole table.
+        if is_suspended(process.pid) {
+          log!(
+            "[Process Scanner] Ignoring suspended process (pid {})",
+            process.pid
+          );
+          return None;
         }
 
         Some(stamp_activity(&obj, process.pid))
@@ -529,12 +570,50 @@ fn os_matches(os: &str) -> bool {
 /// as RSS indefinitely. Called after the initial build and every hourly
 /// rebuild (refresh cadence itself is unchanged).
 fn release_parse_arenas() {
+  release_platform_arenas();
+}
+
+/// Linux (glibc/musl).
+#[cfg(target_os = "linux")]
+fn release_platform_arenas() {
   // SAFETY: malloc_trim only advises the allocator to release free pages;
   // it cannot invalidate live allocations, so it is always safe to call.
   unsafe {
     libc::malloc_trim(0);
   }
 }
+
+/// macOS: drain purgeable memory in all zones.
+#[cfg(target_os = "macos")]
+fn release_platform_arenas() {
+  // Declared locally: libc 0.2 exposes only the zone-struct field, not
+  // this stable Darwin function (malloc/malloc.h, present since 10.6).
+  unsafe extern "C" {
+    fn malloc_zone_pressure_relief(zone: *mut libc::c_void, goal: libc::size_t) -> libc::size_t;
+  }
+  // SAFETY: (NULL, 0) means "all zones, no goal" and is advisory-only;
+  // it cannot invalidate live allocations.
+  unsafe {
+    malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+  }
+}
+
+/// Windows: compact our own process heap.
+#[cfg(target_os = "windows")]
+fn release_platform_arenas() {
+  // SAFETY: HeapCompact with flags=0 only coalesces free blocks of the
+  // given heap; it cannot invalidate live allocations.
+  unsafe {
+    let heap = winapi::um::heapapi::GetProcessHeap();
+    if !heap.is_null() {
+      winapi::um::heapapi::HeapCompact(heap, 0);
+    }
+  }
+}
+
+/// Other platforms: nothing to release through a stable API.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn release_platform_arenas() {}
 
 /// Read `SteamAppId` from `/proc/<pid>/environ` (set by Steam/Proton for
 /// every game process it launches, including non-Steam shortcuts).
@@ -554,6 +633,42 @@ fn read_steam_app_id(pid: u64) -> Option<String> {
     }
   }
   None
+}
+
+/// No environ AppIds outside Linux (Steam matching there was already
+/// limited to the exe/name paths).
+#[cfg(not(target_os = "linux"))]
+fn read_steam_app_id(_pid: u64) -> Option<String> {
+  None
+}
+
+/// Whether a process is currently suspended (`T` state: SIGSTOP'd, e.g. a
+/// paused game). Suspended games show a frozen frame (or nothing) — they
+/// are not being played, so matches on them are discarded and the scan
+/// treats them as absent (clears). Checked lazily, only for matched
+/// processes: one tiny `stat` read per hit, never per scan.
+#[cfg(target_os = "linux")]
+pub(crate) fn is_suspended(pid: u64) -> bool {
+  std::fs::read_to_string(format!("/proc/{pid}/stat"))
+    .ok()
+    .and_then(|stat| parse_stat_state(&stat))
+    .is_some_and(|state| state == 'T' || state == 't')
+}
+
+/// Stubbed on non-Linux (Steam matching there is already limited).
+#[cfg(not(target_os = "linux"))]
+fn is_suspended(_pid: u64) -> bool {
+  false
+}
+
+/// Process state from `/proc/<pid>/stat`: the field right after the last
+/// `)` (comm may itself contain spaces and parens). `None` when unreadable
+/// or malformed — never counted as suspended.
+pub(crate) fn parse_stat_state(stat: &str) -> Option<char> {
+  stat
+    .rfind(')')
+    .and_then(|end| stat[end + 1..].split_whitespace().next())
+    .and_then(|state| state.chars().next())
 }
 
 fn normalize_name(name: &str) -> String {
@@ -630,6 +745,18 @@ pub(crate) fn build_aux_maps(
   (steam_map, name_map)
 }
 
+/// Drop matches on suspended processes (see [`is_suspended`]): a SIGSTOP'd
+/// game shows a frozen frame at best — it is not being played. Single
+/// choke point for every aux hit (appid/stem/folder), mirroring the scan
+/// loop's post-match check for AC hits.
+fn live_or_none(obj: &Arc<DetectableActivity>, pid: u64) -> Option<Arc<DetectableActivity>> {
+  if is_suspended(pid) {
+    log!("[Process Scanner] Ignoring suspended process (pid {pid})");
+    return None;
+  }
+  Some(stamp_activity(obj, pid))
+}
+
 /// Last-resort matching for processes no executable pattern hit.
 /// 1. `SteamAppId` (store games with empty `executables`, legit Steam).
 /// 2. Exact exe-stem == multi-word game name (shortcuts/renamed exes).
@@ -653,7 +780,7 @@ pub(crate) fn match_aux_process(
       obj.name,
       appid
     );
-    return Some(stamp_activity(obj, pid));
+    return live_or_none(obj, pid);
   }
 
   let stem = exe_stem(process_path);
@@ -666,7 +793,7 @@ pub(crate) fn match_aux_process(
       obj.name,
       stem
     );
-    return Some(stamp_activity(obj, pid));
+    return live_or_none(obj, pid);
   }
 
   // Install-folder fallback (Hydra / non-Steam shortcuts / renamed exes):
@@ -690,7 +817,7 @@ pub(crate) fn match_aux_process(
         obj.name,
         folder
       );
-      return Some(stamp_activity(obj, pid));
+      return live_or_none(obj, pid);
     }
   }
 
@@ -749,6 +876,33 @@ pub(crate) fn path_variants_into(path: &str, out: &mut [String; 5]) -> usize {
     }
   }
   count
+}
+
+/// Exe file name when the normalized argv[0] carries no directories
+/// (bare exe, e.g. some Proton launches): `None` when directories are
+/// present (the direct-path match covers those) or the name is empty.
+pub(crate) fn bare_exe(normalized_path: &str) -> Option<&str> {
+  let trimmed = normalized_path.strip_prefix('/').unwrap_or(normalized_path);
+  if trimmed.is_empty() || trimmed.contains('/') {
+    return None;
+  }
+  Some(trimmed)
+}
+
+/// Process working directory via `/proc/<pid>/cwd` (one readlink, no file
+/// content). Proton launches with the game dir as cwd, so joining it with
+/// a bare exe reconstructs the install path the DB knows (DOOM Eternal
+/// case). Read lazily: only bare-exe misses pay for it.
+#[cfg(target_os = "linux")]
+fn read_cwd(pid: u64) -> Option<String> {
+  let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+  Some(cwd.to_str()?.to_ascii_lowercase())
+}
+
+/// No cwd outside Linux (Steam matching there is already limited).
+#[cfg(not(target_os = "linux"))]
+fn read_cwd(_pid: u64) -> Option<String> {
+  None
 }
 
 fn build_ac_patterns(detectables: &[Arc<DetectableActivity>]) -> (AhoCorasick, Vec<[usize; 2]>) {
