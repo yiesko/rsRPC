@@ -663,7 +663,9 @@ fn is_suspended(_pid: u64) -> bool {
 
 /// Process state from `/proc/<pid>/stat`: the field right after the last
 /// `)` (comm may itself contain spaces and parens). `None` when unreadable
-/// or malformed — never counted as suspended.
+/// or malformed — never counted as suspended. Linux-only like its sole
+/// caller: without `/proc` there is nothing to parse.
+#[cfg(target_os = "linux")]
 pub(crate) fn parse_stat_state(stat: &str) -> Option<char> {
   stat
     .rfind(')')

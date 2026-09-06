@@ -201,6 +201,7 @@ fn path_variants_into_matches_legacy_semantics() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn parse_stat_state_reads_after_comm() {
   use crate::server::process::parse_stat_state;
 

@@ -31,11 +31,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Rustfmt check
         run: cargo fmt --manifest-path ./Cargo.toml --all -- --check
@@ -49,14 +51,50 @@ jobs:
         platform: [windows-latest, ubuntu-latest, macos-latest]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Generate detectable snapshot
         run: cargo run --manifest-path tools/updater/Cargo.toml
 
       - name: Clippy check
-        run: cargo clippy --manifest-path ./Cargo.toml --workspace --all-targets -- -D warnings
+        run: cargo clippy --manifest-path ./Cargo.toml --workspace --all-targets --locked -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Generate detectable snapshot
+        run: cargo run --manifest-path tools/updater/Cargo.toml
+
+      - name: Test
+        run: cargo test --manifest-path ./Cargo.toml --workspace --locked
+
+  doc:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Generate detectable snapshot
+        run: cargo run --manifest-path tools/updater/Cargo.toml
+
+      - name: Doc
+        run: cargo doc --manifest-path ./Cargo.toml --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings

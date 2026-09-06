@@ -48,19 +48,11 @@ jobs:
             target: 'aarch64-pc-windows-msvc'
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
 
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            ./target/
-          key: ${{ matrix.config.target }}-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - uses: Swatinem/rust-cache@v2
 
       - name: Generate detectable snapshot
         run: cargo run --manifest-path tools/updater/Cargo.toml
@@ -109,13 +101,13 @@ jobs:
 
       - name: Build
         if: matrix.config.target != 'armv7-unknown-linux-gnueabihf' && matrix.config.target != 'aarch64-unknown-linux-gnu'
-        run: cargo build -p rsrpc-cli --release --target ${{ matrix.config.target }}
+        run: cargo build -p rsrpc-cli --release --locked --target ${{ matrix.config.target }}
         env:
           RUSTFLAGS: -Awarnings
 
       - name: (Linux) (ARMv7) Build
         if: matrix.config.target == 'armv7-unknown-linux-gnueabihf'
-        run: cargo build -p rsrpc-cli --release --target ${{ matrix.config.target }} --config target.armv7-unknown-linux-gnueabihf.linker=\'arm-linux-gnueabihf-gcc\'
+        run: cargo build -p rsrpc-cli --release --locked --target ${{ matrix.config.target }} --config target.armv7-unknown-linux-gnueabihf.linker=\'arm-linux-gnueabihf-gcc\'
         env:
           RUSTFLAGS: -Awarnings -L/usr/lib/arm-linux-gnueabihf
           CC: arm-linux-gnueabihf-gcc
@@ -124,7 +116,7 @@ jobs:
 
       - name: (Linux) (ARM64) Build
         if: matrix.config.target == 'aarch64-unknown-linux-gnu'
-        run: cargo build -p rsrpc-cli --release --target ${{ matrix.config.target }} --config target.aarch64-unknown-linux-gnu.linker=\'aarch64-linux-gnu-gcc\'
+        run: cargo build -p rsrpc-cli --release --locked --target ${{ matrix.config.target }} --config target.aarch64-unknown-linux-gnu.linker=\'aarch64-linux-gnu-gcc\'
         env:
           RUSTFLAGS: -Awarnings -L/usr/lib/aarch64-linux-gnu
           CC: aarch64-linux-gnu-gcc
@@ -132,7 +124,7 @@ jobs:
           PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: rsrpc-${{ matrix.config.target }}
           # Find exec based on platform
@@ -144,11 +136,14 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       # Download all artifacts from the build job
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        # NOTE: no node24 release yet (v6 still targets node20); bump when upstream ships it.
+        uses: actions/download-artifact@v5
         with:
           path: artifacts
 
@@ -165,8 +160,23 @@ jobs:
             rm -rf "$dir"
           done
 
+      - name: Changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || true)
+          if [ -z "$PREV_TAG" ]; then
+            RANGE="HEAD"
+          else
+            RANGE="$PREV_TAG..HEAD"
+          fi
+          {
+            echo "## Commits in ${{ github.ref_name }} ($RANGE)"
+            echo ""
+            git log "$RANGE" --pretty=format:'- %s (%h)' --reverse
+            echo ""
+          } > RELEASE_NOTES.md
+
       - name: Create release using all artifacts
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         if: github.event_name != 'schedule'
         with:
           files: rsrpc*.zip
@@ -174,5 +184,6 @@ jobs:
           # Release name is the tag name
           name: ${{ github.ref_name }} - ${{ github.sha }}
           draft: false
+          body_path: RELEASE_NOTES.md
           generate_release_notes: true
           prerelease: false
