@@ -110,3 +110,60 @@ fn aux_match_prefers_steam_then_name() {
   let miss = match_aux_process("/usr/bin/fish", None, 789, &steam_map, &name_map, &db);
   assert!(miss.is_none());
 }
+
+#[test]
+fn aux_match_falls_back_to_install_folder() {
+  let db = vec![
+    activity("1", "How to Fish", Some("4001890")),
+    activity("2", "Meccha Chameleon", Some("4704690")),
+  ];
+  let (steam_map, name_map) = build_aux_maps(&db);
+  let steam_map = Mutex::new(steam_map);
+  let name_map = Mutex::new(name_map);
+
+  // Hydra-style layout: generic Unreal exe, title only in the folders
+  // (wine path, already slash-normalized and lowercased by the caller).
+  let hit = match_aux_process(
+    "/home/user/games/meccha chameleon/meccha chameleon/chameleon/binaries/win64/penguinhotel-win64-shipping.exe",
+    Some("2987654321"),
+    201,
+    &steam_map,
+    &name_map,
+    &db,
+  );
+  assert_eq!(hit.unwrap().id, "2");
+
+  // Steam AppId still wins over a conflicting folder name.
+  let hit = match_aux_process(
+    "/home/user/steamapps/common/meccha chameleon/how to fish.exe",
+    Some("4001890"),
+    202,
+    &steam_map,
+    &name_map,
+    &db,
+  );
+  assert_eq!(hit.unwrap().id, "1");
+
+  // Generic folders alone never match, even nested deep.
+  let miss = match_aux_process(
+    "/home/user/games/some game/binaries/win64/game-win64-shipping.exe",
+    Some("2987654321"),
+    203,
+    &steam_map,
+    &name_map,
+    &db,
+  );
+  assert!(miss.is_none());
+
+  // Dotted components (versions, hidden dirs) are skipped, real title
+  // behind them still hits.
+  let hit = match_aux_process(
+    "/home/user/.local/share/games/how to fish/v1.2.3/how to fish.bin",
+    None,
+    204,
+    &steam_map,
+    &name_map,
+    &db,
+  );
+  assert_eq!(hit.unwrap().id, "1");
+}

@@ -640,6 +640,31 @@ pub(crate) fn match_aux_process(
     return Some(stamp_activity(obj, pid));
   }
 
+  // Install-folder fallback (Hydra / non-Steam shortcuts / renamed exes):
+  // the folder often carries the title when the exe doesn't, e.g.
+  // `.../Meccha Chameleon/MECCHA CHAMELEON/Chameleon/Binaries/Win64/
+  // PenguinHotel-Win64-Shipping.exe`. Nearest ancestor wins; the map only
+  // holds multi-word names, so generic folders (`binaries`, `win64`) and
+  // single-word ones (`chameleon`) can never hit. Dotted components are
+  // versions/hidden dirs, never titles.
+  for component in process_path.rsplit('/').skip(1) {
+    if component.contains('.') {
+      continue;
+    }
+    let folder = normalize_name(component);
+    if name_matchable(&folder)
+      && let Some(&idx) = name_map.lock().unwrap().get(&folder)
+      && let Some(obj) = detectable_list.get(idx)
+    {
+      log!(
+        "[Process Scanner] Folder match: {} (folder `{}`)",
+        obj.name,
+        folder
+      );
+      return Some(stamp_activity(obj, pid));
+    }
+  }
+
   None
 }
 
