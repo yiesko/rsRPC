@@ -55,6 +55,13 @@ pub struct ClientConnector {
   /// was last broadcast, so IPC/WS clears can resume process detection.
   pub last_pid: Arc<Mutex<Option<u64>>>,
   pub active_socket: Arc<Mutex<Option<String>>>,
+  /// Last process-detected activity id broadcast but not yet cleared.
+  /// Consumed (`take`) by the null-scan path to clear exactly once — even
+  /// when an IPC/WS clear already reset `active_socket` meanwhile. The two
+  /// keyspaces differ (IPC clears are pid-keyed, process clears are
+  /// app-id-keyed), so gating the prune on `active_socket` strands the
+  /// process entry forever: every later bridge client replays a dead game.
+  pub last_process: Arc<Mutex<Option<String>>>,
 
   pub ipc_event_rec: Arc<Mutex<Option<std::sync::mpsc::Receiver<ActivityCmd>>>>,
   pub proc_event_rec: Arc<Mutex<Option<std::sync::mpsc::Receiver<ProcessDetectedEvent>>>>,
@@ -87,6 +94,7 @@ impl ClientConnector {
 
       last_pid: Arc::new(Mutex::new(None)),
       active_socket: Arc::new(Mutex::new(None)),
+      last_process: Arc::new(Mutex::new(None)),
 
       ipc_event_rec: Arc::new(Mutex::new(Some(ipc_event_rec))),
       proc_event_rec: Arc::new(Mutex::new(Some(proc_event_rec))),
@@ -248,17 +256,18 @@ impl ClientConnector {
       let proc_activity = proc_event.activity;
 
       if proc_activity.id == "null" {
-        // If our last socket id is empty, skip
-        let active = connector.active_socket.lock().unwrap().clone();
-        if active.is_none() {
+        // Clear exactly once per process publication: consume the
+        // outstanding id (if any) and clear it. Gated on the publication,
+        // NOT on active_socket — an IPC/WS clear may have reset that flag
+        // already while the app-id-keyed entry is still live (dual
+        // keyspaces: pid-keyed vs app-id-keyed).
+        let Some((pid, socket_id)) = take_process_clear(&connector) else {
           continue;
-        }
+        };
 
         // Send an empty payload
         log!("[Client Connector] Sending empty payload");
 
-        let socket_id = active.unwrap();
-        let pid = connector.last_pid.lock().unwrap().unwrap_or_default();
         let payload = commands::empty_cached(pid, socket_id.clone());
 
         connector.broadcast_activity(payload, socket_id);
@@ -309,6 +318,7 @@ impl ClientConnector {
 
       *connector.last_pid.lock().unwrap() = proc_activity.pid;
       *connector.active_socket.lock().unwrap() = Some(proc_activity.id.clone());
+      *connector.last_process.lock().unwrap() = Some(proc_activity.id.clone());
 
       log!(
         "[Client Connector] Sending payload for activity: {}",
@@ -381,6 +391,19 @@ impl ClientConnector {
       }
     }
   }
+}
+
+/**
+ * Consume the outstanding process publication for clearing, if any.
+ * Returns `(pid, socket_id)` for the clear frame. Single-shot by
+ * construction (`take`): repeated null scans clear once and then skip,
+ * and a prior IPC/WS clear (which resets `active_socket` but never
+ * touches this) cannot disarm it.
+ */
+pub(crate) fn take_process_clear(connector: &ClientConnector) -> Option<(u64, String)> {
+  let socket_id = connector.last_process.lock().unwrap().take()?;
+  let pid = connector.last_pid.lock().unwrap().unwrap_or_default();
+  Some((pid, socket_id))
 }
 
 impl Drop for ClientConnector {

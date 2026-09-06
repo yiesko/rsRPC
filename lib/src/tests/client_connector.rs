@@ -1,5 +1,5 @@
 use crate::cmd::{ActivityCmd, ActivityCmdArgs};
-use crate::server::client_connector::{ClientConnector, is_genuine_clear};
+use crate::server::client_connector::{ClientConnector, is_genuine_clear, take_process_clear};
 
 fn cmd_with(pid: Option<u64>, activity: Option<crate::cmd::Activity>) -> ActivityCmd {
   ActivityCmd {
@@ -45,6 +45,12 @@ fn clones_share_detection_state() {
 
   *b.last_pid.lock().unwrap() = Some(42);
   assert_eq!(*a.last_pid.lock().unwrap(), Some(42));
+
+  *b.last_process.lock().unwrap() = Some("123456789012345678".to_string());
+  assert_eq!(
+    a.last_process.lock().unwrap().clone(),
+    Some("123456789012345678".to_string())
+  );
 }
 
 #[test]
@@ -55,4 +61,48 @@ fn non_empty_set_activity_is_not_a_clear() {
   )
   .unwrap();
   assert!(!is_genuine_clear(&cmd));
+}
+
+#[test]
+fn process_clear_consumes_outstanding_publication_once() {
+  // ClientConnector::new binds bridge ports; use uncommon ones for the test.
+  let (_ipc_tx, ipc_rx) = std::sync::mpsc::channel();
+  let (_proc_tx, proc_rx) = std::sync::mpsc::channel();
+  let (_ws_tx, ws_rx) = std::sync::mpsc::channel();
+  let connector = ClientConnector::new(45973, 45974, String::new(), ipc_rx, proc_rx, ws_rx);
+
+  // Nothing published: null scans skip.
+  assert_eq!(take_process_clear(&connector), None);
+
+  // A process publication arms exactly one clear, with the last pid.
+  *connector.last_process.lock().unwrap() = Some("111111111111111111".to_string());
+  *connector.last_pid.lock().unwrap() = Some(1234);
+  assert_eq!(
+    take_process_clear(&connector),
+    Some((1234, "111111111111111111".to_string()))
+  );
+  // Consumed: further null scans skip (no clear spam, no re-clear).
+  assert_eq!(take_process_clear(&connector), None);
+}
+
+#[test]
+fn process_clear_survives_sdk_clear_reset() {
+  // Regression: the game SDK disconnect clears active_socket (event_loop
+  // path) while the app-id-keyed process entry is still live. The old
+  // null-scan gate (active_socket) then skipped the prune forever and
+  // every later bridge client replayed the dead game.
+  let (_ipc_tx, ipc_rx) = std::sync::mpsc::channel();
+  let (_proc_tx, proc_rx) = std::sync::mpsc::channel();
+  let (_ws_tx, ws_rx) = std::sync::mpsc::channel();
+  let connector = ClientConnector::new(45975, 45976, String::new(), ipc_rx, proc_rx, ws_rx);
+
+  *connector.last_process.lock().unwrap() = Some("111111111111111111".to_string());
+  *connector.last_pid.lock().unwrap() = Some(1234);
+  // SDK clear already reset the shared flag...
+  *connector.active_socket.lock().unwrap() = None;
+  // ...yet the process publication still yields its one clear.
+  assert_eq!(
+    take_process_clear(&connector),
+    Some((1234, "111111111111111111".to_string()))
+  );
 }
