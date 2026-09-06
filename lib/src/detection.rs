@@ -16,6 +16,16 @@ pub const BUNDLED_DETECTABLE: &str = include_str!("../resources/detectable.json"
  * never drift apart.
  */
 pub fn trim_detectable(body: &str) -> Result<String, Box<dyn std::error::Error>> {
+  Ok(serde_json::to_string(&trim_detectable_value(body)?)?)
+}
+
+/**
+ * Trimmed database as a JSON value: same content as [`trim_detectable`]
+ * without the final serialization round-trip. Fallback for bodies whose
+ * entries miss required fields (it defaults them) when the direct struct
+ * parse fails; prefer parsing directly whenever possible (zero DOM).
+ */
+pub fn trim_detectable_value(body: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
   let games: Vec<serde_json::Value> = serde_json::from_str(body)?;
   let trimmed: Vec<serde_json::Value> = games
     .into_iter()
@@ -102,7 +112,7 @@ pub fn trim_detectable(body: &str) -> Result<String, Box<dyn std::error::Error>>
       serde_json::Value::Object(entry)
     })
     .collect();
-  Ok(serde_json::to_string(&trimmed)?)
+  Ok(serde_json::Value::Array(trimmed))
 }
 
 #[skip_serializing_none]

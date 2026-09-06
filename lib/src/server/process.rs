@@ -30,9 +30,6 @@ pub struct Exec {
   pid: u64,
   path: String,
   arguments: Option<String>,
-  /// Steam AppId from `/proc/<pid>/environ` (`SteamAppId=...`), set by the
-  /// Steam client / Proton for games it launches (incl. non-Steam shortcuts).
-  steam_app_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -87,7 +84,7 @@ impl ProcessServer {
     let (steam_map, name_map) = build_aux_maps(&detectable);
     log!("[Process Scanner] Done!");
 
-    ProcessServer {
+    let server = ProcessServer {
       scanning: Arc::new(AtomicBool::new(false)),
       detected_list: Arc::new(Mutex::new(vec![])),
       custom_detectables: Arc::new(Mutex::new(vec![])),
@@ -112,7 +109,13 @@ impl ProcessServer {
       // sysinfo System
       #[cfg(not(target_os = "linux"))]
       sysinfo: Arc::new(Mutex::new(System::new())),
-    }
+    };
+
+    // One-time parse arenas are now garbage: steady state is the lean
+    // structures just built.
+    release_parse_arenas();
+
+    server
   }
 
   fn update_custom_detectables(&self) {
@@ -143,6 +146,9 @@ impl ProcessServer {
     *self.steam_map.lock().unwrap() = steam_map;
     *self.name_map.lock().unwrap() = name_map;
     log!("[Process Scanner] Done!");
+    // Fetch string, JSON DOM and trimmed copy are now garbage: hand the
+    // hourly spike back (refresh cadence itself is unchanged).
+    release_parse_arenas();
   }
 
   pub fn append_detectables(&mut self, detectable: Vec<DetectableActivity>) {
@@ -170,11 +176,15 @@ impl ProcessServer {
 
     self.update_custom_detectables();
 
-    // Periodically refresh the detectable games database (like pog5-rsrpc)
+    // Periodically refresh the detectable games database (like pog5-rsrpc).
+    // Sleep first: startup already fetched synchronously, so an immediate
+    // refetch would parse the whole DB twice for the same data (double
+    // transient memory + startup time for zero new information).
     if clone.enable_db_update && clone.db_url.is_some() {
       let db_clone = clone.clone();
       std::thread::spawn(move || {
         loop {
+          std::thread::sleep(Duration::from_secs(3600));
           let url = db_clone.db_url.clone().unwrap();
           match fetch_detectable(&url) {
             Ok(detectable) => db_clone.update_main_detectables(detectable),
@@ -185,7 +195,6 @@ impl ProcessServer {
               );
             }
           }
-          std::thread::sleep(Duration::from_secs(3600));
         }
       });
     }
@@ -308,8 +317,6 @@ impl ProcessServer {
             .collect::<Vec<_>>()
             .join(" ")
         }),
-        // sysinfo doesn't expose environ here; Steam matching is Linux-only for now
-        steam_app_id: None,
       });
     }
 
@@ -355,7 +362,6 @@ impl ProcessServer {
           } else {
             Some(cmd_args)
           },
-          steam_app_id: read_steam_app_id(&path),
         });
       }
     }
@@ -394,6 +400,9 @@ impl ProcessServer {
       .map_err(|e| format!("detectable_list lock poisoned: {e}"))?;
 
     let mut reversed_path = String::with_capacity(256);
+    // Variant scratch space, reused for every process: the scan allocates
+    // nothing per process at steady state (see path_variants_into).
+    let mut variant_bufs: [String; 5] = Default::default();
 
     let mut detected_list: Vec<Arc<DetectableActivity>> = processes
       .iter()
@@ -415,9 +424,11 @@ impl ProcessServer {
 
         // Aho-Corasick matching against the path and its 64-bit-stripped
         // variants (so `wow64.exe` also matches a `wow.exe` pattern, like
-        // arrpc/pog5-rsrpc).
+        // arrpc/pog5-rsrpc). First hit in variant order wins, exactly as
+        // before — only the allocations are gone.
         let mut found: Option<(Arc<DetectableActivity>, usize)> = None;
-        'variants: for variant in path_variants(&process_path) {
+        let variant_count = path_variants_into(&process_path, &mut variant_bufs);
+        'variants: for variant in &variant_bufs[..variant_count] {
           reversed_path.clear();
           reversed_path.extend(variant.chars().rev());
 
@@ -444,12 +455,15 @@ impl ProcessServer {
         // No executable-name hit: try Steam AppId, then the conservative
         // exe-stem == game-name fallback. Both cover DB entries that ship
         // empty `executables` (e.g. How to Fish) with no overrides.json.
+        // The AppId lives in environ (kilobytes per process), so it is
+        // read here — only for the few misses — never for the whole table.
         let (obj, exe_index) = match found {
           Some(found) => found,
           None => {
+            let app_id = read_steam_app_id(process.pid);
             return match_aux_process(
               &process_path,
-              process.steam_app_id.as_deref(),
+              app_id.as_deref(),
               process.pid,
               &self.steam_map,
               &self.name_map,
@@ -509,11 +523,26 @@ fn os_matches(os: &str) -> bool {
   }
 }
 
+/// Return one-time parse arenas (fetch body, JSON DOM, trimmed copy,
+/// automaton build scratch) to the OS. Steady state is the lean
+/// structures only; without this, the allocator holds the startup spike
+/// as RSS indefinitely. Called after the initial build and every hourly
+/// rebuild (refresh cadence itself is unchanged).
+fn release_parse_arenas() {
+  // SAFETY: malloc_trim only advises the allocator to release free pages;
+  // it cannot invalidate live allocations, so it is always safe to call.
+  unsafe {
+    libc::malloc_trim(0);
+  }
+}
+
 /// Read `SteamAppId` from `/proc/<pid>/environ` (set by Steam/Proton for
 /// every game process it launches, including non-Steam shortcuts).
+/// Callers read this lazily: environ is the most expensive read of the
+/// scan, so only misses pay for it.
 #[cfg(target_os = "linux")]
-fn read_steam_app_id(proc_path: &std::path::Path) -> Option<String> {
-  let env = std::fs::read(proc_path.join("environ")).ok()?;
+fn read_steam_app_id(pid: u64) -> Option<String> {
+  let env = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
   for entry in env.split(|b| *b == 0) {
     if let Some(id) = entry.strip_prefix(b"SteamAppId=")
       && let Ok(id) = std::str::from_utf8(id)
@@ -680,9 +709,15 @@ fn fetch_detectable(url: &str) -> Result<Vec<DetectableActivity>, Box<dyn std::e
     .limit(64 * 1024 * 1024)
     .read_to_string()?;
 
-  // Try the trimmed form first; on failure, use the raw body (serde ignores extras)
-  if let Ok(trimmed) = super::super::detection::trim_detectable(&body)
-    && let Ok(parsed) = serde_json::from_str::<Vec<DetectableActivity>>(&trimmed)
+  // Direct parse first: serde skips unknown fields, so the full body
+  // parses with zero DOM overhead (~5x less transient memory than the
+  // trimmed-Value pass). The trimming pass stays as fallback for entries
+  // missing required fields (it defaults them); raw last.
+  if let Ok(parsed) = serde_json::from_str::<Vec<DetectableActivity>>(&body) {
+    return Ok(parsed);
+  }
+  if let Ok(trimmed) = super::super::detection::trim_detectable_value(&body)
+    && let Ok(parsed) = serde_json::from_value::<Vec<DetectableActivity>>(trimmed)
   {
     return Ok(parsed);
   }
@@ -693,19 +728,27 @@ fn fetch_detectable(url: &str) -> Result<Vec<DetectableActivity>, Box<dyn std::e
  * Generate matching variants of a process path, removing 64-bit markers
  * (parity with arrpc/pog5-rsrpc). E.g. `/games/wow64.exe` produces
  * `/games/wow.exe` which matches a `wow.exe` database entry.
+ *
+ * Writes into caller-owned buffers and returns how many are filled, so the
+ * per-process scan allocates nothing at steady state (buffers are reused
+ * across processes and scans; only marker hits allocate one temp string).
  */
-fn path_variants(path: &str) -> Vec<String> {
-  let mut variants = Vec::with_capacity(5);
-  variants.push(path.to_string());
-
+pub(crate) fn path_variants_into(path: &str, out: &mut [String; 5]) -> usize {
+  out[0].clear();
+  out[0].push_str(path);
+  let mut count = 1;
   for marker in ["64", ".x64", "x64", "_64"] {
+    if !path.contains(marker) {
+      continue;
+    }
     let variant = path.replace(marker, "");
-    if variant != path && !variants.contains(&variant) {
-      variants.push(variant);
+    if variant != path && !out[..count].contains(&variant) && count < out.len() {
+      out[count].clear();
+      out[count].push_str(&variant);
+      count += 1;
     }
   }
-
-  variants
+  count
 }
 
 fn build_ac_patterns(detectables: &[Arc<DetectableActivity>]) -> (AhoCorasick, Vec<[usize; 2]>) {

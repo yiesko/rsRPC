@@ -167,3 +167,35 @@ fn aux_match_falls_back_to_install_folder() {
   );
   assert_eq!(hit.unwrap().id, "1");
 }
+
+#[test]
+fn path_variants_into_matches_legacy_semantics() {
+  use crate::server::process::path_variants_into;
+
+  fn variants(path: &str) -> Vec<String> {
+    let mut bufs: [String; 5] = Default::default();
+    let count = path_variants_into(path, &mut bufs);
+    bufs[..count].to_vec()
+  }
+
+  // Base path always first, then 64-bit-stripped forms.
+  assert_eq!(
+    variants("/games/wow64.exe"),
+    vec!["/games/wow64.exe".to_string(), "/games/wow.exe".to_string()]
+  );
+  // No markers: single variant, and buffers reuse without reallocating.
+  let mut bufs: [String; 5] = Default::default();
+  let first = path_variants_into("/usr/bin/fish", &mut bufs);
+  let ptrs: Vec<*const String> = bufs.iter().map(|s| s as *const String).collect();
+  let second = path_variants_into("/usr/bin/fish", &mut bufs);
+  assert_eq!((first, second), (1, 1));
+  assert_eq!(
+    ptrs,
+    bufs.iter().map(|s| s as *const String).collect::<Vec<_>>()
+  );
+  // Dedup and capacity cap hold (base + 4 markers max).
+  let many = variants("/64/x64/.x64/_64/game64.exe");
+  assert_eq!(many[0], "/64/x64/.x64/_64/game64.exe");
+  assert!(many.len() <= 5);
+  assert!(many.iter().all(|v| !v.is_empty()));
+}
