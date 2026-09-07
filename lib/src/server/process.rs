@@ -135,6 +135,13 @@ impl ProcessServer {
    * periodic refresh), rebuilding the Aho-Corasick automaton.
    */
   fn update_main_detectables(&self, detectable: Vec<DetectableActivity>) {
+    // Never swap in an empty database (outage returning `[]`, corrupt
+    // fetch): it would build a failing automaton and blind detection.
+    // Keep serving the current data instead.
+    if detectable.is_empty() {
+      log!("[Process Scanner] Refusing empty detectable database update, keeping current");
+      return;
+    }
     log!("[Process Scanner] Rebuilding Aho-Corasick patterns for main detectable activities...");
     let detectable: Vec<Arc<DetectableActivity>> = detectable.into_iter().map(Arc::new).collect();
     let (ac, idx) = build_ac_patterns(&detectable);
@@ -179,15 +186,27 @@ impl ProcessServer {
     // Periodically refresh the detectable games database (like pog5-rsrpc).
     // Sleep first: startup already fetched synchronously, so an immediate
     // refetch would parse the whole DB twice for the same data (double
-    // transient memory + startup time for zero new information).
+    // transient memory + startup time for zero new information). Refreshes
+    // are conditional (ETag): an unchanged database costs one header round
+    // trip and zero parsing, so steady-state RSS never ratchets.
     if clone.enable_db_update && clone.db_url.is_some() {
       let db_clone = clone.clone();
       std::thread::spawn(move || {
+        let mut etag: Option<String> = None;
         loop {
           std::thread::sleep(Duration::from_secs(3600));
           let url = db_clone.db_url.clone().unwrap();
-          match fetch_detectable(&url) {
-            Ok(detectable) => db_clone.update_main_detectables(detectable),
+          match fetch_detectable_etag(&url, etag.as_deref()) {
+            Ok(FetchOutcome::Unchanged) => {
+              log!("[Process Scanner] Detectable database unchanged (304), keeping current");
+            }
+            Ok(FetchOutcome::Updated {
+              etag: new_tag,
+              detectable,
+            }) => {
+              etag = new_tag;
+              db_clone.update_main_detectables(detectable);
+            }
             Err(err) => {
               log!(
                 "[Process Scanner] Error updating detectable database: {}",
@@ -826,13 +845,40 @@ pub(crate) fn match_aux_process(
   None
 }
 
+/// Outcome of one conditional refresh: either the database changed (new
+/// ETag + parsed activities) or it did not (keep everything as is).
+pub(crate) enum FetchOutcome {
+  Unchanged,
+  Updated {
+    etag: Option<String>,
+    detectable: Vec<DetectableActivity>,
+  },
+}
+
 /**
- * Fetch the detectable games database from a URL, trimming it with
- * `detection::trim_detectable` before parsing.
+ * Fetch the detectable games database, skipping the download when it has
+ * not changed since `etag` (Discord answers `304`, `ETag` + `max-age=3600`
+ * line up with the hourly cadence). A 304 costs one header round trip and
+ * zero parsing, so idle hours leave RSS untouched.
  */
-fn fetch_detectable(url: &str) -> Result<Vec<DetectableActivity>, Box<dyn std::error::Error>> {
-  let body = ureq::get(url)
-    .call()?
+pub(crate) fn fetch_detectable_etag(
+  url: &str,
+  etag: Option<&str>,
+) -> Result<FetchOutcome, Box<dyn std::error::Error>> {
+  let mut request = ureq::get(url);
+  if let Some(tag) = etag {
+    request = request.header("If-None-Match", tag);
+  }
+  let response = request.call()?;
+  if response.status().as_u16() == 304 {
+    return Ok(FetchOutcome::Unchanged);
+  }
+  let etag = response
+    .headers()
+    .get("etag")
+    .and_then(|value| value.to_str().ok())
+    .map(str::to_string);
+  let body = response
     .into_body()
     .with_config()
     .limit(64 * 1024 * 1024)
@@ -843,14 +889,23 @@ fn fetch_detectable(url: &str) -> Result<Vec<DetectableActivity>, Box<dyn std::e
   // trimmed-Value pass). The trimming pass stays as fallback for entries
   // missing required fields (it defaults them); raw last.
   if let Ok(parsed) = serde_json::from_str::<Vec<DetectableActivity>>(&body) {
-    return Ok(parsed);
+    return Ok(FetchOutcome::Updated {
+      etag,
+      detectable: parsed,
+    });
   }
   if let Ok(trimmed) = super::super::detection::trim_detectable_value(&body)
     && let Ok(parsed) = serde_json::from_value::<Vec<DetectableActivity>>(trimmed)
   {
-    return Ok(parsed);
+    return Ok(FetchOutcome::Updated {
+      etag,
+      detectable: parsed,
+    });
   }
-  Ok(serde_json::from_str(&body)?)
+  Ok(FetchOutcome::Updated {
+    etag,
+    detectable: serde_json::from_str(&body)?,
+  })
 }
 
 /**

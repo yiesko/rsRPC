@@ -285,14 +285,23 @@ fn handle_disconnect(
   responder: &ActivityResponder,
 ) {
   if let Some(ref activity_cmd) = responder.0 {
-    // Send empty activity
+    // Send empty activity. pid defaults to 0 when the last command had
+    // no args (malformed SET_ACTIVITY): pid 0 is never a genuine clear,
+    // so it is safely ignored downstream — and this never panics, which
+    // would kill the whole bridge poll loop (stuck presence for everyone).
     let activity_cmd = ActivityCmd {
       application_id: activity_cmd.application_id.clone(),
       cmd: "SET_ACTIVITY".to_string(),
       data: None,
       evt: None,
       args: Some(ActivityCmdArgs {
-        pid: Some(activity_cmd.args.as_ref().unwrap().pid.unwrap_or_default()),
+        pid: Some(
+          activity_cmd
+            .args
+            .as_ref()
+            .and_then(|args| args.pid)
+            .unwrap_or_default(),
+        ),
         activity: None,
         code: None,
       }),
