@@ -280,3 +280,28 @@ fn bridge_payload_preserves_buttons_and_metadata() {
   let decoded: serde_json::Value = rmp_serde::from_slice(&cached.msgpack).expect("valid msgpack");
   assert_eq!(decoded["activity"]["buttons"], json!(["Join", "Watch"]));
 }
+
+#[test]
+fn bridge_payload_preserves_all_secret_kinds() {
+  // Sibling of upstream #30 (payload fidelity): join/spectate/match must
+  // all survive the bridge. `match` is a Rust keyword, hence match_secret.
+  let mut cmd = parse_cmd(
+    r#"{
+        "cmd": "SET_ACTIVITY",
+        "args": {
+          "pid": 7,
+          "activity": {
+            "name": "SecretGame",
+            "secrets": { "join": "j", "spectate": "s", "match": "m" }
+          }
+        },
+        "nonce": "n"
+      }"#,
+  );
+  let cached = crate::commands::cached_activity(&mut cmd).expect("encodes");
+  let payload: serde_json::Value = serde_json::from_str(&cached.json).expect("valid json");
+  assert_eq!(
+    payload["activity"]["secrets"],
+    serde_json::json!({ "join": "j", "spectate": "s", "match": "m" })
+  );
+}

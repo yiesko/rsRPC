@@ -148,6 +148,9 @@ pub struct Assets {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Secrets {
   pub join: Option<String>,
+  pub spectate: Option<String>,
+  #[serde(rename = "match")]
+  pub match_secret: Option<String>,
 }
 
 #[skip_serializing_none]
