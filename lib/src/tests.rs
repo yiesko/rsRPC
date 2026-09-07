@@ -8,3 +8,4 @@ mod client_connector;
 mod cmd;
 mod ipc_utils;
 mod process;
+mod rpc_server;

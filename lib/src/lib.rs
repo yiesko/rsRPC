@@ -44,6 +44,10 @@ pub struct RPCConfig {
   pub scan_interval_secs: u64,
   pub db_url: Option<String>,
   pub enable_db_update: bool,
+  /// ETag captured by the startup fetch, so the first hourly refresh is
+  /// conditional too (otherwise every restart pays one full redundant
+  /// rebuild before learning the tag). `None` means unconditional.
+  pub initial_db_etag: Option<String>,
 }
 
 impl Default for RPCConfig {
@@ -60,6 +64,7 @@ impl Default for RPCConfig {
       scan_interval_secs: 5,
       db_url: None,
       enable_db_update: false,
+      initial_db_etag: None,
     }
   }
 }
@@ -73,6 +78,11 @@ pub struct Connectors {
 }
 
 pub struct RPCServer {
+  /// Parsed database. Ownership moves to the `ProcessServer` on [`start`](RPCServer::start)
+  /// (single generation alive, never duplicated); after that this is empty
+  /// and [`detect_once`](RPCServer::detect_once) on a started server finds
+  /// nothing. One-shot users (CLI `--list-detected`, per-tick scanners that
+  /// never start) are unaffected: they read it before any `start()`.
   detectable: Arc<Mutex<Vec<Arc<DetectableActivity>>>>,
   connectors: Option<Connectors>,
   config: RPCConfig,
@@ -125,7 +135,9 @@ impl RPCServer {
   /**
    * Run a single process scan without starting any threads/connectors.
    * Used by `--list-detected` diagnostics (main DB only; custom overrides
-   * require a running server via `append_detectables`).
+   * require a running server via `append_detectables`). Reads the database
+   * held by this server; on a started server that database already moved
+   * to the scanner (see the field docs), so call this before `start()`.
    */
   pub fn detect_once(&self) -> Result<Vec<DetectedGame>, Box<dyn std::error::Error>> {
     let (tx, _rx) = mpsc::channel();
@@ -139,6 +151,7 @@ impl RPCServer {
       ProcessEventListeners::default(),
       None,
       false,
+      None,
     );
 
     Ok(
@@ -229,6 +242,14 @@ impl RPCServer {
     self.on_process_scan_complete = Some(Arc::new(Mutex::new(callback)));
   }
 
+  /// Move the parsed database out for the scanner, leaving this server
+  /// empty. Single ownership by construction: cloning here would pin a
+  /// second live generation beside the scanner's (the retained memory the
+  /// hourly rebuilds used to accumulate).
+  fn take_detectables(&mut self) -> Vec<Arc<DetectableActivity>> {
+    std::mem::take(&mut *self.detectable.lock().unwrap())
+  }
+
   pub fn start(&mut self) {
     let (proc_event_sender, proc_event_receiver) = mpsc::channel();
     let (ipc_event_sender, ipc_event_receiver) = mpsc::channel();
@@ -236,13 +257,16 @@ impl RPCServer {
 
     let connectors = Connectors {
       process_server: Arc::new(Mutex::new(ProcessServer::new(
-        self.detectable.lock().unwrap().to_vec(),
+        // Move, never clone: a second live generation here is exactly the
+        // retained ~30MB the hourly rebuilds used to pin down.
+        self.take_detectables(),
         proc_event_sender,
         ProcessEventListeners {
           on_process_scan_complete: self.on_process_scan_complete.clone(),
         },
         self.config.db_url.clone(),
         self.config.enable_db_update,
+        self.config.initial_db_etag.clone(),
       ))),
       client_connector: Arc::new(Mutex::new(ClientConnector::new(
         self.config.port,

@@ -39,7 +39,10 @@ pub struct ProcessDetectedEvent {
 
 #[derive(Clone)]
 pub struct ProcessServer {
-  detected_list: Arc<Mutex<Vec<Arc<DetectableActivity>>>>,
+  /// Id of the last published detection, to notice game changes. A plain
+  /// id string on purpose: keeping the full activities here would pin the
+  /// previous database generation after every refresh.
+  last_detected_id: Arc<Mutex<Option<String>>>,
   custom_detectables: Arc<Mutex<Vec<Arc<DetectableActivity>>>>,
   scanning: Arc<AtomicBool>,
 
@@ -64,6 +67,9 @@ pub struct ProcessServer {
   db_url: Option<String>,
   /// Refresh the detectable games database periodically when set.
   enable_db_update: bool,
+  /// ETag captured by the startup fetch: seeds the refresh thread so its
+  /// first hourly check is conditional instead of a redundant full rebuild.
+  initial_db_etag: Option<String>,
 
   #[cfg(not(target_os = "linux"))]
   sysinfo: Arc<Mutex<System>>,
@@ -78,6 +84,7 @@ impl ProcessServer {
     event_listeners: ProcessEventListeners,
     db_url: Option<String>,
     enable_db_update: bool,
+    initial_db_etag: Option<String>,
   ) -> Self {
     log!("[Process Scanner] Building Aho-Corasick patterns for main detectable activities...");
     let (ac, idx) = build_ac_patterns(&detectable);
@@ -86,7 +93,7 @@ impl ProcessServer {
 
     let server = ProcessServer {
       scanning: Arc::new(AtomicBool::new(false)),
-      detected_list: Arc::new(Mutex::new(vec![])),
+      last_detected_id: Arc::new(Mutex::new(None)),
       custom_detectables: Arc::new(Mutex::new(vec![])),
       detectable_list: Arc::new(Mutex::new(detectable)),
       steam_map: Arc::new(Mutex::new(steam_map)),
@@ -105,6 +112,7 @@ impl ProcessServer {
       // Detectable database auto-refresh
       db_url,
       enable_db_update,
+      initial_db_etag,
 
       // sysinfo System
       #[cfg(not(target_os = "linux"))]
@@ -192,7 +200,10 @@ impl ProcessServer {
     if clone.enable_db_update && clone.db_url.is_some() {
       let db_clone = clone.clone();
       std::thread::spawn(move || {
-        let mut etag: Option<String> = None;
+        // Seeded from the startup fetch when available: the first check
+        // is conditional like every other, instead of one guaranteed
+        // redundant full rebuild per daemon lifetime.
+        let mut etag = db_clone.initial_db_etag.clone();
         loop {
           std::thread::sleep(Duration::from_secs(3600));
           let url = db_clone.db_url.clone().unwrap();
@@ -230,79 +241,80 @@ impl ProcessServer {
           }
         };
         let mut new_game_detected = false;
+        let mut last_id = clone.last_detected_id.lock().unwrap();
 
-        // If the detected list has changed, send only the first element
+        // If the detected list has changed, send only the first element.
+        // Every non-empty scan sends (downstream dedups repeats); only the
+        // tracked id changes what counts as "new". Fail-soft: a dead
+        // receiver means the connector is gone, so sleep and retry instead
+        // of panicking this loop (see the panic hook in cli/main.rs).
         if !detected.is_empty() {
-          let detected_list = clone.detected_list.lock().unwrap();
-
-          // If the detected list is empty, send the first element
-          if detected_list.is_empty() {
+          // If the detected id is different, it is a new game
+          if last_id.as_deref() != Some(detected[0].id.as_str()) {
             new_game_detected = true;
-            clone
-              .event_sender
-              .send(ProcessDetectedEvent {
-                activity: detected[0].clone(),
-              })
-              .unwrap();
-          } else {
-            // If the detected list is not empty, check if the first element is different
-            if detected[0].id != detected_list[0].id {
-              new_game_detected = true;
-            }
+          }
 
-            clone
-              .event_sender
-              .send(ProcessDetectedEvent {
-                activity: detected[0].clone(),
-              })
-              .unwrap();
+          if clone
+            .event_sender
+            .send(ProcessDetectedEvent {
+              activity: detected[0].clone(),
+            })
+            .is_err()
+          {
+            log!("[Process Scanner] Event receiver gone, retrying scan");
+            std::thread::sleep(wait_time);
+            continue;
           }
         }
 
-        // If there are no detected processes, send an empty message
+        // If there are no detected processes, send an empty message.
+        // Fail-soft like above: never panic the scan loop on send.
         if detected.is_empty() {
-          clone
-            .event_sender
-            .send(ProcessDetectedEvent {
-              activity: Arc::new(DetectableActivity {
-                bot_public: None,
-                bot_require_code_grant: None,
-                cover_image: None,
-                description: None,
-                developers: None,
-                executables: None,
-                flags: None,
-                guild_id: None,
-                hook: false,
-                icon: None,
-                id: "null".to_string(),
-                name: "".to_string(),
-                publishers: None,
-                rpc_origins: None,
-                splash: None,
-                third_party_skus: None,
-                type_field: None,
-                verify_key: None,
-                primary_sku_id: None,
-                slug: None,
-                aliases: None,
-                overlay: None,
-                overlay_compatibility_hook: None,
-                privacy_policy_url: None,
-                terms_of_service_url: None,
-                eula_id: None,
-                deeplink_uri: None,
-                tags: None,
-                pid: None,
-                timestamp: None,
-              }),
-            })
-            .unwrap();
+          let cleared = clone.event_sender.send(ProcessDetectedEvent {
+            activity: Arc::new(DetectableActivity {
+              bot_public: None,
+              bot_require_code_grant: None,
+              cover_image: None,
+              description: None,
+              developers: None,
+              executables: None,
+              flags: None,
+              guild_id: None,
+              hook: false,
+              icon: None,
+              id: "null".to_string(),
+              name: "".to_string(),
+              publishers: None,
+              rpc_origins: None,
+              splash: None,
+              third_party_skus: None,
+              type_field: None,
+              verify_key: None,
+              primary_sku_id: None,
+              slug: None,
+              aliases: None,
+              overlay: None,
+              overlay_compatibility_hook: None,
+              privacy_policy_url: None,
+              terms_of_service_url: None,
+              eula_id: None,
+              deeplink_uri: None,
+              tags: None,
+              pid: None,
+              timestamp: None,
+            }),
+          });
+          if cleared.is_err() {
+            log!("[Process Scanner] Event receiver gone, retrying scan");
+            std::thread::sleep(wait_time);
+            continue;
+          }
         }
 
         if new_game_detected {
-          // Set the detected list to the new list
-          *clone.detected_list.lock().unwrap() = detected;
+          // Remember only the id (never the activities: those would pin
+          // the previous database generation after every refresh).
+          *last_id = detected.first().map(|game| game.id.clone());
         }
 
         std::thread::sleep(wait_time);

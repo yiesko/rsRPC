@@ -216,7 +216,10 @@ fn handle_browser_command(
   };
 
   // Send the event away!
-  event_sender.send(event.clone()).unwrap();
+  if event_sender.send(event.clone()).is_err() {
+    log!("[Websocket] Event receiver gone, dropping message");
+    return;
+  }
 
   // Respond
   responder.send(Message::Text(serde_json::to_string(&response).unwrap()));
@@ -270,7 +273,10 @@ fn handle_set_activity(
   // Set the last activity for the client
   responder.0 = Some(event.clone());
 
-  event_sender.send(event.clone()).unwrap();
+  if event_sender.send(event.clone()).is_err() {
+    log!("[Websocket] Event receiver gone, dropping message");
+    return;
+  }
 
   // Confirm to the game client (arRPC-shaped reply); some RPC libraries
   // wait for this before considering the presence set.
@@ -308,6 +314,8 @@ fn handle_disconnect(
       nonce: activity_cmd.nonce.clone(),
     };
 
-    event_sender.send(activity_cmd).unwrap();
+    if event_sender.send(activity_cmd).is_err() {
+      log!("[Websocket] Event receiver gone, dropping clear");
+    }
   }
 }

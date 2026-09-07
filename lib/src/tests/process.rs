@@ -290,6 +290,7 @@ fn ac_probe_needs_directories_that_cwd_reconstructs() {
     ProcessEventListeners::default(),
     None,
     false,
+    None,
   );
   let reversed = |path: &str| path.chars().rev().collect::<String>();
   // Bare exe alone misses (no directories for the suffix to anchor on)...

@@ -42,18 +42,52 @@ struct Args {
   list_detected: bool,
 }
 
-fn fetch_detectable(url: &str) -> Result<String, Box<dyn std::error::Error>> {
-  let detectable = ureq::get(url)
-    .call()?
+fn fetch_detectable(url: &str) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
+  let response = ureq::get(url).call()?;
+  let etag = response
+    .headers()
+    .get("etag")
+    .and_then(|value| value.to_str().ok())
+    .map(str::to_string);
+  let detectable = response
     .into_body()
     .with_config()
     .limit(64 * 1024 * 1024)
     .read_to_string()?;
 
-  Ok(detectable)
+  Ok((detectable, etag))
+}
+
+/// Build the server from a fetched body: parse directly first (serde
+/// skips unknown fields — zero DOM transient, ~5x less startup memory),
+/// falling back to the trimmed form for entries missing required fields.
+/// Mirrors the lib refresh path so boot never pays the DOM pass.
+fn server_from_fetched(
+  detectable: String,
+  config: RPCConfig,
+) -> Result<rsrpc::RPCServer, Box<dyn std::error::Error>> {
+  let use_trimmed = serde_json::from_str::<Vec<DetectableActivity>>(&detectable).is_err();
+  let body = if use_trimmed {
+    trim_detectable(&detectable).unwrap_or(detectable)
+  } else {
+    detectable
+  };
+  rsrpc::RPCServer::from_json_str(body, config)
 }
 
 pub fn main() -> Result<(), Box<dyn std::error::Error>> {
+  // Fail-fast supervision (ADR-1): worker threads dying silently would
+  // leave a zombie daemon (systemd green, detection/bridge dead) that
+  // Restart=on-failure can never catch. Any panic anywhere exits the
+  // process after the default hook logs it, so systemd restarts us into
+  // a clean state (stale sockets/IPC are reclaimed on boot by design).
+  // Binary-only: the library (and its tests) keep default behavior.
+  let default_hook = std::panic::take_hook();
+  std::panic::set_hook(Box::new(move |info| {
+    default_hook(info);
+    eprintln!("[rsrpc] worker panic, exiting for supervisor restart");
+    std::process::exit(1);
+  }));
   // When running as a binary, enable logs.
   // SAFETY: called on the main thread at startup, before any other thread
   // exists, so no concurrent environment access can occur.
@@ -70,7 +104,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
       None
     }
   });
-  let config = RPCConfig {
+  let mut config = RPCConfig {
     enable_process_scanner: !args.no_process_scan,
     port: args.bridge_port,
     msgpack_port: args.msgpack_port,
@@ -93,9 +127,9 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
   } else if let Some(url) = args.db_url {
     // A custom database URL was provided; fetch it with offline fallback
     match fetch_detectable(&url) {
-      Ok(detectable) => {
-        let trimmed = trim_detectable(&detectable).unwrap_or(detectable);
-        rsrpc::RPCServer::from_json_str(trimmed, config)?
+      Ok((detectable, etag)) => {
+        config.initial_db_etag = etag;
+        server_from_fetched(detectable, config)?
       }
       Err(err) => {
         eprintln!(
@@ -108,9 +142,9 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
   } else if args.enable_db_update {
     // Fetch the official DB with trim + offline fallback; keep db_url in config for hourly refresh
     match fetch_detectable(DEFAULT_DB_URL) {
-      Ok(detectable) => {
-        let trimmed = trim_detectable(&detectable).unwrap_or(detectable);
-        rsrpc::RPCServer::from_json_str(trimmed, config)?
+      Ok((detectable, etag)) => {
+        config.initial_db_etag = etag;
+        server_from_fetched(detectable, config)?
       }
       Err(err) => {
         eprintln!(
