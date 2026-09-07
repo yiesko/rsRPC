@@ -204,18 +204,28 @@ impl ProcessServer {
         // is conditional like every other, instead of one guaranteed
         // redundant full rebuild per daemon lifetime.
         let mut etag = db_clone.initial_db_etag.clone();
+        // Content hash of the last built database: guards against CDN etag
+        // flaps (new tag, identical bytes), which a tag-only check would
+        // rebuild pointlessly.
+        let mut content_hash: Option<u64> = None;
         loop {
           std::thread::sleep(Duration::from_secs(3600));
           let url = db_clone.db_url.clone().unwrap();
-          match fetch_detectable_etag(&url, etag.as_deref()) {
+          match fetch_detectable_etag(&url, etag.as_deref(), content_hash) {
             Ok(FetchOutcome::Unchanged) => {
               log!("[Process Scanner] Detectable database unchanged (304), keeping current");
             }
+            Ok(FetchOutcome::SameContent { etag: new_tag }) => {
+              etag = new_tag;
+              log!("[Process Scanner] Detectable database bytes unchanged, keeping current");
+            }
             Ok(FetchOutcome::Updated {
               etag: new_tag,
+              content_hash: new_hash,
               detectable,
             }) => {
               etag = new_tag;
+              content_hash = Some(new_hash);
               db_clone.update_main_detectables(detectable);
             }
             Err(err) => {
@@ -858,13 +868,28 @@ pub(crate) fn match_aux_process(
 }
 
 /// Outcome of one conditional refresh: either the database changed (new
-/// ETag + parsed activities) or it did not (keep everything as is).
+/// ETag + parsed activities), its bytes are identical (new ETag, same
+/// content: CDN etags flap without content changes), or the server said
+/// 304 (keep everything as is).
 pub(crate) enum FetchOutcome {
   Unchanged,
+  SameContent {
+    etag: Option<String>,
+  },
   Updated {
     etag: Option<String>,
+    content_hash: u64,
     detectable: Vec<DetectableActivity>,
   },
+}
+
+/// Content hash for change detection (std-only SipHash: deterministic
+/// within a run, which is the only scope it is ever compared in).
+pub(crate) fn body_hash(body: &str) -> u64 {
+  use std::hash::{DefaultHasher, Hash, Hasher};
+  let mut hasher = DefaultHasher::new();
+  body.hash(&mut hasher);
+  hasher.finish()
 }
 
 /**
@@ -876,6 +901,7 @@ pub(crate) enum FetchOutcome {
 pub(crate) fn fetch_detectable_etag(
   url: &str,
   etag: Option<&str>,
+  known_hash: Option<u64>,
 ) -> Result<FetchOutcome, Box<dyn std::error::Error>> {
   let mut request = ureq::get(url);
   if let Some(tag) = etag {
@@ -896,6 +922,13 @@ pub(crate) fn fetch_detectable_etag(
     .limit(64 * 1024 * 1024)
     .read_to_string()?;
 
+  // Same bytes under a new tag (CDN etag flaps): skip the rebuild, which
+  // is where the retained memory comes from — not the download.
+  let content_hash = body_hash(&body);
+  if known_hash.is_some_and(|known| known == content_hash) {
+    return Ok(FetchOutcome::SameContent { etag });
+  }
+
   // Direct parse first: serde skips unknown fields, so the full body
   // parses with zero DOM overhead (~5x less transient memory than the
   // trimmed-Value pass). The trimming pass stays as fallback for entries
@@ -903,6 +936,7 @@ pub(crate) fn fetch_detectable_etag(
   if let Ok(parsed) = serde_json::from_str::<Vec<DetectableActivity>>(&body) {
     return Ok(FetchOutcome::Updated {
       etag,
+      content_hash,
       detectable: parsed,
     });
   }
@@ -911,11 +945,13 @@ pub(crate) fn fetch_detectable_etag(
   {
     return Ok(FetchOutcome::Updated {
       etag,
+      content_hash,
       detectable: parsed,
     });
   }
   Ok(FetchOutcome::Updated {
     etag,
+    content_hash,
     detectable: serde_json::from_str(&body)?,
   })
 }

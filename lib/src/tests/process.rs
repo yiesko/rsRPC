@@ -310,11 +310,15 @@ fn conditional_refresh_skips_unchanged_database() {
 
   use crate::server::process::fetch_detectable_etag;
 
-  // Local stub server: 304 when the tag matches, else 200 + tiny DB.
+  // Local stub server: 304 when the tag matches the last issued one;
+  // 200 + tiny DB with a rotating tag otherwise (CDN flap simulator).
   let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
   let port = listener.local_addr().unwrap().port();
+  let issued: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+    std::sync::Arc::new(std::sync::Mutex::new(None));
+  let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
   std::thread::spawn(move || {
-    for stream in listener.incoming().take(2) {
+    for stream in listener.incoming().take(3) {
       let mut stream = match stream {
         Ok(stream) => stream,
         Err(_) => continue,
@@ -322,14 +326,22 @@ fn conditional_refresh_skips_unchanged_database() {
       let mut buf = vec![0u8; 4096];
       let n = stream.read(&mut buf).unwrap_or(0);
       let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+      let sent_tag = request.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        (name.trim().to_lowercase() == "if-none-match").then(|| value.trim().to_string())
+      });
 
-      let body = if request.to_lowercase().contains("if-none-match: \"abc\"") {
-        "HTTP/1.1 304 Not Modified\r\nETag: \"abc\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-          .to_string()
+      let body = if sent_tag.is_some() && sent_tag.as_deref() == issued.lock().unwrap().as_deref() {
+        "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
       } else {
+        let tag = format!(
+          "\"tag-{}\"",
+          counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        *issued.lock().unwrap() = Some(tag.clone());
         let db = "[]";
         format!(
-          "HTTP/1.1 200 OK\r\nETag: \"abc\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+          "HTTP/1.1 200 OK\r\nETag: {tag}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
           db.len(),
           db
         )
@@ -338,18 +350,31 @@ fn conditional_refresh_skips_unchanged_database() {
     }
   });
   let url = format!("http://127.0.0.1:{port}/db");
+  let no_hash = None;
 
   // No tag yet: full fetch, empty DB, tag captured.
-  let (tag, empty) = match fetch_detectable_etag(&url, None).unwrap() {
-    crate::server::process::FetchOutcome::Updated { etag, detectable } => (etag, detectable),
+  let (tag, empty) = match fetch_detectable_etag(&url, None, no_hash).unwrap() {
+    crate::server::process::FetchOutcome::Updated {
+      etag, detectable, ..
+    } => (etag, detectable),
     crate::server::process::FetchOutcome::Unchanged => panic!("first fetch must download"),
+    crate::server::process::FetchOutcome::SameContent { .. } => {
+      panic!("nothing known yet, cannot be same-content")
+    }
   };
   assert!(empty.is_empty());
-  assert_eq!(tag.as_deref(), Some("\"abc\""));
+  let tag = tag.expect("stub always tags 200s");
 
   // Same tag: 304, nothing downloaded or parsed.
   assert!(matches!(
-    fetch_detectable_etag(&url, tag.as_deref()),
+    fetch_detectable_etag(&url, Some(&tag), no_hash),
     Ok(crate::server::process::FetchOutcome::Unchanged)
+  ));
+
+  // Rotated tag, identical bytes: no rebuild (the flap case).
+  let known = crate::server::process::body_hash("[]");
+  assert!(matches!(
+    fetch_detectable_etag(&url, Some("\"stale\""), Some(known)),
+    Ok(crate::server::process::FetchOutcome::SameContent { .. })
   ));
 }
