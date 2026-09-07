@@ -302,3 +302,53 @@ fn ac_probe_needs_directories_that_cwd_reconstructs() {
     Some("424242424242424242".to_string())
   );
 }
+
+#[test]
+fn conditional_refresh_skips_unchanged_database() {
+  use std::io::{Read, Write};
+
+  use crate::server::process::fetch_detectable_etag;
+
+  // Local stub server: 304 when the tag matches, else 200 + tiny DB.
+  let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+  let port = listener.local_addr().unwrap().port();
+  std::thread::spawn(move || {
+    for stream in listener.incoming().take(2) {
+      let mut stream = match stream {
+        Ok(stream) => stream,
+        Err(_) => continue,
+      };
+      let mut buf = vec![0u8; 4096];
+      let n = stream.read(&mut buf).unwrap_or(0);
+      let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+
+      let body = if request.to_lowercase().contains("if-none-match: \"abc\"") {
+        "HTTP/1.1 304 Not Modified\r\nETag: \"abc\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+          .to_string()
+      } else {
+        let db = "[]";
+        format!(
+          "HTTP/1.1 200 OK\r\nETag: \"abc\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+          db.len(),
+          db
+        )
+      };
+      let _ = stream.write_all(body.as_bytes());
+    }
+  });
+  let url = format!("http://127.0.0.1:{port}/db");
+
+  // No tag yet: full fetch, empty DB, tag captured.
+  let (tag, empty) = match fetch_detectable_etag(&url, None).unwrap() {
+    crate::server::process::FetchOutcome::Updated { etag, detectable } => (etag, detectable),
+    crate::server::process::FetchOutcome::Unchanged => panic!("first fetch must download"),
+  };
+  assert!(empty.is_empty());
+  assert_eq!(tag.as_deref(), Some("\"abc\""));
+
+  // Same tag: 304, nothing downloaded or parsed.
+  assert!(matches!(
+    fetch_detectable_etag(&url, tag.as_deref()),
+    Ok(crate::server::process::FetchOutcome::Unchanged)
+  ));
+}
