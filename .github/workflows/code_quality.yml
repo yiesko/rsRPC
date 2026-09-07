@@ -98,3 +98,28 @@ jobs:
         run: cargo doc --manifest-path ./Cargo.toml --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
+
+  audit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Security audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  msrv:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@1.88
+
+      - name: Generate detectable snapshot
+        run: cargo run --manifest-path tools/updater/Cargo.toml
+
+      - name: MSRV check
+        run: cargo check --manifest-path ./Cargo.toml --workspace --all-targets --locked

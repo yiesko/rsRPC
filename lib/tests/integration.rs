@@ -182,3 +182,18 @@ fn missing_args_yields_no_activity_payload() {
   assert!(cached_activity(&mut cmd).is_none());
   assert!(set_activity_response(&cmd).is_none());
 }
+
+#[test]
+fn from_json_str_returns_error_instead_of_panicking() {
+  // Library constructors must never panic on caller input: invalid JSON
+  // is an Err, and so is valid JSON with the wrong shape.
+  assert!(rsrpc::RPCServer::from_json_str("not json at all", RPCConfig::default()).is_err());
+  assert!(rsrpc::RPCServer::from_json_str(r#"{"not": "a list"}"#, RPCConfig::default()).is_err());
+  assert!(
+    rsrpc::RPCServer::from_json_str(
+      r#"[{"id": "1", "name": "Probe", "hook": true}]"#,
+      RPCConfig::default()
+    )
+    .is_ok()
+  );
+}

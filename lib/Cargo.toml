@@ -4,6 +4,12 @@ version = "0.30.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["spikehd"]
+description = "Alternative Discord RPC server library: process detection, IPC/WebSocket transports and an arRPC-compatible activity bridge"
+license = "MIT"
+readme = "../README.md"
+repository = "https://github.com/yiesko/rsRPC"
+keywords = ["discord", "rich-presence", "rpc", "bridge", "gaming"]
+categories = ["network-programming"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

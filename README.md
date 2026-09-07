@@ -32,7 +32,7 @@
 
 ## Testing it out
 
-1. Download a binary from [releases](https://github.com/SpikeHD/rsRPC/releases), [GitHub Actions](https://www.github.com/SpikeHD/rsRPC/actions) or build it yourself below!
+1. Download a binary from [releases](https://github.com/yiesko/rsRPC/releases), [GitHub Actions](https://www.github.com/yiesko/rsRPC/actions) or build it yourself below!
 2. If you just want to use the bundled detectable snapshot, just run the binary (works fully offline, no `detectable.json` needed)!
 3. If you want to use your own detectable list, place a `detectable.json` file in the same directory as the binary (you can use [the arRPC one](https://raw.githubusercontent.com/OpenAsar/arrpc/main/src/process/detectable.json) as an example), then run the binary with `./rsrpc-cli -d ./detectable.json`
 
@@ -75,6 +75,9 @@ Every option also has a corresponding environment variable (e.g. `RSRPC_BRIDGE_P
 * Executable matching uses Aho-Corasick over reversed paths with `64`/`.x64`/`x64`/`_64` variants (e.g. `wow64.exe` matches `wow.exe`).
 * Entries with empty `executables` are still matched via Steam AppId (Linux reads `SteamAppId` from `/proc/<pid>/environ`) or via an exact exe-stem == multi-word game-name fallback (e.g. `how to fish.exe` → `How to Fish`; single-word names like `fish` never match).
 * The main DB is filtered by executable OS (`win32`/`darwin`/`linux`); custom overrides from `overrides.json`/`append_detectables` bypass that filter so win32-only entries are detected under Proton/Wine, and always win over the main DB.
+* Entries with empty `executables` are additionally matched by install-folder name (e.g. `.../Meccha Chameleon/...` → `MECCHA CHAMELEON`; multi-word names only, so generic folders never hit).
+* Launches with a bare exe name (no directories in argv[0], common under Proton) are retried joined with the process cwd.
+* Suspended (`SIGSTOP'd`) processes count as absent (a frozen frame is not gameplay); they are republished on resume.
 
 ### Custom overrides (`overrides.json`)
 
@@ -88,6 +91,11 @@ File contains a JSON array of `DetectableActivity` objects. Resolution order: `-
 ```
 
 Uses the main DB only; `overrides.json` diagnostics require a running server.
+
+### Known limitations
+
+* **No OAuth/`AUTHORIZE` flow**: the bridge forwards `SET_ACTIVITY` (and a few browser/deeplink commands) but cannot complete authorization — that needs a route game → real Discord client plus the app's `client_secret`, which only the game developer has. Games that log in via RPC need direct access to the Discord client socket (stop rsRPC while playing them).
+* **`detect_once` on a started server** returns nothing: `start()` moves the database to the scanner (single ownership, no duplicated generations). One-shot users (CLI `--list-detected`, per-tick scanners that never start) are unaffected.
 
 ## Building the binary
 
@@ -105,7 +113,7 @@ fresh clone builds without network access to Discord. To refresh it, run
 
 ```toml
 [dependencies]
-rsrpc = { git = "https://www.github.com/SpikeHD/rsRPC", tag = "VERSION_NUMBER_HERE" }
+rsrpc = { git = "https://www.github.com/yiesko/rsRPC", tag = "VERSION_NUMBER_HERE" }
 ```
 
 2. Use the library in your code:

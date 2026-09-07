@@ -95,9 +95,10 @@ impl RPCServer {
     detectable: impl AsRef<str>,
     config: RPCConfig,
   ) -> Result<Self, Box<dyn std::error::Error>> {
-    // Parse as DetectableActivity vector, panic if invalid
-    let detectable: Vec<DetectableActivity> =
-      serde_json::from_str(detectable.as_ref()).expect("Invalid JSON provided to RPCServer");
+    // Parse as DetectableActivity vector; invalid JSON is a caller error,
+    // propagated (never panics: this is a library constructor).
+    let detectable: Vec<DetectableActivity> = serde_json::from_str(detectable.as_ref())
+      .map_err(|err| format!("Invalid JSON provided to RPCServer: {err}"))?;
 
     let detectable: Vec<Arc<DetectableActivity>> = detectable.into_iter().map(Arc::new).collect();
 
