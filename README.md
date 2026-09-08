@@ -15,14 +15,18 @@
 * Websocket-based RPC detection (loopback only)
 * Bridge that forwards game activities to web clients via both a **JSON** port (`1337`) and a **MessagePack** port (`1338`)
 * arRPC-shaped `SET_ACTIVITY` confirmation replies on both IPC and websocket transports
-* Handshake validation (invalid versions / missing client IDs are rejected with close codes)
-* `INVITE_BROWSER`, `DEEP_LINK`, `CONNECTIONS_CALLBACK` support
+* Handshake validation (invalid versions / missing client IDs are rejected with close codes; oversize frames refused with `1003`, unknown opcodes rejected)
+* `SUBSCRIBE`/`UNSUBSCRIBE` ACKs, `GET_USER` (current identity or `null`), `INVITE_BROWSER` / `GUILD_TEMPLATE_BROWSER` / `GIFT_CODE_BROWSER` (forward + ACK; websocket rejects missing codes with `4011`/`4017`/`4016`), `DEEP_LINK`, `CONNECTIONS_CALLBACK` refusal
+* Official errors for unbacked commands: OAuth → `5000`, activity invites → `5006`, voice/guilds/overlay/store → honest "requires the real Discord client"
+* Clickable-asset URL fields (`details_url`, `state_url`, `large_url`, `small_url`) preserved through the bridge
 * Bundled offline detectable snapshot with optional automatic database refresh (fetch the detectable list every hour, like pog5-rsrpc)
 * `plugin/rsrpc.js` - optional Vencord plugin / userscript / Node client that receives activity from the bridge (not embedded in the Rust binary)
 * Custom overrides via `overrides.json` (added on the fly, bypass the OS filter so win32 entries work under Proton/Wine)
 * Adding new processes on the fly
 * Manually triggering scans
-* Single-shot diagnostics via `--list-detected`
+* Single-shot diagnostics via `--list-detected` and `--list-database`
+* IPC-wins handoff: generic process detection shows immediately, yields
+  to live game-SDK presence, and resumes when it clears (see below)
 
 # Building
 
@@ -42,8 +46,13 @@
   -d, --detectable-file <FILE>    Path to a custom detectable games list
   -n, --no-process-scan           Disable process detection
                                   (alias: --no-process-scanning)
-      --bridge-port <PORT>        Bridge JSON port (default: 1337)
-      --msgpack-port <PORT>       Bridge MessagePack port (default: 1338)
+      --bridge-port <PORT>        Bridge JSON port range start (default: 1337;
+                                   scans up to --bridge-port-end, arRPC scans
+                                   1337-1347)
+      --bridge-port-end <PORT>    Bridge JSON port range end, inclusive
+                                   (default: 1347)
+      --msgpack-port <PORT>       Bridge MessagePack port (default: 1338;
+                                   moves forward on collision with the JSON port)
       --ws-port-start <PORT>      First websocket port for games (default: 6463)
       --ws-port-end <PORT>        Last websocket port for games, inclusive (default: 6472)
       --scan-interval-secs <SECS> Process scan interval in seconds (default: 5)
@@ -55,13 +64,24 @@
                                   used as custom overrides (default: $RSRPC_OVERRIDES_FILE,
                                   $XDG_CONFIG_HOME/rsrpc/overrides.json,
                                   ~/.config/rsrpc/overrides.json)
+      --ignore-ids <IDS>          Comma-separated application IDs the process
+                                   scanner never publishes (full silence for
+                                   those slots). Scan-only by design:
+                                   forwarded client frames always pass.
+                                   `$RSRPC_IGNORE_IDS`
       --list-detected             Run a single process scan, print detected
-                                  games and exit (main DB only; custom
-                                  overrides require a running server)
+                                   games and exit (main DB only; custom
+                                   overrides require a running server)
+      --list-database             Print a database summary (entry/executable
+                                   counts + first entries) and exit
   -D, --debug                     Print the resolved configuration
 ```
 
 Every option also has a corresponding environment variable (e.g. `RSRPC_BRIDGE_PORT`, `RSRPC_MSGPACK_PORT`, `RSRPC_OVERRIDES_FILE`, `RSRPC_LIST_DETECTED`, `RSRPC_DEBUG`).
+
+### Logging
+
+Severities, chattiest first: `DEBUG` (per-tick internals, needs `--debug`/`RSRPC_DEBUG=1`), `INFO` (one line per state change: detects, clears, connects, hourly DB checks), `WARN` (degraded but continuing: fallbacks, retries, pruned clients), `ERROR` (failed operations). `RSRPC_LOGS_ENABLED=1` (set by the binary) gates everything; `RSRPC_LOG_LEVEL=debug|info|warn|error` (default `info`) sets the floor. `INFO` keeps the historical untagged shape; other levels print `[DEBUG]`/`[WARN]`/`[ERROR]` tags.
 
 ### Detectable database (offline snapshot & refresh)
 
@@ -91,6 +111,31 @@ File contains a JSON array of `DetectableActivity` objects. Resolution order: `-
 ```
 
 Uses the main DB only; `overrides.json` diagnostics require a running server.
+
+### IPC-wins handoff (generic ↔ companion)
+
+No `--ignore-ids` needed for companions anymore. When a game is only
+process-detected, the generic card shows immediately. The moment a game
+SDK (or companion like wwrpc) publishes `SET_ACTIVITY` for the same app,
+the generic card is withdrawn; when that source clears, the generic card
+comes back while the game process is still alive (liveness-checked, so no
+flash on exit). Takeover rule across companions: **last publisher wins** —
+a stale close from a superseded publisher is ignored instead of wrongly
+resuming the generic card. No wire-format change: coexistence is keyed by
+the existing `socketId = pid` convention.
+
+```bash
+./rsrpc-cli --list-database
+# 24208 database entries, 11226 executables
+# Overwatch (356875221078245376)
+# ...
+```
+
+### Identity (`READY` user) and state snapshot
+
+* The `DISPATCH`/`READY` identity defaults to arRPC's (`arRPC/1045800378228281345`); override at startup with `RSRPC_USER_ID`, `RSRPC_USER_USERNAME`, `RSRPC_USER_GLOBAL_NAME`, `RSRPC_USER_DISCRIMINATOR`, `RSRPC_USER_AVATAR`.
+* Bridge clients can patch it at runtime with `SET_USER` (`{"type":"SET_USER","patch":{...}}`, whitelisted keys only) and restore it with `RESET_USER`; both are ACKed (`SET_USER_ACK`/`RESET_USER_ACK`), and identity changes fan out as the official `CURRENT_USER_UPDATE` DISPATCH to bridge clients (IPC/WS game clients learn it on their next handshake).
+* `RSRPC_STATE_FILE=1` writes an arRPC-layout snapshot to `<tmpdir>/rsrpc-state-{0..9}` (`servers` + `activities`), rewritten on every broadcast and every 30s refresh tick; removed on graceful shutdown (SIGINT), reclaimed by mtime otherwise.
 
 ### Known limitations
 
@@ -152,11 +197,13 @@ server.start();
 
 | Field | Default | Meaning |
 |---|---|---|
-| `port` | `1337` | Bridge JSON port (`--bridge-port` / `RSRPC_BRIDGE_PORT`) |
+| `port` | `1337` | Bridge JSON port range start (`--bridge-port` / `RSRPC_BRIDGE_PORT`) |
+| `bridge_port_end` | `1347` | Bridge JSON port range end, inclusive |
 | `msgpack_port` | `1338` | Bridge MessagePack port (`--msgpack-port` / `RSRPC_MSGPACK_PORT`) |
 | `ws_port_start` / `ws_port_end` | `6463` / `6472` | Game websocket range, inclusive |
 | `scan_interval_secs` | `5` | Process scan interval (`--scan-interval-secs` / `RSRPC_SCAN_INTERVAL`) |
 | `db_url` / `enable_db_update` | `None` / `false` | Hourly DB refresh source + toggle |
+| `ignored_ids` | `[]` | App IDs the scanner never publishes (`--ignore-ids` / `RSRPC_IGNORE_IDS`) |
 
 ### Runtime API
 
@@ -165,6 +212,9 @@ use rsrpc::DetectedGame;
 
 // Single scan without threads (main DB only; returns id/name/pid).
 let games: Vec<DetectedGame> = server.detect_once()?;
+
+// Database summary without threads (entry/executable counts + names).
+let summary: Vec<rsrpc::DetectableSummary> = server.database_summary()?;
 
 // Add/remove entries after start() (bypass the OS filter, win over main DB).
 server.append_detectables(overrides);
@@ -202,7 +252,8 @@ Notes:
 
 * Default is arRPC-compatible JSON (`new RsRpcClient(false)`); no extra dependency.
 * MessagePack (`true`) needs `@msgpack/msgpack`: `<script src="https://unpkg.com/@msgpack/msgpack"></script>`.
-* Ports are configurable (`--bridge-port` / `--msgpack-port`); the client accepts `options: { jsonPort, msgpackPort, reconnectInterval }`.
+* Ports are configurable (`--bridge-port`/`--bridge-port-end`/`--msgpack-port`); the JSON bridge scans its range like arRPC (1337-1347) and the MessagePack port steps aside on collision; the client accepts `options: { jsonPort, msgpackPort, reconnectInterval }`.
+* Bridge control messages (JSON port): `SET_USER`/`RESET_USER` (see Identity above). Presence frames still echo to the sender; cached activities replay to late joiners and refresh every 30s.
 
 ## Testing & benchmarks
 

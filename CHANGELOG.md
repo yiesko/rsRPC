@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-09-08
+
+### Added
+- arRPC protocol parity: `SUBSCRIBE`/`UNSUBSCRIBE` blind ACKs, `Unknown
+  command` / `CONNECTIONS_CALLBACK is not supported` ERROR replies
+  (code 1000), invite-code validation (4011/4017), malformed-frame
+  rejection (4005), 1 MiB IPC payload limit with `1003` close, refusal
+  of unknown packet types (1003) instead of misreading them as frames.
+- Microsecond/nanosecond timestamp normalization to milliseconds
+  (seconds/milliseconds behavior unchanged).
+- Bridge port-range scan (`--bridge-port`..`--bridge-port-end`,
+  default 1337-1347 like arRPC) with MessagePack collision skip.
+- Bounded bridge replay cache (50 entries, oldest-first eviction) with
+  30s rebroadcast refresh for late/missed clients.
+- Runtime identity: `RSRPC_USER_*` startup overrides plus bridge
+  `SET_USER`/`RESET_USER` with ACKs (whitelisted keys only, blank
+  strings ignored like the env overrides, huge integers clamped
+  instead of wrapping); READY frames reflect the current identity on
+  every transport.
+- Presence state snapshot (`RSRPC_STATE_FILE=1` writes
+  `<tmpdir>/rsrpc-state-{0..9}` with servers + activities, arRPC
+  layout, `rsrpc-` prefix); `--list-database` summary diagnostics.
+- Official-protocol gaps closed: `GET_USER` (current identity, or
+  `null` for other ids) on IPC + websocket; `GIFT_CODE_BROWSER`
+  forwarded like the other `*_BROWSER` commands (`4016` on missing
+  code); clickable-asset URL fields (`details_url`, `state_url`,
+  `large_url`, `small_url`) preserved through the bridge;
+  `CURRENT_USER_UPDATE` DISPATCH fanned out to bridge clients on
+  `SET_USER`/`RESET_USER`.
+- Honest errors for known-but-unbacked commands (shared table):
+  OAuth → `5000`, activity invites → `5006`, voice/guilds/overlay/
+  store → "requires the real Discord client"; genuinely unknown
+  commands still get `Unknown command`.
+- IPC-wins handoff: generic process detection shows immediately and
+  yields its slot when a game SDK publishes for the same app (last
+  publisher wins across companions; stale closes ignored), resuming
+  while the game process is still alive when the source clears.
+  `--ignore-ids` stays as full-silence opt-in, no longer needed for
+  companions.
+- Stale IPC socket PING/PONG probe (1s): wedged holders are reclaimed,
+  live holders (Discord/arRPC/rsRPC) are left alone.
+- `--ignore-ids` / `RSRPC_IGNORE_IDS`: scan-only coexistence filter —
+  ignored application IDs behave as absent (null event, clear) so a
+  richer publisher owns those slots; forwarded client frames always
+  pass, and `--list-detected` still shows ignored games.
+- Log severity system (`DEBUG`/`INFO`/`WARN`/`ERROR`): `RSRPC_LOG_LEVEL`
+  sets the floor (default `info`), `--debug` / `RSRPC_DEBUG=1` forces
+  debug and prints the resolved config; `INFO` keeps the historical
+  untagged shape, other levels are tagged.
+- Presence log lines: `Published: {name} (app {id}, pid {pid})` via a
+  `display_name()` fallback (name → details → state → `?`), `INFO` on
+  change and `DEBUG` on duplicate republishes/clears.
+
+### Changed
+- Tree-wide log reclassification: per-tick chatter (scan ticks, match
+  details, repeat sends) demoted to `DEBUG`, fallbacks/retries/prunes
+  to `WARN`, so the default log shows one line per state change.
+- Hourly DB refresh logs condensed to one line per check (`DB check:
+  unchanged (etag …)` / `same bytes` / `updated: N entries`).
+- `SUBSCRIBE`/`UNSUBSCRIBE` and unknown/unbacked commands are answered
+  at the edge (ACK/ERROR) and no longer forwarded to bridge clients;
+  only `SET_ACTIVITY` and the known secondary commands
+  (`INVITE_BROWSER`, `GUILD_TEMPLATE_BROWSER`, `GIFT_CODE_BROWSER`,
+  `DEEP_LINK`) reach the bridge.
+- State snapshot is rewritten on every 30s refresh tick, so a
+  live-but-idle daemon never looks stale to slot reuse.
+
+### Fixed
+- `SET_USER` patch can no longer wipe identity fields with blank
+  strings or wrap `flags`/`premium_type` on out-of-range integers.
+
 ## [0.31.0] - 2026-09-07
 
 ### Added
@@ -49,6 +120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Stuck presence after game close.
 
-[Unreleased]: https://github.com/yiesko/rsRPC/compare/v0.31.0...HEAD
+[Unreleased]: https://github.com/yiesko/rsRPC/compare/v0.32.0...HEAD
+[0.32.0]: https://github.com/yiesko/rsRPC/releases/tag/v0.32.0
 [0.31.0]: https://github.com/yiesko/rsRPC/releases/tag/v0.31.0
 [0.30.0]: https://github.com/yiesko/rsRPC/releases/tag/v0.30.0
