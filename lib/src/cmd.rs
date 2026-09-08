@@ -124,6 +124,8 @@ pub struct ActivityCmdArgs {
 pub struct Party {
   pub id: Option<String>,
   pub size: Option<Vec<u32>>,
+  /// 0 = private, 1 = public (official party privacy).
+  pub privacy: Option<u32>,
 }
 
 #[skip_serializing_none]
@@ -191,6 +193,8 @@ pub struct Activity {
   pub state_url: Option<String>,
   pub sync_id: Option<String>,
   pub instance: Option<bool>,
+  /// Which field the member list shows (0 = name, 1 = state, 2 = details).
+  pub status_display_type: Option<u32>,
   pub flags: Option<u32>,
   pub emoji: Option<Emoji>,
   pub party: Option<Party>,

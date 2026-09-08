@@ -400,3 +400,30 @@ fn activity_urls_survive_fix_and_bridge_encoding() {
     "https://example.wiki/heroes/Pharah"
   );
 }
+
+#[test]
+fn party_privacy_and_status_display_survive_bridge() {
+  // Previously dropped silently (serde ignores unknown fields): a full
+  // party + display-type payload must cross untouched.
+  let mut cmd = parse_cmd(
+    r#"{
+        "cmd": "SET_ACTIVITY",
+        "args": {
+          "pid": 42,
+          "activity": {
+            "name": "Test",
+            "party": {"id": "p1", "size": [3, 6], "privacy": 1},
+            "status_display_type": 2
+          }
+        },
+        "nonce": "n"
+      }"#,
+  );
+  let cached = crate::commands::cached_activity(&mut cmd).expect("encodes");
+  let payload: serde_json::Value = serde_json::from_str(&cached.json).expect("valid json");
+  assert_eq!(
+    payload["activity"]["party"],
+    serde_json::json!({"id": "p1", "size": [3, 6], "privacy": 1})
+  );
+  assert_eq!(payload["activity"]["status_display_type"], 2);
+}

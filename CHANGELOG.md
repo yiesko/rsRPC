@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.1] - 2026-09-08
+
+### Added
+- `docs/systemd-user-units.md`: practical guide to user units
+  (anatomy, drop-ins, lifecycle, logs, linger, gotchas, from-scratch
+  recipe) with real examples from this setup.
+
+### Fixed
+- `party.privacy` (0 = private, 1 = public) and `status_display_type`
+  (0 = name, 1 = state, 2 = details) were silently dropped on parse
+  (serde ignores unknown fields) — real SDKs (pypresence, Tauon) send
+  them. Both now cross the bridge untouched.
+
 ## [0.32.0] - 2026-09-08
 
 ### Added
@@ -120,7 +133,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Stuck presence after game close.
 
-[Unreleased]: https://github.com/yiesko/rsRPC/compare/v0.32.0...HEAD
+[Unreleased]: https://github.com/yiesko/rsRPC/compare/v0.32.1...HEAD
+[0.32.1]: https://github.com/yiesko/rsRPC/releases/tag/v0.32.1
 [0.32.0]: https://github.com/yiesko/rsRPC/releases/tag/v0.32.0
 [0.31.0]: https://github.com/yiesko/rsRPC/releases/tag/v0.31.0
 [0.30.0]: https://github.com/yiesko/rsRPC/releases/tag/v0.30.0
