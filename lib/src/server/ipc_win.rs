@@ -7,16 +7,19 @@ use std::sync::{Arc, Mutex};
 
 use crate::cmd::ActivityCmd;
 use crate::log;
+use crate::user::RpcUser;
 
 use super::ipc_utils::{IpcFacilitator, handle_stream};
 
 #[derive(Clone)]
 pub struct IpcConnector {
   socket: Arc<Mutex<Listener>>,
+  socket_path: String,
   did_handshake: bool,
   pub client_id: String,
   pub pid: u64,
   pub nonce: String,
+  user: Arc<Mutex<RpcUser>>,
 
   event_sender: mpsc::Sender<ActivityCmd>,
 }
@@ -54,9 +57,18 @@ impl IpcFacilitator for IpcConnector {
     self.nonce = nonce;
   }
 
+  fn user_payload(&self) -> String {
+    self.user.lock().unwrap().ready_payload()
+  }
+
+  fn current_user(&self) -> RpcUser {
+    self.user.lock().unwrap().clone()
+  }
+
   fn recreate_socket(&mut self) {
-    let socket = Self::create_socket(None);
+    let (socket, socket_path) = Self::create_socket(None);
     *self.socket.lock().unwrap() = socket;
+    self.socket_path = socket_path;
   }
 
   /**
@@ -97,18 +109,26 @@ impl IpcConnector {
   /**
    * Create a socket and return a new IpcConnector
    */
-  pub fn new(event_sender: mpsc::Sender<ActivityCmd>) -> Self {
+  pub fn new(event_sender: mpsc::Sender<ActivityCmd>, user: Arc<Mutex<RpcUser>>) -> Self {
+    let (socket, socket_path) = Self::create_socket(None);
     Self {
-      socket: Arc::new(Mutex::new(Self::create_socket(None))),
+      socket: Arc::new(Mutex::new(socket)),
+      socket_path,
       did_handshake: false,
       client_id: "".to_string(),
       pid: 0,
       nonce: "".to_string(),
+      user,
       event_sender,
     }
   }
 
-  fn create_socket(tries: Option<u8>) -> Listener {
+  /// Named-pipe path of the bound socket (for the state snapshot).
+  pub fn socket_path(&self) -> String {
+    self.socket_path.clone()
+  }
+
+  fn create_socket(tries: Option<u8>) -> (Listener, String) {
     // Define the path to the named pipe
     let pipe_path = r"\\.\pipe\discord-ipc";
 
@@ -137,6 +157,6 @@ impl IpcConnector {
 
     log!("[IPC] Created IPC socket: {}", pipe_path);
 
-    socket
+    (socket, pipe_path)
   }
 }

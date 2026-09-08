@@ -8,9 +8,10 @@ use simple_websockets::{Event, EventHub, Message, Responder};
 
 use crate::{
   cmd::{ActivityCmd, ActivityCmdArgs},
-  commands, log,
-  server::utils::CONNECTION_REPONSE,
+  commands, debug, error, log,
   url_params::get_url_params,
+  user::RpcUser,
+  warn,
 };
 
 // (last activity, client_id from the connect query, responder)
@@ -20,6 +21,10 @@ type ActivityResponder = (Option<ActivityCmd>, Option<String>, Responder);
 pub struct WebsocketConnector {
   server: Arc<Mutex<Option<EventHub>>>,
   pub clients: Arc<Mutex<HashMap<u64, ActivityResponder>>>,
+  /// Actual bound port (`None` when no port in the range was free and the
+  /// process exited — kept for the state snapshot).
+  pub bound_port: Option<u16>,
+  user: Arc<Mutex<RpcUser>>,
 
   event_sender: mpsc::Sender<ActivityCmd>,
 }
@@ -29,14 +34,24 @@ impl WebsocketConnector {
     event_sender: mpsc::Sender<ActivityCmd>,
     ws_port_start: u16,
     ws_port_end: u16,
+    user: Arc<Mutex<RpcUser>>,
   ) -> Self {
     // Try starting websocket server on the configured range, bound to
     // loopback only (games always connect to 127.0.0.1).
     for port in ws_port_start..=ws_port_end {
       let listener = match std::net::TcpListener::bind(("127.0.0.1", port)) {
         Ok(listener) => listener,
-        Err(_) => {
-          log!("[Websocket] Failed to start server on port {}", port);
+        Err(err) => {
+          // Only port conflicts are routine (another RPC server owns the
+          // port); surface other failures distinctly in the log.
+          if err.kind() == std::io::ErrorKind::AddrInUse {
+            warn!("[Websocket] Port {} in use, trying next", port);
+          } else {
+            warn!(
+              "[Websocket] Cannot bind port {} ({}), trying next",
+              port, err
+            );
+          }
           continue;
         }
       };
@@ -47,16 +62,21 @@ impl WebsocketConnector {
           return Self {
             server: Arc::new(Mutex::new(Some(server))),
             clients: Arc::new(Mutex::new(HashMap::new())),
+            bound_port: Some(port),
+            user,
             event_sender,
           };
         }
         Err(_) => {
-          log!("[Websocket] Failed to start server on port {}", port);
+          warn!(
+            "[Websocket] Failed to start server on port {}, trying next",
+            port
+          );
         }
       }
     }
 
-    log!("[Websocket] Failed to start server on any port");
+    error!("[Websocket] Failed to start server on any port, exiting");
     std::process::exit(1);
   }
 
@@ -69,12 +89,13 @@ impl WebsocketConnector {
       .expect("Websocket server already started");
     let clients = self.clients.clone();
     let event_sender = self.event_sender.clone();
+    let user = self.user.clone();
 
     std::thread::spawn(move || {
       let mut clients = clients.lock().unwrap();
 
       loop {
-        log!("[Websocket] Polling for events...");
+        debug!("[Websocket] Polling for events...");
 
         match server.poll_event() {
           Event::Connect(client_id, responder) => {
@@ -90,17 +111,15 @@ impl WebsocketConnector {
             log!("[Websocket] Client {} connected", client_id);
 
             if version != "1" || encoding != "json" {
-              log!(
+              warn!(
                 "[Websocket] Invalid connection from client {} (v={}, encoding={}), closing",
-                client_id,
-                version,
-                encoding
+                client_id, version, encoding
               );
               responder.close();
               continue;
             }
 
-            responder.send(Message::Text(CONNECTION_REPONSE.to_string()));
+            responder.send(Message::Text(user.lock().unwrap().ready_payload()));
 
             clients.insert(client_id, (None, ws_client_id, responder));
           }
@@ -116,10 +135,9 @@ impl WebsocketConnector {
             handle_disconnect(client_id, &event_sender, &responder);
           }
           Event::Message(client_id, message) => {
-            log!(
+            debug!(
               "[Websocket] Received message from client {}: {:?}",
-              client_id,
-              message
+              client_id, message
             );
 
             let responder = match clients.get_mut(&client_id) {
@@ -135,8 +153,8 @@ impl WebsocketConnector {
             let event: ActivityCmd = match serde_json::from_str(&message) {
               Ok(event) => event,
               Err(e) => {
-                log!("[Websocket] Invalid message from client {}", client_id);
-                log!("[Websocket] Error: {}", e);
+                warn!("[Websocket] Invalid message from client {}", client_id);
+                warn!("[Websocket] Error: {}", e);
                 continue;
               }
             };
@@ -153,13 +171,13 @@ impl WebsocketConnector {
               ];
 
               if !valid.contains(&value) {
-                log!("[Websocket] Invalid origin from client {}", client_id);
+                warn!("[Websocket] Invalid origin from client {}", client_id);
                 continue;
               }
             }
 
             match event.cmd.as_str() {
-              "INVITE_BROWSER" | "GUILD_TEMPLATE_BROWSER" => {
+              "INVITE_BROWSER" | "GUILD_TEMPLATE_BROWSER" | "GIFT_CODE_BROWSER" => {
                 if !secondary_events {
                   continue;
                 }
@@ -168,6 +186,22 @@ impl WebsocketConnector {
               }
               "DEEP_LINK" => handle_deep_link(&event, &responder.2),
               "CONNECTIONS_CALLBACK" => handle_connections_callback(&event, &responder.2),
+              "SUBSCRIBE" | "UNSUBSCRIBE" => {
+                // Blind ACK like arRPC: no voice/guild backend exists, but
+                // clients wait for the lock-step reply.
+                responder
+                  .2
+                  .send(Message::Text(commands::subscribe_ack(&event)));
+              }
+              "GET_USER" => {
+                let wanted = event.args.as_ref().and_then(|args| args.user_id.as_ref());
+                let user = user.lock().unwrap().clone();
+                let matched = wanted.is_none_or(|id| *id == user.id);
+                responder.2.send(Message::Text(commands::get_user_response(
+                  &event,
+                  matched.then_some(&user),
+                )));
+              }
               "SET_ACTIVITY" => {
                 if !set_activity {
                   continue;
@@ -175,8 +209,18 @@ impl WebsocketConnector {
 
                 handle_set_activity(&event, &event_sender, responder)
               }
-              _ => {
-                log!("[Websocket] Unknown command: {}", event.cmd);
+              other => {
+                let unsupported = commands::unsupported_command(other);
+                if unsupported.is_none() {
+                  warn!("[Websocket] Unknown command: {}", other);
+                }
+                let (code, message) = unsupported.unwrap_or((1000, "Unknown command"));
+                responder.2.send(Message::Text(commands::rpc_error(
+                  &event.cmd,
+                  &event.nonce,
+                  code,
+                  message,
+                )));
               }
             }
           }
@@ -205,6 +249,30 @@ fn handle_browser_command(
   event_sender: &mpsc::Sender<ActivityCmd>,
   responder: &Responder,
 ) {
+  // Discord error codes for unusable invite/template/gift ids.
+  let (code, message) = if event.cmd == "GUILD_TEMPLATE_BROWSER" {
+    (4017_u16, "Invalid guild template id")
+  } else if event.cmd == "GIFT_CODE_BROWSER" {
+    (4016_u16, "Invalid gift code")
+  } else {
+    (4011_u16, "Invalid invite id")
+  };
+  let has_code = event
+    .args
+    .as_ref()
+    .and_then(|args| args.code.as_ref())
+    .is_some_and(|code| !code.trim().is_empty());
+  if !has_code {
+    warn!("[Websocket] {} without code from client", event.cmd);
+    responder.send(Message::Text(commands::rpc_error(
+      &event.cmd,
+      &event.nonce,
+      code,
+      message,
+    )));
+    return;
+  }
+
   // Let's just assume this went well I don't care
   let response = ActivityCmd {
     application_id: event.application_id.clone(),
@@ -217,7 +285,7 @@ fn handle_browser_command(
 
   // Send the event away!
   if event_sender.send(event.clone()).is_err() {
-    log!("[Websocket] Event receiver gone, dropping message");
+    warn!("[Websocket] Event receiver gone, dropping message");
     return;
   }
 
@@ -274,7 +342,7 @@ fn handle_set_activity(
   responder.0 = Some(event.clone());
 
   if event_sender.send(event.clone()).is_err() {
-    log!("[Websocket] Event receiver gone, dropping message");
+    warn!("[Websocket] Event receiver gone, dropping message");
     return;
   }
 
@@ -310,12 +378,13 @@ fn handle_disconnect(
         ),
         activity: None,
         code: None,
+        user_id: None,
       }),
       nonce: activity_cmd.nonce.clone(),
     };
 
     if event_sender.send(activity_cmd).is_err() {
-      log!("[Websocket] Event receiver gone, dropping clear");
+      warn!("[Websocket] Event receiver gone, dropping clear");
     }
   }
 }

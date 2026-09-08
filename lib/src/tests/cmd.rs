@@ -135,6 +135,34 @@ fn fix_timestamps_converts_seconds_to_millis() {
 }
 
 #[test]
+fn fix_timestamps_converts_micros_and_nanos_to_millis() {
+  // Real-world shapes: some SDKs send µs (~1e15) or ns (~1e18).
+  let micros = 1_780_000_000_000_000_i64;
+  let nanos = 1_780_000_000_000_000_000_i64;
+  let json = format!(
+    r#"{{
+        "cmd": "SET_ACTIVITY",
+        "args": {{
+          "pid": 42,
+          "activity": {{
+            "name": "Test",
+            "timestamps": {{ "start": {micros}, "end": {nanos} }}
+          }}
+        }},
+        "nonce": "n"
+      }}"#
+  );
+  let mut cmd = parse_cmd(&json);
+
+  cmd.fix();
+
+  let activity = cmd.args.unwrap().activity.unwrap();
+  let timestamps = activity.timestamps.unwrap();
+  assert_eq!(timestamps.start.unwrap().0, micros / 1_000);
+  assert_eq!(timestamps.end.unwrap().0, nanos / 1_000_000);
+}
+
+#[test]
 fn fix_timestamps_keeps_millis_untouched() {
   let future_ms = chrono::Utc::now().timestamp() + (100 * 365 * 24 * 3600) + 10_000;
   let json = format!(
@@ -302,6 +330,73 @@ fn bridge_payload_preserves_all_secret_kinds() {
   let payload: serde_json::Value = serde_json::from_str(&cached.json).expect("valid json");
   assert_eq!(
     payload["activity"]["secrets"],
-    serde_json::json!({ "join": "j", "spectate": "s", "match": "m" })
+    json!({ "join": "j", "spectate": "s", "match": "m" })
+  );
+}
+
+#[test]
+fn display_name_falls_back_to_details_then_state() {
+  fn activity_of(json: &str) -> crate::cmd::Activity {
+    parse_cmd(json).args.unwrap().activity.unwrap()
+  }
+
+  let named = activity_of(
+    r#"{"cmd":"SET_ACTIVITY","nonce":"n","args":{"pid":1,"activity":{"name":"Game","details":"Song","state":"Artist"}}}"#,
+  );
+  assert_eq!(named.display_name(), "Game");
+
+  // Music apps often send no name: song/artist still identify the publisher.
+  let nameless = activity_of(
+    r#"{"cmd":"SET_ACTIVITY","nonce":"n","args":{"pid":1,"activity":{"details":"Song","state":"Artist"}}}"#,
+  );
+  assert_eq!(nameless.display_name(), "Song");
+
+  let stateless = activity_of(
+    r#"{"cmd":"SET_ACTIVITY","nonce":"n","args":{"pid":1,"activity":{"state":"Artist"}}}"#,
+  );
+  assert_eq!(stateless.display_name(), "Artist");
+
+  let blank =
+    activity_of(r#"{"cmd":"SET_ACTIVITY","nonce":"n","args":{"pid":1,"activity":{"name":"   "}}}"#);
+  assert_eq!(blank.display_name(), "?");
+}
+
+#[test]
+fn activity_urls_survive_fix_and_bridge_encoding() {
+  // Official clickable-asset fields: passthrough, never validated here.
+  let mut cmd = parse_cmd(
+    r#"{
+        "cmd": "SET_ACTIVITY",
+        "args": {
+          "pid": 42,
+          "activity": {
+            "name": "Test",
+            "details": "Level 1",
+            "details_url": "https://example.com/level/1",
+            "state": "Hub",
+            "state_url": "https://example.com/hub",
+            "assets": {
+              "large_image": "map",
+              "large_url": "https://example.wiki/maps/Numbani",
+              "small_image": "hero",
+              "small_url": "https://example.wiki/heroes/Pharah"
+            }
+          }
+        },
+        "nonce": "n"
+      }"#,
+  );
+  let cached = crate::commands::cached_activity(&mut cmd).expect("encodes");
+  let payload: serde_json::Value = serde_json::from_str(&cached.json).expect("valid json");
+  let activity = &payload["activity"];
+  assert_eq!(activity["details_url"], "https://example.com/level/1");
+  assert_eq!(activity["state_url"], "https://example.com/hub");
+  assert_eq!(
+    activity["assets"]["large_url"],
+    "https://example.wiki/maps/Numbani"
+  );
+  assert_eq!(
+    activity["assets"]["small_url"],
+    "https://example.wiki/heroes/Pharah"
   );
 }

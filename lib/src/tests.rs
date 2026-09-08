@@ -6,6 +6,10 @@
 
 mod client_connector;
 mod cmd;
+mod commands;
 mod ipc_utils;
+mod logger;
 mod process;
 mod rpc_server;
+mod state;
+mod user;

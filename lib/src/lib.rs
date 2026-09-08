@@ -11,12 +11,16 @@ use std::{
   sync::{Arc, Mutex, mpsc},
 };
 
+use user::RpcUser;
+
 pub mod cmd;
 pub mod commands;
 pub mod detection;
 mod logger;
 mod server;
+pub mod state;
 mod url_params;
+pub mod user;
 
 #[cfg(test)]
 mod tests;
@@ -31,6 +35,14 @@ pub struct DetectedGame {
   pub pid: Option<u64>,
 }
 
+/// Minimal database entry for `--list-database` diagnostics.
+#[derive(Clone, Debug)]
+pub struct DetectableSummary {
+  pub id: String,
+  pub name: String,
+  pub executables: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct RPCConfig {
   pub enable_process_scanner: bool,
@@ -39,6 +51,9 @@ pub struct RPCConfig {
   pub enable_secondary_events: bool,
   pub port: u16,
   pub msgpack_port: u16,
+  /// End of the JSON bridge port scan range (`port..=bridge_port_end`,
+  /// arRPC-compatible `1337-1347` by default).
+  pub bridge_port_end: u16,
   pub ws_port_start: u16,
   pub ws_port_end: u16,
   pub scan_interval_secs: u64,
@@ -48,6 +63,12 @@ pub struct RPCConfig {
   /// conditional too (otherwise every restart pays one full redundant
   /// rebuild before learning the tag). `None` means unconditional.
   pub initial_db_etag: Option<String>,
+  /// Application IDs the process scanner must never publish (coexistence
+  /// with a richer publisher owning those slots). Scan-only by design:
+  /// forwarded client frames always pass (a companion and a native frame
+  /// are indistinguishable on that path, and the companion must flow).
+  /// Ignored games behave as absent: null event, clear.
+  pub ignored_ids: Vec<String>,
 }
 
 impl Default for RPCConfig {
@@ -58,6 +79,7 @@ impl Default for RPCConfig {
       enable_websocket_connector: true,
       enable_secondary_events: true,
       port: 1337,
+      bridge_port_end: 1347,
       msgpack_port: 1338,
       ws_port_start: 6463,
       ws_port_end: 6472,
@@ -65,6 +87,7 @@ impl Default for RPCConfig {
       db_url: None,
       enable_db_update: false,
       initial_db_etag: None,
+      ignored_ids: Vec::new(),
     }
   }
 }
@@ -153,6 +176,7 @@ impl RPCServer {
       None,
       false,
       None,
+      Vec::new(),
     );
 
     Ok(
@@ -163,6 +187,29 @@ impl RPCServer {
           id: a.id.clone(),
           name: a.name.clone(),
           pid: a.pid,
+        })
+        .collect(),
+    )
+  }
+
+  /**
+   * Summarize the held database (entry count, executable count, names).
+   * Like [`detect_once`](RPCServer::detect_once), call this before
+   * [`start`](RPCServer::start): startup moves the database to the
+   * scanner, leaving this side empty.
+   */
+  pub fn database_summary(&self) -> Result<Vec<DetectableSummary>, String> {
+    let detectable = self
+      .detectable
+      .lock()
+      .map_err(|err| format!("detectable lock poisoned: {err}"))?;
+    Ok(
+      detectable
+        .iter()
+        .map(|entry| DetectableSummary {
+          id: entry.id.clone(),
+          name: entry.name.clone(),
+          executables: entry.executables.as_ref().map(Vec::len).unwrap_or(0),
         })
         .collect(),
     )
@@ -236,7 +283,7 @@ impl RPCServer {
     callback: impl FnMut(ProcessScanState) + Send + Sync + 'static,
   ) {
     if self.connectors.is_some() {
-      log!("[RPC Server] Cannot set on_process_scan_complete, connectors are already initialized");
+      warn!("[RPC Server] Cannot set on_process_scan_complete, connectors are already initialized");
       return;
     }
 
@@ -256,6 +303,29 @@ impl RPCServer {
     let (ipc_event_sender, ipc_event_receiver) = mpsc::channel();
     let (ws_event_sender, ws_event_reciever) = mpsc::channel();
 
+    // Shared READY identity (startup RSRPC_USER_* + runtime SET_USER).
+    let user = Arc::new(Mutex::new(RpcUser::from_env()));
+
+    // Bind the edge connectors first: their bound addresses feed the
+    // bridge's state snapshot.
+    let ipc_connector = IpcConnector::new(ipc_event_sender, user.clone());
+    let ws_connector = WebsocketConnector::new(
+      ws_event_sender,
+      self.config.ws_port_start,
+      self.config.ws_port_end,
+      user.clone(),
+    );
+    let mut client_connector = ClientConnector::new(
+      self.config.port,
+      self.config.bridge_port_end,
+      self.config.msgpack_port,
+      user,
+      ipc_event_receiver,
+      proc_event_receiver,
+      ws_event_reciever,
+    );
+    client_connector.set_extra_servers(ws_connector.bound_port, Some(ipc_connector.socket_path()));
+
     let connectors = Connectors {
       process_server: Arc::new(Mutex::new(ProcessServer::new(
         // Move, never clone: a second live generation here is exactly the
@@ -268,21 +338,11 @@ impl RPCServer {
         self.config.db_url.clone(),
         self.config.enable_db_update,
         self.config.initial_db_etag.clone(),
+        self.config.ignored_ids.clone(),
       ))),
-      client_connector: Arc::new(Mutex::new(ClientConnector::new(
-        self.config.port,
-        self.config.msgpack_port,
-        server::utils::CONNECTION_REPONSE.to_string(),
-        ipc_event_receiver,
-        proc_event_receiver,
-        ws_event_reciever,
-      ))),
-      ipc_connector: Arc::new(Mutex::new(IpcConnector::new(ipc_event_sender))),
-      ws_connector: Arc::new(Mutex::new(WebsocketConnector::new(
-        ws_event_sender,
-        self.config.ws_port_start,
-        self.config.ws_port_end,
-      ))),
+      client_connector: Arc::new(Mutex::new(client_connector)),
+      ipc_connector: Arc::new(Mutex::new(ipc_connector)),
+      ws_connector: Arc::new(Mutex::new(ws_connector)),
     };
 
     log!(

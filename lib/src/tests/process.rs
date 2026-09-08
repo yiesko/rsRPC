@@ -291,6 +291,7 @@ fn ac_probe_needs_directories_that_cwd_reconstructs() {
     None,
     false,
     None,
+    Vec::new(),
   );
   let reversed = |path: &str| path.chars().rev().collect::<String>();
   // Bare exe alone misses (no directories for the suffix to anchor on)...
@@ -314,9 +315,8 @@ fn conditional_refresh_skips_unchanged_database() {
   // 200 + tiny DB with a rotating tag otherwise (CDN flap simulator).
   let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
   let port = listener.local_addr().unwrap().port();
-  let issued: std::sync::Arc<std::sync::Mutex<Option<String>>> =
-    std::sync::Arc::new(std::sync::Mutex::new(None));
-  let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+  let issued: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+  let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
   std::thread::spawn(move || {
     for stream in listener.incoming().take(3) {
       let mut stream = match stream {
@@ -377,4 +377,56 @@ fn conditional_refresh_skips_unchanged_database() {
     fetch_detectable_etag(&url, Some("\"stale\""), Some(known)),
     Ok(crate::server::process::FetchOutcome::SameContent { .. })
   ));
+}
+
+#[test]
+fn apply_ignore_list_drops_only_ignored_ids() {
+  use std::sync::Arc;
+
+  use crate::detection::DetectableActivity;
+  use crate::server::process::apply_ignore_list;
+
+  fn activity(id: &str) -> Arc<DetectableActivity> {
+    Arc::new(DetectableActivity {
+      bot_public: None,
+      bot_require_code_grant: None,
+      cover_image: None,
+      description: None,
+      developers: None,
+      executables: None,
+      flags: None,
+      guild_id: None,
+      hook: true,
+      icon: None,
+      id: id.to_string(),
+      name: format!("Game {id}"),
+      publishers: None,
+      rpc_origins: None,
+      splash: None,
+      third_party_skus: None,
+      type_field: None,
+      verify_key: None,
+      primary_sku_id: None,
+      slug: None,
+      aliases: None,
+      overlay: None,
+      overlay_compatibility_hook: None,
+      privacy_policy_url: None,
+      terms_of_service_url: None,
+      eula_id: None,
+      deeplink_uri: None,
+      tags: None,
+      pid: None,
+      timestamp: None,
+    })
+  }
+
+  let detected = vec![activity("1"), activity("2"), activity("3")];
+  // Empty list: everything passes, order preserved.
+  let kept = apply_ignore_list(detected.clone(), &[]);
+  assert_eq!(kept.len(), 3);
+  // Ignored ids drop; the rest keep order (first-element semantics kept).
+  let kept = apply_ignore_list(detected, &["2".to_string()]);
+  let ids: Vec<_> = kept.iter().map(|game| game.id.clone()).collect();
+  assert_eq!(ids, vec!["1".to_string(), "3".to_string()]);
 }

@@ -11,7 +11,7 @@ use std::vec;
 use sysinfo::System;
 
 use crate::ProcessCallback;
-use crate::log;
+use crate::{debug, log, warn};
 
 use super::super::DetectableActivity;
 
@@ -70,6 +70,10 @@ pub struct ProcessServer {
   /// ETag captured by the startup fetch: seeds the refresh thread so its
   /// first hourly check is conditional instead of a redundant full rebuild.
   initial_db_etag: Option<String>,
+  /// Application IDs never published by the scan thread (coexistence with
+  /// a richer publisher elsewhere). Filtered right after the scan, so an
+  /// ignored-only result behaves exactly like no game: null event, clear.
+  ignored_ids: Vec<String>,
 
   #[cfg(not(target_os = "linux"))]
   sysinfo: Arc<Mutex<System>>,
@@ -85,6 +89,7 @@ impl ProcessServer {
     db_url: Option<String>,
     enable_db_update: bool,
     initial_db_etag: Option<String>,
+    ignored_ids: Vec<String>,
   ) -> Self {
     log!("[Process Scanner] Building Aho-Corasick patterns for main detectable activities...");
     let (ac, idx) = build_ac_patterns(&detectable);
@@ -113,6 +118,7 @@ impl ProcessServer {
       db_url,
       enable_db_update,
       initial_db_etag,
+      ignored_ids,
 
       // sysinfo System
       #[cfg(not(target_os = "linux"))]
@@ -147,7 +153,7 @@ impl ProcessServer {
     // fetch): it would build a failing automaton and blind detection.
     // Keep serving the current data instead.
     if detectable.is_empty() {
-      log!("[Process Scanner] Refusing empty detectable database update, keeping current");
+      warn!("[Process Scanner] Refusing empty detectable database update, keeping current");
       return;
     }
     log!("[Process Scanner] Rebuilding Aho-Corasick patterns for main detectable activities...");
@@ -213,24 +219,37 @@ impl ProcessServer {
           let url = db_clone.db_url.clone().unwrap();
           match fetch_detectable_etag(&url, etag.as_deref(), content_hash) {
             Ok(FetchOutcome::Unchanged) => {
-              log!("[Process Scanner] Detectable database unchanged (304), keeping current");
+              log!(
+                "[Process Scanner] DB check: unchanged (etag {})",
+                etag.as_deref().unwrap_or("none")
+              );
             }
             Ok(FetchOutcome::SameContent { etag: new_tag }) => {
+              log!(
+                "[Process Scanner] DB check: same bytes, new tag (etag {} -> {})",
+                etag.as_deref().unwrap_or("none"),
+                new_tag.as_deref().unwrap_or("none")
+              );
               etag = new_tag;
-              log!("[Process Scanner] Detectable database bytes unchanged, keeping current");
             }
             Ok(FetchOutcome::Updated {
               etag: new_tag,
               content_hash: new_hash,
               detectable,
             }) => {
+              log!(
+                "[Process Scanner] DB updated: {} entries (etag {} -> {})",
+                detectable.len(),
+                etag.as_deref().unwrap_or("none"),
+                new_tag.as_deref().unwrap_or("none")
+              );
               etag = new_tag;
               content_hash = Some(new_hash);
               db_clone.update_main_detectables(detectable);
             }
             Err(err) => {
-              log!(
-                "[Process Scanner] Error updating detectable database: {}",
+              warn!(
+                "[Process Scanner] Error updating detectable database, retrying in 1h: {}",
                 err
               );
             }
@@ -242,14 +261,27 @@ impl ProcessServer {
     std::thread::spawn(move || {
       // Run the process scan repeatedly (every 3 seconds)
       loop {
-        let detected = match clone.scan_for_processes() {
+        let mut detected = match clone.scan_for_processes() {
           Ok(detected) => detected,
           Err(err) => {
-            log!("[Process Scanner] Error while scanning processes: {}", err);
+            warn!(
+              "[Process Scanner] Error while scanning processes, retrying: {}",
+              err
+            );
             std::thread::sleep(wait_time);
             continue;
           }
         };
+        // Coexistence filter: ignored app IDs behave as absent, so a richer
+        // publisher elsewhere owns the slot (clears flow normally).
+        let before = detected.len();
+        detected = apply_ignore_list(detected, &clone.ignored_ids);
+        if detected.len() != before {
+          debug!(
+            "[Process Scanner] Ignored {} detected game(s)",
+            before - detected.len()
+          );
+        }
         let mut new_game_detected = false;
         let mut last_id = clone.last_detected_id.lock().unwrap();
 
@@ -271,7 +303,7 @@ impl ProcessServer {
             })
             .is_err()
           {
-            log!("[Process Scanner] Event receiver gone, retrying scan");
+            warn!("[Process Scanner] Event receiver gone, retrying scan");
             std::thread::sleep(wait_time);
             continue;
           }
@@ -315,7 +347,7 @@ impl ProcessServer {
             }),
           });
           if cleared.is_err() {
-            log!("[Process Scanner] Event receiver gone, retrying scan");
+            warn!("[Process Scanner] Event receiver gone, retrying scan");
             std::thread::sleep(wait_time);
             continue;
           }
@@ -446,10 +478,10 @@ impl ProcessServer {
     #[cfg(target_os = "linux")]
     let processes = ProcessServer::process_list()?;
 
-    log!("[Process Scanner] Process scan triggered");
+    debug!("[Process Scanner] Process scan triggered");
 
     if self.scanning.load(std::sync::atomic::Ordering::Relaxed) {
-      log!("[Process Scanner] Scanning already in progress");
+      debug!("[Process Scanner] Scanning already in progress");
       return Err("Scanning already in progress".into());
     }
 
@@ -507,7 +539,7 @@ impl ProcessServer {
           && let Some(cwd) = read_cwd(process.pid)
         {
           let candidate = format!("{cwd}/{exe}");
-          log!(
+          debug!(
             "[Process Scanner] Bare exe, probing cwd-joined path for pid {}",
             process.pid
           );
@@ -517,7 +549,7 @@ impl ProcessServer {
             reversed_path.extend(variant.chars().rev());
             found = self.ac_probe(&reversed_path, &detectable_list);
             if found.is_some() {
-              log!("[Process Scanner] Cwd match for pid {}", process.pid);
+              debug!("[Process Scanner] Cwd match for pid {}", process.pid);
               break 'cwd;
             }
           }
@@ -554,6 +586,10 @@ impl ProcessServer {
             .as_ref()
             .is_some_and(|args| args.contains(exec_args));
           if !has_args {
+            debug!(
+              "[Process Scanner] Argument mismatch for pid {}, skipping",
+              process.pid
+            );
             return None;
           }
         }
@@ -562,7 +598,7 @@ impl ProcessServer {
         // so the scan reports them absent (and clears). Checked here — once
         // per hit — never for the whole table.
         if is_suspended(process.pid) {
-          log!(
+          debug!(
             "[Process Scanner] Ignoring suspended process (pid {})",
             process.pid
           );
@@ -590,7 +626,7 @@ impl ProcessServer {
 
     detected_list.shrink_to_fit();
 
-    log!("[Process Scanner] Process scan complete");
+    debug!("[Process Scanner] Process scan complete");
 
     Ok(detected_list)
   }
@@ -794,10 +830,26 @@ pub(crate) fn build_aux_maps(
 /// loop's post-match check for AC hits.
 fn live_or_none(obj: &Arc<DetectableActivity>, pid: u64) -> Option<Arc<DetectableActivity>> {
   if is_suspended(pid) {
-    log!("[Process Scanner] Ignoring suspended process (pid {pid})");
+    debug!("[Process Scanner] Ignoring suspended process (pid {pid})");
     return None;
   }
   Some(stamp_activity(obj, pid))
+}
+
+/// Drop scan results whose application id is ignored, preserving order.
+/// Pure: an ignored-only scan yields an empty vec, which the scan thread
+/// already turns into the normal null event (clear). Tested below.
+pub(crate) fn apply_ignore_list(
+  detected: Vec<Arc<DetectableActivity>>,
+  ignored_ids: &[String],
+) -> Vec<Arc<DetectableActivity>> {
+  if ignored_ids.is_empty() {
+    return detected;
+  }
+  detected
+    .into_iter()
+    .filter(|game| !ignored_ids.iter().any(|id| *id == game.id))
+    .collect()
 }
 
 /// Last-resort matching for processes no executable pattern hit.
@@ -818,10 +870,9 @@ pub(crate) fn match_aux_process(
     && let Some(&idx) = steam_map.lock().unwrap().get(appid)
     && let Some(obj) = detectable_list.get(idx)
   {
-    log!(
+    debug!(
       "[Process Scanner] Steam match: {} (appid {})",
-      obj.name,
-      appid
+      obj.name, appid
     );
     return live_or_none(obj, pid);
   }
@@ -831,10 +882,9 @@ pub(crate) fn match_aux_process(
     && let Some(&idx) = name_map.lock().unwrap().get(&stem)
     && let Some(obj) = detectable_list.get(idx)
   {
-    log!(
+    debug!(
       "[Process Scanner] Name match: {} (exe stem `{}`)",
-      obj.name,
-      stem
+      obj.name, stem
     );
     return live_or_none(obj, pid);
   }
@@ -855,10 +905,9 @@ pub(crate) fn match_aux_process(
       && let Some(&idx) = name_map.lock().unwrap().get(&folder)
       && let Some(obj) = detectable_list.get(idx)
     {
-      log!(
+      debug!(
         "[Process Scanner] Folder match: {} (folder `{}`)",
-        obj.name,
-        folder
+        obj.name, folder
       );
       return live_or_none(obj, pid);
     }

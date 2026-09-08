@@ -52,22 +52,12 @@ impl ActivityCmd {
 
       // convert starting timestamp
       if let Some(start) = timestamps.start.as_mut() {
-        // convert timestamp if in seconds
-        if start.0 > cur {
-          *start = TimeoutValue(start.0);
-        } else {
-          *start = TimeoutValue(start.0 * 1000);
-        }
+        *start = TimeoutValue(normalize_timestamp(start.0, cur));
       }
 
       // convert ending timestamp
       if let Some(end) = timestamps.end.as_mut() {
-        // convert timestamp if in seconds
-        if end.0 > cur {
-          *end = TimeoutValue(end.0);
-        } else {
-          *end = TimeoutValue(end.0 * 1000);
-        }
+        *end = TimeoutValue(normalize_timestamp(end.0, cur));
       }
     }
   }
@@ -123,8 +113,10 @@ impl ActivityCmd {
 pub struct ActivityCmdArgs {
   pub pid: Option<u64>,
   pub activity: Option<Activity>,
-  // For INVITE_BROWSER
+  // For INVITE_BROWSER / GUILD_TEMPLATE_BROWSER / GIFT_CODE_BROWSER
   pub code: Option<String>,
+  // For GET_USER
+  pub user_id: Option<String>,
 }
 
 #[skip_serializing_none]
@@ -142,6 +134,9 @@ pub struct Assets {
   pub large_text: Option<String>,
   pub small_image: Option<String>,
   pub small_text: Option<String>,
+  /// URLs opened when clicking the images (official activity-assets fields).
+  pub large_url: Option<String>,
+  pub small_url: Option<String>,
 }
 
 #[skip_serializing_none]
@@ -189,7 +184,11 @@ pub struct Activity {
   pub timestamps: Option<Timestamps>,
   pub application_id: Option<String>,
   pub details: Option<String>,
+  /// URL opened when clicking the details text (official, max 256 chars).
+  pub details_url: Option<String>,
   pub state: Option<String>,
+  /// URL opened when clicking the state text (official, max 256 chars).
+  pub state_url: Option<String>,
   pub sync_id: Option<String>,
   pub instance: Option<bool>,
   pub flags: Option<u32>,
@@ -200,10 +199,48 @@ pub struct Activity {
   pub metadata: Option<Metadata>,
 }
 
+impl Activity {
+  /// Human-readable label for logs: name first, then details/state, so
+  /// publishers without a name (music apps send song/artist instead)
+  /// still identify themselves instead of showing `?`.
+  pub fn display_name(&self) -> &str {
+    [&self.name, &self.details, &self.state]
+      .into_iter()
+      .flatten()
+      .map(|text| text.trim())
+      .find(|text| !text.is_empty())
+      .unwrap_or("?")
+  }
+}
+
+/// Normalize a client-supplied timestamp to milliseconds (what Discord
+/// renders), mirroring arRPC's precision sniffing:
+///
+/// - nanoseconds (`>= 1e17`, ~1.8e18 now) are divided by 1e6,
+/// - microseconds (`>= 1e14`, ~1.8e15 now) are divided by 1e3,
+/// - milliseconds (above `now + 100y`, ~1.7e12 now) pass through,
+/// - anything smaller is seconds and is multiplied by 1e3.
+///
+/// The µs/ns branches sit above the legacy s/ms heuristic so existing
+/// second/millisecond inputs behave exactly as before.
+fn normalize_timestamp(value: i64, millis_threshold: i64) -> i64 {
+  const MICROS_THRESHOLD: i64 = 100_000_000_000_000; // 1e14
+  const NANOS_THRESHOLD: i64 = 100_000_000_000_000_000; // 1e17
+
+  if value >= NANOS_THRESHOLD {
+    value / 1_000_000
+  } else if value >= MICROS_THRESHOLD {
+    value / 1_000
+  } else if value > millis_threshold {
+    value
+  } else {
+    value * 1000
+  }
+}
+
 #[skip_serializing_none]
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 pub struct TimeoutValue(pub(crate) i64);
-
 #[skip_serializing_none]
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Timestamps {

@@ -20,9 +20,15 @@ struct Args {
   )]
   no_process_scan: bool,
   #[arg(long, short = 'D', env = "RSRPC_DEBUG")]
+  /// Print the resolved configuration plus per-tick debug logging
+  /// (scan ticks, repeat sends, match details).
   debug: bool,
   #[arg(long, env = "RSRPC_BRIDGE_PORT", default_value_t = 1337)]
+  /// Start of the JSON bridge port scan range (see --bridge-port-end).
   bridge_port: u16,
+  #[arg(long, env = "RSRPC_BRIDGE_PORT_END", default_value_t = 1347)]
+  /// End of the JSON bridge port scan range (arRPC-compatible 1337-1347).
+  bridge_port_end: u16,
   #[arg(long, env = "RSRPC_MSGPACK_PORT", default_value_t = 1338)]
   msgpack_port: u16,
   #[arg(long, env = "RSRPC_WS_PORT_START", default_value_t = 6463)]
@@ -37,9 +43,19 @@ struct Args {
   enable_db_update: bool,
   #[arg(long, env = "RSRPC_OVERRIDES_FILE")]
   overrides_file: Option<PathBuf>,
+  /// Application IDs never published (comma-separated): coexistence with
+  /// a richer publisher owning those slots (e.g. a companion presence).
+  /// Ignored games behave as absent; clears always pass through.
+  /// `--list-detected` still shows them (diagnostics stay truthful).
+  #[arg(long, env = "RSRPC_IGNORE_IDS")]
+  ignore_ids: Option<String>,
   /// Run a single process scan, print detected games and exit (main DB only)
   #[arg(long, env = "RSRPC_LIST_DETECTED")]
   list_detected: bool,
+  /// Print a database summary (entry/executable counts + first entries)
+  /// and exit. Runs before any scan, on the same held database.
+  #[arg(long, env = "RSRPC_LIST_DATABASE")]
+  list_database: bool,
 }
 
 fn fetch_detectable(url: &str) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
@@ -75,6 +91,17 @@ fn server_from_fetched(
   rsrpc::RPCServer::from_json_str(body, config)
 }
 
+/// Split a comma-separated id list (`--ignore-ids`): trims, drops blanks.
+fn parse_ignore_ids(input: Option<&str>) -> Vec<String> {
+  input
+    .unwrap_or_default()
+    .split(',')
+    .map(str::trim)
+    .filter(|id| !id.is_empty())
+    .map(str::to_string)
+    .collect()
+}
+
 pub fn main() -> Result<(), Box<dyn std::error::Error>> {
   // Fail-fast supervision (ADR-1): worker threads dying silently would
   // leave a zombie daemon (systemd green, detection/bridge dead) that
@@ -96,6 +123,12 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
   }
 
   let args = Args::parse();
+  if args.debug {
+    // SAFETY: same as above, still single-threaded startup.
+    unsafe {
+      std::env::set_var("RSRPC_DEBUG", "1");
+    }
+  }
   // Effective db_url for auto-refresh: with --enable-db-update and no --db-url, fall back to DEFAULT_DB_URL
   let effective_db_url = args.db_url.clone().or_else(|| {
     if args.enable_db_update {
@@ -107,12 +140,14 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
   let mut config = RPCConfig {
     enable_process_scanner: !args.no_process_scan,
     port: args.bridge_port,
+    bridge_port_end: args.bridge_port_end,
     msgpack_port: args.msgpack_port,
     ws_port_start: args.ws_port_start,
     ws_port_end: args.ws_port_end,
     scan_interval_secs: args.scan_interval_secs,
     db_url: effective_db_url.clone(),
     enable_db_update: args.enable_db_update,
+    ignored_ids: parse_ignore_ids(args.ignore_ids.as_deref()),
     ..Default::default()
   };
 
@@ -170,6 +205,25 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
           None => println!("{} (id {})", game.name, game.id),
         }
       }
+    }
+    return Ok(());
+  }
+
+  if args.list_database {
+    let entries = client
+      .database_summary()
+      .map_err(|err| format!("database unavailable: {err}"))?;
+    let executables: usize = entries.iter().map(|entry| entry.executables).sum();
+    println!(
+      "{} database entries, {} executables",
+      entries.len(),
+      executables
+    );
+    for entry in entries.iter().take(10) {
+      println!("{} ({})", entry.name, entry.id);
+    }
+    if entries.len() > 10 {
+      println!("... and {} more", entries.len() - 10);
     }
     return Ok(());
   }
