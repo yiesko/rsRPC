@@ -111,16 +111,11 @@ impl HandoffState {
   /// return the released app ids. Without this, a dead owner suppresses
   /// its slots' generics forever.
   pub(crate) fn note_clear_pid(&mut self, pid: u64) -> Vec<String> {
-    let dead: Vec<String> = self
+    self
       .live_ipc
-      .iter()
-      .filter(|(_, owner)| **owner == pid)
-      .map(|(app, _)| app.clone())
-      .collect();
-    for app in &dead {
-      self.live_ipc.remove(app);
-    }
-    dead
+      .extract_if(|_, owner| *owner == pid)
+      .map(|(app, _)| app)
+      .collect()
   }
 
   /// Whether generic detection must stay out of this slot right now.
@@ -200,17 +195,13 @@ pub struct ClientConnector {
   /// Monotonic sequence for replay-cache recency (LRU eviction order).
   activity_seq: Arc<Mutex<u64>>,
 
-  /// Shared across the per-loop clones (event/process): which process activity
-  /// was last broadcast, so IPC/WS clears can resume process detection.
-  pub last_pid: Arc<Mutex<Option<u64>>>,
-  pub active_socket: Arc<Mutex<Option<String>>>,
   /// Last process-detected activities broadcast but not yet cleared, by
   /// app id (each with its pid for the clear frame). Consumed (`drain`)
-  /// by the null-scan path to clear exactly once — even when an IPC/WS
-  /// clear already reset `active_socket` meanwhile. The two keyspaces
+  /// by the null-scan path to clear exactly once. The two keyspaces
   /// differ (IPC clears are pid-keyed, process clears are app-id-keyed),
-  /// so gating the prune on `active_socket` strands the process entry
-  /// forever: every later bridge client replays a dead game.
+  /// so IPC clears never touch this map: an entry lives exactly from its
+  /// generic publication to its process clear, and every later bridge
+  /// client replays only live games.
   pub last_process: Arc<Mutex<HashMap<String, u64>>>,
   /// IPC-wins handoff state (see [`HandoffState`]).
   handoff: Arc<Mutex<HandoffState>>,
@@ -270,8 +261,6 @@ impl ClientConnector {
       last_activities: Arc::new(Mutex::new(HashMap::new())),
       activity_seq: Arc::new(Mutex::new(0)),
 
-      last_pid: Arc::new(Mutex::new(None)),
-      active_socket: Arc::new(Mutex::new(None)),
       last_process: Arc::new(Mutex::new(HashMap::new())),
       handoff: Arc::new(Mutex::new(HandoffState::default())),
 
@@ -518,14 +507,13 @@ impl ClientConnector {
             }
           }
           // A genuine clear (null activity) from a real connection means the
-          // SDK source went away: drop our process-side "already sent" state
-          // so the scanner re-asserts the still-running game on the next
-          // pass (e.g. How to Fish comes back after Sober/Roblox closes).
+          // SDK source went away: the slot below is handed back to generic
+          // detection (resume), so the scanner re-asserts the still-running
+          // game (e.g. How to Fish comes back after Sober/Roblox closes).
           // pid == 0 means no game was ever identified on this connection
           // (e.g. SUBSCRIBE before any SET_ACTIVITY) — ignore those, or
           // every fresh connection would flap the display.
           if is_genuine_clear(&cmd) {
-            *connector.active_socket.lock().unwrap() = None;
             // Hand the slot(s) back to generic detection when the owning
             // SDK source cleared (stale closes from superseded companions
             // are ignored); the game must still be alive, or the card
@@ -574,11 +562,9 @@ impl ClientConnector {
       if proc_activity.id == "null" {
         connector.handoff.lock().unwrap().note_scan(None);
         // Clear every outstanding process publication (multi-game scans
-        // publish per slot; a lone null means the table is empty).
-        // Gated on the publications, NOT on active_socket — an IPC/WS
-        // clear may have reset that flag already while app-id-keyed
-        // entries are still live (dual keyspaces: pid-keyed vs
-        // app-id-keyed).
+        // publish per slot; a lone null means the table is empty). The
+        // two keyspaces differ (IPC clears are pid-keyed, process clears
+        // are app-id-keyed), so IPC clears never disarm these.
         let outstanding = take_process_clear(&connector);
         if outstanding.is_empty() {
           continue;
@@ -592,8 +578,6 @@ impl ClientConnector {
 
           connector.broadcast_activity(payload, socket_id);
         }
-
-        *connector.active_socket.lock().unwrap() = None;
 
         continue;
       }
@@ -617,14 +601,8 @@ impl ClientConnector {
       // Strictly per-slot: other games' cards are untouched, so co-running
       // games each keep theirs.
       if connector.handoff.lock().unwrap().suppresses(&game.id) {
-        if connector
-          .last_process
-          .lock()
-          .unwrap()
-          .remove(&game.id)
-          .is_some()
-        {
-          let pid = connector.last_pid.lock().unwrap().unwrap_or_default();
+        // The armed entry carries its own pid for the clear frame.
+        if let Some(pid) = connector.last_process.lock().unwrap().remove(&game.id) {
           connector.broadcast_activity(
             commands::empty_cached(pid, game.id.clone()),
             game.id.clone(),
@@ -657,8 +635,6 @@ impl ClientConnector {
         continue;
       }
 
-      *connector.last_pid.lock().unwrap() = proc_activity.pid;
-      *connector.active_socket.lock().unwrap() = Some(proc_activity.id.clone());
       connector
         .last_process
         .lock()
@@ -681,8 +657,6 @@ impl ClientConnector {
    * without this the slot would stay dark until the next game switch.
    */
   fn resume_generic(&self, game: &ScannedGame) {
-    *self.last_pid.lock().unwrap() = Some(game.pid);
-    *self.active_socket.lock().unwrap() = Some(game.id.clone());
     self
       .last_process
       .lock()
@@ -845,8 +819,8 @@ impl ClientConnector {
  * Consume the outstanding process publications for clearing, if any.
  * Returns `(pid, socket_id)` pairs, sorted for deterministic clears.
  * Single-shot by construction (`drain`): repeated null scans clear once
- * and then skip, and a prior IPC/WS clear (which resets `active_socket`
- * but never touches these) cannot disarm them.
+ * and then skip. IPC/WS clears never touch this map (pid-keyed vs
+ * app-id-keyed keyspaces), so they cannot disarm it either.
  */
 pub(crate) fn take_process_clear(connector: &ClientConnector) -> Vec<(u64, String)> {
   let mut outstanding: Vec<(u64, String)> = connector

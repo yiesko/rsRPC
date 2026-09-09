@@ -42,28 +42,24 @@ fn clones_share_detection_state() {
   let a = ClientConnector::new(45971, 45981, 45972, test_user(), ipc_rx, proc_rx, ws_rx);
   let b = a.clone();
 
-  // A reset on one clone (event_loop) must be visible on the other
-  // (process_loop) — plain Option fields would silently diverge here.
-  *b.active_socket.lock().unwrap() = Some("123456789012345678".to_string());
-  assert_eq!(
-    a.active_socket.lock().unwrap().clone(),
-    Some("123456789012345678".to_string())
-  );
-  *a.active_socket.lock().unwrap() = None;
-  assert!(b.active_socket.lock().unwrap().is_none());
-
-  *b.last_pid.lock().unwrap() = Some(42);
-  assert_eq!(*a.last_pid.lock().unwrap(), Some(42));
-
-  *b.last_process.lock().unwrap() = [("123456789012345678".to_string(), 42)]
-    .into_iter()
-    .collect();
+  // Shared detection state must be visible across clones (event_loop on
+  // one, process_loop on the other): arming a process publication via b
+  // shows up when a drains it.
+  b.last_process
+    .lock()
+    .unwrap()
+    .insert("123456789012345678".to_string(), 42);
   assert_eq!(
     a.last_process.lock().unwrap().clone(),
     [("123456789012345678".to_string(), 42)]
       .into_iter()
       .collect::<std::collections::HashMap<_, _>>()
   );
+  assert_eq!(
+    take_process_clear(&a),
+    vec![(42, "123456789012345678".to_string())]
+  );
+  assert!(b.last_process.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -102,11 +98,11 @@ fn process_clear_consumes_outstanding_publication_once() {
 }
 
 #[test]
-fn process_clear_survives_sdk_clear_reset() {
-  // Regression: the game SDK disconnect clears active_socket (event_loop
-  // path) while the app-id-keyed process entry is still live. The old
-  // null-scan gate (active_socket) then skipped the prune forever and
-  // every later bridge client replayed the dead game.
+fn process_clear_survives_sdk_clear() {
+  // Regression: the game SDK disconnect (event_loop path, pid-keyed) must
+  // never disarm the app-id-keyed process prune — otherwise the null scan
+  // skips it forever and every later bridge client replays a dead game.
+  // There is no shared flag anymore: the armed map is the only gate.
   let (_ipc_tx, ipc_rx) = std::sync::mpsc::channel();
   let (_proc_tx, proc_rx) = std::sync::mpsc::channel();
   let (_ws_tx, ws_rx) = std::sync::mpsc::channel();
@@ -117,8 +113,6 @@ fn process_clear_survives_sdk_clear_reset() {
     .lock()
     .unwrap()
     .insert("111111111111111111".to_string(), 1234);
-  // SDK clear already reset the shared flag...
-  *connector.active_socket.lock().unwrap() = None;
   // ...yet the process publication still yields its one clear.
   assert_eq!(
     take_process_clear(&connector),
