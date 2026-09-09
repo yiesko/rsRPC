@@ -777,13 +777,14 @@ pub(crate) fn exe_stem(normalized_path: &str) -> String {
 fn stamp_activity(obj: &Arc<DetectableActivity>, pid: u64) -> Arc<DetectableActivity> {
   let mut new_activity = (**obj).clone();
   new_activity.pid = Some(pid);
-  new_activity.timestamp = Some(format!(
-    "{:?}",
-    std::time::SystemTime::now()
-      .duration_since(std::time::UNIX_EPOCH)
-      .unwrap()
-      .as_millis()
-  ));
+  // Epoch millis as a NUMBER: Discord's schema (and strict clients) want an
+  // integer here — a stringified timestamp is silently dropped downstream.
+  let start_ms = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .ok()
+    .and_then(|age| u64::try_from(age.as_millis()).ok())
+    .unwrap_or(0);
+  new_activity.timestamp = Some(start_ms);
   Arc::new(new_activity)
 }
 

@@ -59,7 +59,7 @@ pub(crate) struct ScannedGame {
   pub(crate) id: String,
   pub(crate) name: String,
   pub(crate) pid: u64,
-  pub(crate) start: String,
+  pub(crate) start: u64,
 }
 
 /// IPC-wins handoff: generic process detection yields its slot to a live
@@ -133,9 +133,7 @@ pub(crate) fn generic_payload(game: &ScannedGame) -> commands::CachedActivity {
     activity: commands::ProcessActivity {
       application_id: game.id.clone(),
       name: game.name.clone(),
-      timestamps: commands::ProcessTimestamps {
-        start: game.start.clone(),
-      },
+      timestamps: commands::ProcessTimestamps { start: game.start },
       r#type: 0,
       metadata: HashMap::new(),
       flags: 0,
@@ -568,10 +566,7 @@ impl ClientConnector {
         id: proc_activity.id.clone(),
         name: proc_activity.name.clone(),
         pid: proc_activity.pid.unwrap_or_default(),
-        start: proc_activity
-          .timestamp
-          .clone()
-          .unwrap_or_else(|| "0".to_string()),
+        start: proc_activity.timestamp.unwrap_or(0),
       };
       connector
         .handoff

@@ -19,7 +19,7 @@ pub struct ProcessActivity {
 
 #[derive(Serialize)]
 pub struct ProcessTimestamps {
-  pub start: String,
+  pub start: u64,
 }
 
 #[derive(Serialize)]

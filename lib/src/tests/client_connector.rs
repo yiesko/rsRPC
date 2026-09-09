@@ -229,7 +229,7 @@ fn handoff_suppresses_while_ipc_live_and_resumes_on_owner_clear() {
     id: "111111111111111111".to_string(),
     name: "Game".to_string(),
     pid: 1234,
-    start: "0".to_string(),
+    start: 0,
   };
   let mut handoff = HandoffState::default();
   assert!(!handoff.suppresses(&game.id));
@@ -280,7 +280,7 @@ fn handoff_resume_only_matches_scanned_game() {
     id: "2".to_string(),
     name: "Other".to_string(),
     pid: 9,
-    start: "0".to_string(),
+    start: 0,
   }));
   // A different game on screen: not ours to resume.
   assert_eq!(handoff.resume_for("1"), None);
@@ -303,12 +303,33 @@ fn generic_payload_carries_scanned_identity() {
     id: "111111111111111111".to_string(),
     name: "Game".to_string(),
     pid: 1234,
-    start: "7".to_string(),
+    start: 7,
   });
   let body: serde_json::Value = serde_json::from_str(&payload.json).expect("valid json");
   assert_eq!(body["socketId"], "111111111111111111");
   assert_eq!(body["activity"]["application_id"], "111111111111111111");
   assert_eq!(body["activity"]["name"], "Game");
-  assert_eq!(body["activity"]["timestamps"]["start"], "7");
+  assert_eq!(body["activity"]["timestamps"]["start"], 7);
   assert_eq!(body["pid"], 1234);
+}
+
+#[test]
+fn generic_payload_start_is_numeric_millis() {
+  // Strict clients silently drop generic frames whose start timestamp is a
+  // string: Discord's schema wants integer millis (see stamp_activity).
+  use crate::server::client_connector::{ScannedGame, generic_payload};
+
+  let payload = generic_payload(&ScannedGame {
+    id: "111111111111111111".to_string(),
+    name: "Game".to_string(),
+    pid: 1234,
+    start: 1_700_000_000_000,
+  });
+  let body: serde_json::Value = serde_json::from_str(&payload.json).expect("valid json");
+  let start = &body["activity"]["timestamps"]["start"];
+  assert!(
+    start.is_u64(),
+    "start must serialize as a number, got {start}"
+  );
+  assert_eq!(start.as_u64(), Some(1_700_000_000_000));
 }
