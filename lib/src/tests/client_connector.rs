@@ -55,10 +55,14 @@ fn clones_share_detection_state() {
   *b.last_pid.lock().unwrap() = Some(42);
   assert_eq!(*a.last_pid.lock().unwrap(), Some(42));
 
-  *b.last_process.lock().unwrap() = Some("123456789012345678".to_string());
+  *b.last_process.lock().unwrap() = [("123456789012345678".to_string(), 42)]
+    .into_iter()
+    .collect();
   assert_eq!(
     a.last_process.lock().unwrap().clone(),
-    Some("123456789012345678".to_string())
+    [("123456789012345678".to_string(), 42)]
+      .into_iter()
+      .collect::<std::collections::HashMap<_, _>>()
   );
 }
 
@@ -81,17 +85,20 @@ fn process_clear_consumes_outstanding_publication_once() {
   let connector = ClientConnector::new(45973, 45983, 45974, test_user(), ipc_rx, proc_rx, ws_rx);
 
   // Nothing published: null scans skip.
-  assert_eq!(take_process_clear(&connector), None);
+  assert_eq!(take_process_clear(&connector), Vec::new());
 
-  // A process publication arms exactly one clear, with the last pid.
-  *connector.last_process.lock().unwrap() = Some("111111111111111111".to_string());
-  *connector.last_pid.lock().unwrap() = Some(1234);
+  // A process publication arms exactly one clear, carrying its own pid.
+  connector
+    .last_process
+    .lock()
+    .unwrap()
+    .insert("111111111111111111".to_string(), 1234);
   assert_eq!(
     take_process_clear(&connector),
-    Some((1234, "111111111111111111".to_string()))
+    vec![(1234, "111111111111111111".to_string())]
   );
   // Consumed: further null scans skip (no clear spam, no re-clear).
-  assert_eq!(take_process_clear(&connector), None);
+  assert_eq!(take_process_clear(&connector), Vec::new());
 }
 
 #[test]
@@ -105,14 +112,17 @@ fn process_clear_survives_sdk_clear_reset() {
   let (_ws_tx, ws_rx) = std::sync::mpsc::channel();
   let connector = ClientConnector::new(45975, 45985, 45976, test_user(), ipc_rx, proc_rx, ws_rx);
 
-  *connector.last_process.lock().unwrap() = Some("111111111111111111".to_string());
-  *connector.last_pid.lock().unwrap() = Some(1234);
+  connector
+    .last_process
+    .lock()
+    .unwrap()
+    .insert("111111111111111111".to_string(), 1234);
   // SDK clear already reset the shared flag...
   *connector.active_socket.lock().unwrap() = None;
   // ...yet the process publication still yields its one clear.
   assert_eq!(
     take_process_clear(&connector),
-    Some((1234, "111111111111111111".to_string()))
+    vec![(1234, "111111111111111111".to_string())]
   );
 }
 
@@ -284,6 +294,75 @@ fn handoff_resume_only_matches_scanned_game() {
   }));
   // A different game on screen: not ours to resume.
   assert_eq!(handoff.resume_for("1"), None);
+}
+
+#[test]
+fn abrupt_close_releases_every_slot_of_dead_pid() {
+  // Socket died without CLEAR (send_empty carries no app id): every slot
+  // the dead pid owned must release, or their generics stay suppressed
+  // by a ghost owner forever.
+  use crate::server::client_connector::HandoffState;
+
+  let mut handoff = HandoffState::default();
+  handoff.note_publish("1", 10);
+  handoff.note_publish("2", 10);
+  handoff.note_publish("3", 99);
+
+  let mut released = handoff.note_clear_pid(10);
+  released.sort();
+  assert_eq!(released, vec!["1".to_string(), "2".to_string()]);
+  // Other pids untouched; release is idempotent.
+  assert!(handoff.suppresses("3"));
+  assert!(!handoff.suppresses("1"));
+  assert!(handoff.note_clear_pid(10).is_empty());
+}
+
+#[test]
+fn process_clear_drains_every_armed_slot_sorted() {
+  // Multi-game scans publish per slot: one null event must clear all of
+  // them, deterministically ordered, then go quiet.
+  use crate::server::client_connector::take_process_clear;
+
+  let (_ipc_tx, ipc_rx) = std::sync::mpsc::channel();
+  let (_proc_tx, proc_rx) = std::sync::mpsc::channel();
+  let (_ws_tx, ws_rx) = std::sync::mpsc::channel();
+  let connector = ClientConnector::new(45977, 45987, 45978, test_user(), ipc_rx, proc_rx, ws_rx);
+
+  {
+    let mut armed = connector.last_process.lock().unwrap();
+    armed.insert("222222222222222222".to_string(), 22);
+    armed.insert("111111111111111111".to_string(), 11);
+  }
+  assert_eq!(
+    take_process_clear(&connector),
+    vec![
+      (11, "111111111111111111".to_string()),
+      (22, "222222222222222222".to_string()),
+    ]
+  );
+  assert_eq!(take_process_clear(&connector), Vec::new());
+}
+
+#[test]
+fn scan_memory_is_per_slot() {
+  // Every scan event is remembered by app id (not just the last one),
+  // so any slot's IPC clear can resume its own generic; null wipes all.
+  use crate::server::client_connector::{HandoffState, ScannedGame};
+
+  let game = |id: &str| ScannedGame {
+    id: id.to_string(),
+    name: "Game".to_string(),
+    pid: 1,
+    start: 0,
+  };
+  let mut handoff = HandoffState::default();
+  handoff.note_scan(Some(game("1")));
+  handoff.note_scan(Some(game("2")));
+  assert_eq!(handoff.resume_for("1"), Some(game("1")));
+  assert_eq!(handoff.resume_for("2"), Some(game("2")));
+  handoff.note_scan(None);
+  assert_eq!(handoff.resume_for("1"), None);
+  assert_eq!(handoff.resume_for("2"), None);
 }
 
 #[test]

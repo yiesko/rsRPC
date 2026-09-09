@@ -39,10 +39,6 @@ pub struct ProcessDetectedEvent {
 
 #[derive(Clone)]
 pub struct ProcessServer {
-  /// Id of the last published detection, to notice game changes. A plain
-  /// id string on purpose: keeping the full activities here would pin the
-  /// previous database generation after every refresh.
-  last_detected_id: Arc<Mutex<Option<String>>>,
   custom_detectables: Arc<Mutex<Vec<Arc<DetectableActivity>>>>,
   scanning: Arc<AtomicBool>,
 
@@ -98,7 +94,6 @@ impl ProcessServer {
 
     let server = ProcessServer {
       scanning: Arc::new(AtomicBool::new(false)),
-      last_detected_id: Arc::new(Mutex::new(None)),
       custom_detectables: Arc::new(Mutex::new(vec![])),
       detectable_list: Arc::new(Mutex::new(detectable)),
       steam_map: Arc::new(Mutex::new(steam_map)),
@@ -282,30 +277,22 @@ impl ProcessServer {
             before - detected.len()
           );
         }
-        let mut new_game_detected = false;
-        let mut last_id = clone.last_detected_id.lock().unwrap();
-
-        // If the detected list has changed, send only the first element.
-        // Every non-empty scan sends (downstream dedups repeats); only the
-        // tracked id changes what counts as "new". Fail-soft: a dead
-        // receiver means the connector is gone, so sleep and retry instead
-        // of panicking this loop (see the panic hook in cli/main.rs).
+        // Forward EVERY detected game, one event per slot. Downstream
+        // publishes per app id and dedups repeats, so co-running games
+        // each own their card instead of only the first.
         if !detected.is_empty() {
-          // If the detected id is different, it is a new game
-          if last_id.as_deref() != Some(detected[0].id.as_str()) {
-            new_game_detected = true;
-          }
-
-          if clone
-            .event_sender
-            .send(ProcessDetectedEvent {
-              activity: detected[0].clone(),
-            })
-            .is_err()
-          {
-            warn!("[Process Scanner] Event receiver gone, retrying scan");
-            std::thread::sleep(wait_time);
-            continue;
+          for game in &detected {
+            if clone
+              .event_sender
+              .send(ProcessDetectedEvent {
+                activity: game.clone(),
+              })
+              .is_err()
+            {
+              warn!("[Process Scanner] Event receiver gone, retrying scan");
+              std::thread::sleep(wait_time);
+              continue;
+            }
           }
         }
 
@@ -351,12 +338,6 @@ impl ProcessServer {
             std::thread::sleep(wait_time);
             continue;
           }
-        }
-
-        if new_game_detected {
-          // Remember only the id (never the activities: those would pin
-          // the previous database generation after every refresh).
-          *last_id = detected.first().map(|game| game.id.clone());
         }
 
         std::thread::sleep(wait_time);

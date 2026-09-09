@@ -77,8 +77,9 @@ pub(crate) struct ScannedGame {
 pub(crate) struct HandoffState {
   /// App id → pid of its current IPC/WS owner (`SET_ACTIVITY` with activity).
   live_ipc: HashMap<String, u64>,
-  /// Last game the scanner reported (`None` after a null/clear event).
-  last_scan: Option<ScannedGame>,
+  /// Last games the scanner reported, by app id (a null/clear event wipes
+  /// the table).
+  last_scans: HashMap<String, ScannedGame>,
 }
 
 impl HandoffState {
@@ -97,7 +98,29 @@ impl HandoffState {
   }
 
   pub(crate) fn note_scan(&mut self, game: Option<ScannedGame>) {
-    self.last_scan = game;
+    match game {
+      Some(game) => {
+        self.last_scans.insert(game.id.clone(), game);
+      }
+      // Null scan: the table is empty, forget every game.
+      None => self.last_scans.clear(),
+    }
+  }
+
+  /// Release every slot owned by `pid` (abrupt close without CLEAR) and
+  /// return the released app ids. Without this, a dead owner suppresses
+  /// its slots' generics forever.
+  pub(crate) fn note_clear_pid(&mut self, pid: u64) -> Vec<String> {
+    let dead: Vec<String> = self
+      .live_ipc
+      .iter()
+      .filter(|(_, owner)| **owner == pid)
+      .map(|(app, _)| app.clone())
+      .collect();
+    for app in &dead {
+      self.live_ipc.remove(app);
+    }
+    dead
   }
 
   /// Whether generic detection must stay out of this slot right now.
@@ -108,7 +131,7 @@ impl HandoffState {
   /// The game to re-assert when `app_id`'s IPC source cleared, if the
   /// scanner still reports that same game.
   pub(crate) fn resume_for(&self, app_id: &str) -> Option<ScannedGame> {
-    self.last_scan.clone().filter(|game| game.id == app_id)
+    self.last_scans.get(app_id).cloned()
   }
 }
 
@@ -181,13 +204,14 @@ pub struct ClientConnector {
   /// was last broadcast, so IPC/WS clears can resume process detection.
   pub last_pid: Arc<Mutex<Option<u64>>>,
   pub active_socket: Arc<Mutex<Option<String>>>,
-  /// Last process-detected activity id broadcast but not yet cleared.
-  /// Consumed (`take`) by the null-scan path to clear exactly once — even
-  /// when an IPC/WS clear already reset `active_socket` meanwhile. The two
-  /// keyspaces differ (IPC clears are pid-keyed, process clears are
-  /// app-id-keyed), so gating the prune on `active_socket` strands the
-  /// process entry forever: every later bridge client replays a dead game.
-  pub last_process: Arc<Mutex<Option<String>>>,
+  /// Last process-detected activities broadcast but not yet cleared, by
+  /// app id (each with its pid for the clear frame). Consumed (`drain`)
+  /// by the null-scan path to clear exactly once — even when an IPC/WS
+  /// clear already reset `active_socket` meanwhile. The two keyspaces
+  /// differ (IPC clears are pid-keyed, process clears are app-id-keyed),
+  /// so gating the prune on `active_socket` strands the process entry
+  /// forever: every later bridge client replays a dead game.
+  pub last_process: Arc<Mutex<HashMap<String, u64>>>,
   /// IPC-wins handoff state (see [`HandoffState`]).
   handoff: Arc<Mutex<HandoffState>>,
 
@@ -248,7 +272,7 @@ impl ClientConnector {
 
       last_pid: Arc::new(Mutex::new(None)),
       active_socket: Arc::new(Mutex::new(None)),
-      last_process: Arc::new(Mutex::new(None)),
+      last_process: Arc::new(Mutex::new(HashMap::new())),
       handoff: Arc::new(Mutex::new(HandoffState::default())),
 
       ipc_event_rec: Arc::new(Mutex::new(Some(ipc_event_rec))),
@@ -502,19 +526,29 @@ impl ClientConnector {
           // every fresh connection would flap the display.
           if is_genuine_clear(&cmd) {
             *connector.active_socket.lock().unwrap() = None;
-            // Hand the slot back to generic detection when the owning SDK
-            // source cleared (stale closes from superseded companions are
-            // ignored); the game must still be alive, or the card would
-            // flash on the way out (the scanner's null event clears anyway).
-            let resume = cmd.application_id.clone().and_then(|app| {
+            // Hand the slot(s) back to generic detection when the owning
+            // SDK source cleared (stale closes from superseded companions
+            // are ignored); the game must still be alive, or the card
+            // would flash on the way out (the scanner's null event clears
+            // anyway).
+            let resume: Vec<ScannedGame> = {
               let mut handoff = connector.handoff.lock().unwrap();
-              if handoff.note_clear(&app, pid) {
-                handoff.resume_for(&app)
-              } else {
-                None
+              match cmd.application_id.clone() {
+                Some(app) if handoff.note_clear(&app, pid) => {
+                  handoff.resume_for(&app).into_iter().collect()
+                }
+                Some(_) => Vec::new(),
+                // No app id: abrupt close (socket died without CLEAR).
+                // Release every slot this pid owned, or their generics
+                // stay suppressed by a dead owner forever.
+                None => handoff
+                  .note_clear_pid(pid)
+                  .into_iter()
+                  .filter_map(|app| handoff.resume_for(&app))
+                  .collect(),
               }
-            });
-            if let Some(game) = resume.filter(|game| process_alive(game.pid)) {
+            };
+            for game in resume.into_iter().filter(|game| process_alive(game.pid)) {
               connector.resume_generic(&game);
             }
             if changed {
@@ -539,21 +573,25 @@ impl ClientConnector {
 
       if proc_activity.id == "null" {
         connector.handoff.lock().unwrap().note_scan(None);
-        // Clear exactly once per process publication: consume the
-        // outstanding id (if any) and clear it. Gated on the publication,
-        // NOT on active_socket — an IPC/WS clear may have reset that flag
-        // already while the app-id-keyed entry is still live (dual
-        // keyspaces: pid-keyed vs app-id-keyed).
-        let Some((pid, socket_id)) = take_process_clear(&connector) else {
+        // Clear every outstanding process publication (multi-game scans
+        // publish per slot; a lone null means the table is empty).
+        // Gated on the publications, NOT on active_socket — an IPC/WS
+        // clear may have reset that flag already while app-id-keyed
+        // entries are still live (dual keyspaces: pid-keyed vs
+        // app-id-keyed).
+        let outstanding = take_process_clear(&connector);
+        if outstanding.is_empty() {
           continue;
-        };
+        }
 
-        // Send an empty payload
-        log!("[Client Connector] Sending empty payload");
+        for (pid, socket_id) in outstanding {
+          // Send an empty payload
+          log!("[Client Connector] Sending empty payload");
 
-        let payload = commands::empty_cached(pid, socket_id.clone());
+          let payload = commands::empty_cached(pid, socket_id.clone());
 
-        connector.broadcast_activity(payload, socket_id);
+          connector.broadcast_activity(payload, socket_id);
+        }
 
         *connector.active_socket.lock().unwrap() = None;
 
@@ -575,16 +613,22 @@ impl ClientConnector {
         .note_scan(Some(game.clone()));
 
       // IPC-wins handoff: a live SDK presence owns this slot — withdraw
-      // our generic card if shown (keeping last_process armed for the
-      // final clear) and stay out until that source clears.
+      // our generic card if shown and stay out until that source clears.
+      // Strictly per-slot: other games' cards are untouched, so co-running
+      // games each keep theirs.
       if connector.handoff.lock().unwrap().suppresses(&game.id) {
-        if connector.active_socket.lock().unwrap().as_deref() == Some(game.id.as_str()) {
+        if connector
+          .last_process
+          .lock()
+          .unwrap()
+          .remove(&game.id)
+          .is_some()
+        {
           let pid = connector.last_pid.lock().unwrap().unwrap_or_default();
           connector.broadcast_activity(
             commands::empty_cached(pid, game.id.clone()),
             game.id.clone(),
           );
-          *connector.active_socket.lock().unwrap() = None;
           debug!(
             "[Client Connector] Yielding {} to live IPC presence",
             game.name
@@ -598,19 +642,14 @@ impl ClientConnector {
         continue;
       }
 
-      // If the active socket is different from the current socket, send an empty payload for the old socket
-      let active = connector.active_socket.lock().unwrap().clone();
-      if active != Some(proc_activity.id.clone()) {
-        if let Some(socket_id) = active {
-          // Send an empty payload
-          log!("[Client Connector] Sending empty payload");
-
-          let pid = connector.last_pid.lock().unwrap().unwrap_or_default();
-          let payload = commands::empty_cached(pid, socket_id.clone());
-
-          connector.broadcast_activity(payload, socket_id);
-        }
-      } else {
+      // Already showing this slot: the scanner emits every pass, so
+      // repeats dedup here instead of flapping the display.
+      if connector
+        .last_process
+        .lock()
+        .unwrap()
+        .contains_key(&game.id)
+      {
         debug!(
           "[Client Connector] Already sent payload for activity: {}",
           proc_activity.name
@@ -620,10 +659,14 @@ impl ClientConnector {
 
       *connector.last_pid.lock().unwrap() = proc_activity.pid;
       *connector.active_socket.lock().unwrap() = Some(proc_activity.id.clone());
-      *connector.last_process.lock().unwrap() = Some(proc_activity.id.clone());
+      connector
+        .last_process
+        .lock()
+        .unwrap()
+        .insert(game.id.clone(), proc_activity.pid.unwrap_or_default());
 
       debug!(
-        "[Client Connector] Already sent payload for activity: {}",
+        "[Client Connector] Publishing generic presence for activity: {}",
         proc_activity.name
       );
 
@@ -640,7 +683,11 @@ impl ClientConnector {
   fn resume_generic(&self, game: &ScannedGame) {
     *self.last_pid.lock().unwrap() = Some(game.pid);
     *self.active_socket.lock().unwrap() = Some(game.id.clone());
-    *self.last_process.lock().unwrap() = Some(game.id.clone());
+    self
+      .last_process
+      .lock()
+      .unwrap()
+      .insert(game.id.clone(), game.pid);
     debug!(
       "[Client Connector] Resuming generic presence for {} ({})",
       game.name, game.id
@@ -795,16 +842,22 @@ impl ClientConnector {
 }
 
 /**
- * Consume the outstanding process publication for clearing, if any.
- * Returns `(pid, socket_id)` for the clear frame. Single-shot by
- * construction (`take`): repeated null scans clear once and then skip,
- * and a prior IPC/WS clear (which resets `active_socket` but never
- * touches this) cannot disarm it.
+ * Consume the outstanding process publications for clearing, if any.
+ * Returns `(pid, socket_id)` pairs, sorted for deterministic clears.
+ * Single-shot by construction (`drain`): repeated null scans clear once
+ * and then skip, and a prior IPC/WS clear (which resets `active_socket`
+ * but never touches these) cannot disarm them.
  */
-pub(crate) fn take_process_clear(connector: &ClientConnector) -> Option<(u64, String)> {
-  let socket_id = connector.last_process.lock().unwrap().take()?;
-  let pid = connector.last_pid.lock().unwrap().unwrap_or_default();
-  Some((pid, socket_id))
+pub(crate) fn take_process_clear(connector: &ClientConnector) -> Vec<(u64, String)> {
+  let mut outstanding: Vec<(u64, String)> = connector
+    .last_process
+    .lock()
+    .unwrap()
+    .drain()
+    .map(|(socket_id, pid)| (pid, socket_id))
+    .collect();
+  outstanding.sort();
+  outstanding
 }
 
 impl Drop for ClientConnector {
