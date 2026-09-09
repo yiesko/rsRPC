@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.2] - 2026-09-09
+
+### Fixed
+- Generic process payloads carried `timestamps.start` as a string;
+  strict clients (Equibop) silently drop mistyped frames, so generic
+  cards never displayed. Epoch millis are now emitted as a number end
+  to end (`DetectableActivity.timestamp`, `ScannedGame.start`,
+  `ProcessTimestamps.start`).
+- The scan loop forwarded only the first detected game, starving
+  co-running games (WuWa + NTE). Every detected game now gets its own
+  per-slot event with per-id dedup and no cross-clearing; the null
+  event drains every armed slot.
+- App slots whose IPC/WS owner died without CLEAR stayed suppressed by
+  a ghost owner forever (`send_empty` carries no app id). Abrupt closes
+  now release every slot owned by the dead pid and resume their
+  generics.
+- Steam AppId fallback via command line (`reaper SteamLaunch
+  AppId=4508340 ...`) when `/proc/<pid>/environ` is unreadable.
+  Sandboxed Proton runtimes (pressure-vessel/bwrap) hide environ from
+  service contexts while cmdline stays readable — without this, games
+  like NTE are invisible to automatic detection.
+
 ## [0.32.1] - 2026-09-08
 
 ### Added
@@ -133,7 +155,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Stuck presence after game close.
 
-[Unreleased]: https://github.com/yiesko/rsRPC/compare/v0.32.1...HEAD
+[Unreleased]: https://github.com/yiesko/rsRPC/compare/v0.32.2...HEAD
+[0.32.2]: https://github.com/yiesko/rsRPC/releases/tag/v0.32.2
 [0.32.1]: https://github.com/yiesko/rsRPC/releases/tag/v0.32.1
 [0.32.0]: https://github.com/yiesko/rsRPC/releases/tag/v0.32.0
 [0.31.0]: https://github.com/yiesko/rsRPC/releases/tag/v0.31.0

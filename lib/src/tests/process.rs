@@ -430,3 +430,25 @@ fn apply_ignore_list_drops_only_ignored_ids() {
   let ids: Vec<_> = kept.iter().map(|game| game.id.clone()).collect();
   assert_eq!(ids, vec!["1".to_string(), "3".to_string()]);
 }
+
+#[test]
+fn app_id_from_args_parses_steam_launcher_token() {
+  use crate::server::process::app_id_from_args;
+
+  // Real reaper shape: token stands alone, digits follow.
+  assert_eq!(
+    app_id_from_args(Some("SteamLaunch AppId=4508340 -- /games/nte")),
+    Some("4508340".to_string())
+  );
+  // No token, empty input, token without digits: nothing.
+  assert_eq!(app_id_from_args(Some("htgame.exe /Game/Map")), None);
+  assert_eq!(app_id_from_args(None), None);
+  assert_eq!(app_id_from_args(Some("AppId= -- flag")), None);
+  // Suffix of a longer key is not a token (`SomeAppId=`).
+  assert_eq!(app_id_from_args(Some("SomeAppId=123")), None);
+  // First boundary-valid token with digits wins.
+  assert_eq!(
+    app_id_from_args(Some("SomeAppId=1 AppId=22")),
+    Some("22".to_string())
+  );
+}

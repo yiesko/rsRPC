@@ -541,10 +541,24 @@ impl ProcessServer {
         // empty `executables` (e.g. How to Fish) with no overrides.json.
         // The AppId lives in environ (kilobytes per process), so it is
         // read here — only for the few misses — never for the whole table.
+        // When environ is unreadable (sandboxed Proton runtimes such as
+        // pressure-vessel hide it from service contexts while cmdline
+        // stays readable), fall back to the AppId in the command line
+        // (`reaper SteamLaunch AppId=4508340 ...`).
         let (obj, exe_index) = match found {
           Some(found) => found,
           None => {
             let app_id = read_steam_app_id(process.pid);
+            let (app_id, via_cmdline) = match app_id {
+              Some(id) => (Some(id), false),
+              None => (app_id_from_args(process.arguments.as_deref()), true),
+            };
+            if via_cmdline && let Some(id) = app_id.as_deref() {
+              debug!(
+                "[Process Scanner] AppId {} for pid {} from command line (environ unreadable)",
+                id, process.pid
+              );
+            }
             return match_aux_process(
               &process_path,
               app_id.as_deref(),
@@ -697,6 +711,35 @@ fn read_steam_app_id(pid: u64) -> Option<String> {
 /// limited to the exe/name paths).
 #[cfg(not(target_os = "linux"))]
 fn read_steam_app_id(_pid: u64) -> Option<String> {
+  None
+}
+
+/// Steam AppId from a process command line (`reaper SteamLaunch
+/// AppId=4508340 ...`): fallback when `/proc/<pid>/environ` is
+/// unreadable. Sandboxed Proton runtimes (pressure-vessel/bwrap) hide
+/// environ from service contexts while cmdline stays readable — without
+/// this, every such game is invisible to automatic detection. Same trust
+/// as environ (both launcher-provided, display-only use): the token must
+/// stand alone (`AppId=` at a word boundary, followed by digits).
+pub(crate) fn app_id_from_args(arguments: Option<&str>) -> Option<String> {
+  const TOKEN: &str = "AppId=";
+  let args = arguments?;
+  let mut rest = args;
+  while let Some(pos) = rest.find(TOKEN) {
+    let boundary = pos == 0
+      || rest[..pos]
+        .chars()
+        .next_back()
+        .is_none_or(|c| !c.is_ascii_alphanumeric());
+    rest = &rest[pos + TOKEN.len()..];
+    if !boundary {
+      continue;
+    }
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if !digits.is_empty() {
+      return Some(digits);
+    }
+  }
   None
 }
 
