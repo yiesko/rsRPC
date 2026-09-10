@@ -803,14 +803,26 @@ impl ClientConnector {
       return;
     }
 
-    for responder in json_clients.values() {
-      if let Ok(payload) = serde_json::to_string(cmd) {
-        responder.send(Message::Text(payload));
+    // Serialize once per encoding, not once per client: clones are
+    // orders of magnitude cheaper than re-serializing the same frame.
+    let json_payload = if json_clients.is_empty() {
+      None
+    } else {
+      serde_json::to_string(cmd).ok()
+    };
+    let msgpack_payload = if msgpack_clients.is_empty() {
+      None
+    } else {
+      rmp_serde::to_vec_named(cmd).ok()
+    };
+    if let Some(payload) = json_payload {
+      for responder in json_clients.values() {
+        responder.send(Message::Text(payload.clone()));
       }
     }
-    for responder in msgpack_clients.values() {
-      if let Ok(payload) = rmp_serde::to_vec_named(cmd) {
-        responder.send(Message::Binary(payload));
+    if let Some(payload) = msgpack_payload {
+      for responder in msgpack_clients.values() {
+        responder.send(Message::Binary(payload.clone()));
       }
     }
   }

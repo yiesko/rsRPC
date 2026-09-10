@@ -224,8 +224,9 @@ pub struct ThirdPartySku {
 /// full probe chain — and can never shadow a real game.
 #[derive(Clone, Debug, Default)]
 pub struct Exclusions {
-  /// Lowercased basenames, exact match.
-  pub executables: Vec<String>,
+  /// Lowercased basenames, exact match (hash set: consulted per process
+  /// per tick, so O(1) instead of a linear scan over two dozen names).
+  pub executables: std::collections::HashSet<String>,
   /// Compiled case-insensitively (the DB is Windows-centric; matching
   /// stays correct for Proton paths). Invalid patterns are skipped at
   /// parse, never fatal.
@@ -239,7 +240,7 @@ impl Exclusions {
     if self.executables.is_empty() && self.patterns.is_empty() {
       return false;
     }
-    if self.executables.iter().any(|exe| exe == basename) {
+    if self.executables.contains(basename) {
       return true;
     }
     self.patterns.iter().any(|re| re.is_match(basename))

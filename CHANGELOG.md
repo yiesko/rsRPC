@@ -58,6 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   defaults) and `append_detectables` stages pre-start: `--list-detected`
   now applies staged overrides AND the ignore-list, so diagnostics show
   exactly what the daemon would publish (previously main-DB-only).
+- Scan efficiency (measured with hotpath-rs, see `cargo profile
+  profiling`): case-insensitive automata (no per-process lowercase
+  allocation), borrowed paths (`Cow`, zero alloc on the common case),
+  memoized SteamAppId per pid (one environ read per process lifetime,
+  swept per tick, invalidated on EXEC), `HashSet` exclusions, hoisted
+  broadcast serialization, and idle backoff (5s → 30s cap, reset by any
+  detection or early wake — EXEC still delivers starts instantly).
+  Steady state: ~0.4% CPU, ~57MB RSS; per-process classify 54µs → 23µs.
 
 ## [0.32.2] - 2026-09-09
 

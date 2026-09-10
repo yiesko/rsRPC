@@ -672,8 +672,10 @@ fn exclusions_parse_and_match() {
     "unexpected": [1, 2]
   }"#;
   let exclusions = parse_exclusions(body);
+  let mut names: Vec<_> = exclusions.executables.iter().cloned().collect();
+  names.sort();
   assert_eq!(
-    exclusions.executables,
+    names,
     vec!["crashreportclient.exe", "unitycrashhandler64.exe"]
   );
   assert_eq!(exclusions.patterns.len(), 1);
@@ -753,6 +755,66 @@ fn match_process_honors_exclusions() {
     )
     .expect("non-excluded path must match");
   assert_eq!(hit.id, "222");
+}
+
+#[test]
+fn ac_matches_mixed_case_without_lowercasing() {
+  use crate::server::process::Exec;
+
+  // DB patterns stay as-written; the automaton matches insensitively so
+  // the scan loop never allocates a lowercased path per process.
+  let db = vec![proton_entry(
+    "444",
+    "Mixed Case",
+    Some(("Mixed/Dir/GAME.EXE", "linux", false)),
+    None,
+  )];
+  let server = proton_server(db.clone());
+  let mut variant_bufs: [String; 5] = Default::default();
+  let mut reversed_path = String::with_capacity(256);
+  let mut obs_open = false;
+
+  for path in [
+    "/games/mixed/dir/game.exe",
+    "/GAMES/MIXED/DIR/GAME.EXE",
+    "C:\\Games\\Mixed\\Dir\\Game.Exe",
+  ] {
+    let hit = server
+      .match_process(
+        &Exec {
+          pid: u64::MAX,
+          path: path.to_string(),
+          arguments: None,
+        },
+        &db,
+        &mut variant_bufs,
+        &mut reversed_path,
+        &mut obs_open,
+      )
+      .expect("case must not matter");
+    assert_eq!(hit.id, "444");
+  }
+}
+
+#[test]
+fn idle_wait_stretches_and_caps() {
+  use std::time::Duration;
+
+  use crate::server::process::idle_wait;
+
+  let base = Duration::from_secs(5);
+  assert_eq!(idle_wait(base, 0), Duration::from_secs(5));
+  assert_eq!(idle_wait(base, 1), Duration::from_secs(10));
+  assert_eq!(idle_wait(base, 2), Duration::from_secs(20));
+  assert_eq!(idle_wait(base, 3), Duration::from_secs(30));
+  assert_eq!(idle_wait(base, 100), Duration::from_secs(30));
+  // A base already above the cap never stretches further.
+  assert_eq!(
+    idle_wait(Duration::from_secs(60), 3),
+    Duration::from_secs(30)
+  );
+  // Overflow-safe at the extremes.
+  assert_eq!(idle_wait(Duration::MAX, 4), Duration::from_secs(30));
 }
 
 // --- proc-events netlink parser (F1.5) ---

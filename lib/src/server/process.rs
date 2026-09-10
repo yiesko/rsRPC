@@ -74,6 +74,12 @@ pub struct ProcessServer {
   /// scan loop the moment a TRACKED game exits — untracked exits never
   /// cause a scan.
   detected_pids: Arc<Mutex<HashSet<u64>>>,
+  /// Memoized SteamAppId per pid: environ never changes after exec, so
+  /// one read per process lifetime suffices (environ is kilobytes — the
+  /// biggest per-process cost in the profiler). Invalidated by EXEC (the
+  /// watcher drops the entry before reclassifying) and by death (swept
+  /// every tick against the live pid set). Bounded by live process count.
+  appid_cache: Arc<Mutex<HashMap<u64, Option<String>>>>,
   /// Scan thread handle for early wakeups (proc-events EXIT of a tracked
   /// game). Registered by the scan thread itself on startup.
   scan_wake: Arc<Mutex<Option<std::thread::Thread>>>,
@@ -152,6 +158,7 @@ impl ProcessServer {
       exclusions_url,
       steam_libraries: Arc::new(Mutex::new(SteamLibraries::discover())),
       detected_pids: Arc::new(Mutex::new(HashSet::new())),
+      appid_cache: Arc::new(Mutex::new(HashMap::new())),
       scan_wake: Arc::new(Mutex::new(None)),
 
       // sysinfo System
@@ -243,6 +250,25 @@ impl ProcessServer {
       .unwrap()
       .match_prefix(normalized_path)
       .map(str::to_string)
+  }
+
+  /// SteamAppId for one pid, memoized: environ is kilobytes and never
+  /// changes after exec, so re-reading it every 5s per process was pure
+  /// waste (profiler: ~5KB of the ~5KB per-process cost). IO happens
+  /// outside the lock; EXEC invalidates via [`ProcessServer::drop_appid`].
+  fn cached_app_id(&self, pid: u64) -> Option<String> {
+    if let Some(cached) = self.appid_cache.lock().unwrap().get(&pid) {
+      return cached.clone();
+    }
+    let id = read_steam_app_id(pid);
+    self.appid_cache.lock().unwrap().insert(pid, id.clone());
+    id
+  }
+
+  /// Drop one pid's memoized AppId (EXEC: same pid, new image, possibly
+  /// new environ). Called by the proc-events watcher before reclassifying.
+  pub(crate) fn drop_appid(&self, pid: u64) {
+    self.appid_cache.lock().unwrap().remove(&pid);
   }
 
   /// Revalidate the Steam libraries (stats only unless something changed).
@@ -350,7 +376,9 @@ impl ProcessServer {
       // the moment a tracked game exits (Linux only; elsewhere None and
       // the cadence below is a plain sleep).
       *clone.scan_wake.lock().unwrap() = Some(std::thread::current());
-      // Run the process scan repeatedly (every 3 seconds)
+      // Idle backoff state: consecutive ticks with no games detected.
+      let mut idle_ticks: u32 = 0;
+      // Run the process scan repeatedly (base cadence, stretched while idle)
       loop {
         let mut detected = match clone.scan_for_processes() {
           Ok(detected) => detected,
@@ -440,7 +468,22 @@ impl ProcessServer {
           }
         }
 
-        wait_scan(wait_time);
+        // Idle backoff: consecutive empty ticks stretch the cadence
+        // (base → 30s cap). Safe because game START arrives via EXEC
+        // events instantly and EXITs of tracked games unpark us early —
+        // polling only backstops what the watcher cannot (untracked
+        // exits, DB refreshes). Any detection or early wake resets.
+        if detected.is_empty() {
+          idle_ticks = idle_ticks.saturating_add(1);
+        } else {
+          idle_ticks = 0;
+        }
+        let cadence = idle_wait(wait_time, idle_ticks);
+        let wait_start = std::time::Instant::now();
+        wait_scan(cadence);
+        if wait_start.elapsed() < cadence.mul_f32(0.9) {
+          idle_ticks = 0;
+        }
       }
     });
 
@@ -608,27 +651,37 @@ impl ProcessServer {
     reversed_path: &mut String,
     obs_open: &mut bool,
   ) -> Option<Arc<DetectableActivity>> {
-    // Process path (but consistent slashes, so we can compare properly)
-    let mut process_path = process.path.to_ascii_lowercase();
+    // Process path with consistent slashes (original case: the
+    // automata match ASCII case-insensitively). Borrowed until a
+    // rewrite is actually needed — the common Linux case (no
+    // backslashes, absolute path) allocates nothing at all.
+    let mut process_path: std::borrow::Cow<str> = std::borrow::Cow::Borrowed(&process.path);
 
     if process_path.contains('\\') {
-      process_path = process_path.replace('\\', "/");
+      process_path = std::borrow::Cow::Owned(process_path.replace('\\', "/"));
     }
 
     if !process_path.starts_with('/') {
-      process_path.insert(0, '/');
+      process_path = std::borrow::Cow::Owned(format!("/{process_path}"));
     }
 
     // Discord exclusions first: installers, crash reporters and friends
     // are invisible before any matching (one basename lookup instead of
     // the full probe chain, and they can never shadow a real game).
     // Before the OBS flag too: an excluded process is absent, period.
-    let basename = process_path.rsplit('/').next().unwrap_or(&process_path);
-    if self.exclusions.lock().unwrap().is_excluded(basename) {
+    // Only the tiny basename is lowercased (the exclusion list is).
+    let basename = process_path
+      .rsplit('/')
+      .next()
+      .unwrap_or(&process_path)
+      .to_ascii_lowercase();
+    if self.exclusions.lock().unwrap().is_excluded(&basename) {
       debug!("[Process Scanner] Excluded process, skipping: {basename}");
       return None;
     }
 
+    // OBS binaries ship lowercase; the flag only feeds an unconsumed
+    // observer callback, so original-case matching is exact enough.
     if !*obs_open && (process_path.contains("obs64") || process_path.contains("streamlabs")) {
       *obs_open = true;
     }
@@ -672,13 +725,14 @@ impl ProcessServer {
     let (obj, exe_index) = match found {
       Some(found) => found,
       None => {
-        // The AppId lives in environ (kilobytes per process), so it is
-        // read here — only for the few misses — never for the whole table.
-        // When environ is unreadable (sandboxed Proton runtimes such as
-        // pressure-vessel hide it from service contexts while cmdline
-        // stays readable), fall back to the AppId in the command line
-        // (`reaper SteamLaunch AppId=4508340 ...`).
-        let app_id = read_steam_app_id(process.pid);
+        // Lowercase copy for the case-sensitive tail below (store-id
+        // maps, stem/folder heuristics). Paid only on misses — the hot
+        // AC path above never allocates it.
+        let lowered = process_path.to_ascii_lowercase();
+        // The AppId comes memoized (one environ read per process
+        // lifetime); cmdline fallback when environ is unreadable
+        // (sandboxed Proton runtimes hide it from service contexts).
+        let app_id = self.cached_app_id(process.pid);
         let (app_id, via_cmdline) = match app_id {
           Some(id) => (Some(id), false),
           None => (app_id_from_args(process.arguments.as_deref()), true),
@@ -709,7 +763,7 @@ impl ProcessServer {
         let non_steam = app_id.as_deref().is_some_and(is_shortcut_id);
         if non_steam
           && let Some(hit) =
-            match_name_or_folder(&process_path, process.pid, &self.name_map, detectable_list)
+            match_name_or_folder(&lowered, process.pid, &self.name_map, detectable_list)
         {
           return Some(hit);
         }
@@ -728,7 +782,7 @@ impl ProcessServer {
         // Steam's own word: the process runs under a known install dir,
         // so it inherits that entry's AppId. Beats name guessing below,
         // loses to a DB-declared path above.
-        if let Some(library_appid) = self.steam_prefix_app_id(&process_path)
+        if let Some(library_appid) = self.steam_prefix_app_id(&lowered)
           && let Some(hit) = match_steam_id(
             Some(&library_appid),
             process.pid,
@@ -747,7 +801,7 @@ impl ProcessServer {
         if non_steam {
           return None;
         }
-        return match_name_or_folder(&process_path, process.pid, &self.name_map, detectable_list);
+        return match_name_or_folder(&lowered, process.pid, &self.name_map, detectable_list);
       }
     };
 
@@ -780,6 +834,16 @@ impl ProcessServer {
     // Steam generation marker: one stat per watched libraryfolders.vdf;
     // the parse itself runs only when something actually changed.
     self.refresh_steam_libraries();
+
+    // Drop memoized AppIds of dead pids (pid reuse must never serve a
+    // stale id): one set build + retain per tick, replacing hundreds of
+    // kilobyte environ re-reads.
+    let live: HashSet<u64> = processes.iter().map(|process| process.pid).collect();
+    self
+      .appid_cache
+      .lock()
+      .unwrap()
+      .retain(|pid, _| live.contains(pid));
 
     let mut reversed_path = String::with_capacity(256);
     // Variant scratch space, reused for every process: the scan allocates
@@ -830,6 +894,16 @@ fn wait_scan(wait_time: Duration) {
   std::thread::park_timeout(wait_time);
 }
 
+/// Idle-stretched cadence: base × 2^idle_ticks, capped at 30s
+/// (5s → 10s → 20s → 30s at the default base). Overflow-safe.
+pub(crate) fn idle_wait(base: Duration, idle_ticks: u32) -> Duration {
+  const MAX_BACKOFF: Duration = Duration::from_secs(30);
+  let stretched = base
+    .checked_mul(1 << idle_ticks.min(4))
+    .unwrap_or(MAX_BACKOFF);
+  stretched.min(MAX_BACKOFF)
+}
+
 /// Spawn the netlink dispatch (Linux): EXEC classifies one process and
 /// emits hits at once; EXIT of a tracked game unparks the scan loop for
 /// an immediate natural clear. Setup failure (or a dead receiver on
@@ -850,6 +924,8 @@ fn spawn_proc_watcher(server: &ProcessServer) {
             debug!("[Process Scanner] exec event: pid {pid} unreadable, skipping");
             continue;
           };
+          // Same pid, new image: the memoized AppId may be stale.
+          dispatch.drop_appid(pid);
           let detectable_list = dispatch.detectable_list.lock().unwrap();
           let mut obs_open = false;
           if let Some(hit) = dispatch.match_process(
@@ -1482,14 +1558,26 @@ fn build_ac_patterns_with_os_filter(
     }
   }
 
-  (AhoCorasick::new(exe_patterns).unwrap(), exe_indexes)
+  (build_ac_automaton(exe_patterns).unwrap(), exe_indexes)
 }
 
-/// Normalize one DB executable name into a reversed AC pattern: consistent
-/// slashes, lowercase, leading `/` (`>` becomes `/`, arrpc parity).
+/// Build the automaton with ASCII case-insensitive matching: process
+/// paths are compared in their original case, so the scan loop never
+/// allocates a lowercased copy per process (the single hottest
+/// allocation in the profiler). Slashes/case in patterns are normalized
+/// at build time (rare), never per scan (hot).
+fn build_ac_automaton(exe_patterns: Vec<String>) -> Result<AhoCorasick, aho_corasick::BuildError> {
+  AhoCorasick::builder()
+    .ascii_case_insensitive(true)
+    .build(exe_patterns)
+}
+
+/// Normalize one DB executable name into a reversed AC pattern:
+/// consistent slashes, leading `/` (`>` becomes `/`, arrpc parity).
+/// Case is left alone — the automaton matches insensitively.
 fn normalize_exe_pattern(name: &str) -> String {
   // Make paths consistent, and fix some additional checks
-  let mut exec_name = name.replace('\\', "/").to_lowercase();
+  let mut exec_name = name.replace('\\', "/");
 
   // Checks adapted from arrpc, remain the '>' in DetectableActivity for later argument checks
   if exec_name.starts_with(">") {
@@ -1537,6 +1625,6 @@ fn build_proton_ac_patterns(
       "[Process Scanner] Proton fallback: {} win32 patterns",
       exe_patterns.len()
     );
-    (Some(AhoCorasick::new(exe_patterns).unwrap()), exe_indexes)
+    (Some(build_ac_automaton(exe_patterns).unwrap()), exe_indexes)
   }
 }

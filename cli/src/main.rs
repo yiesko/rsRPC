@@ -37,6 +37,9 @@ struct Args {
   #[arg(long, env = "RSRPC_WS_PORT_END", default_value_t = 6472)]
   ws_port_end: u16,
   #[arg(long, env = "RSRPC_SCAN_INTERVAL", default_value_t = 5)]
+  /// Base scan cadence in seconds. Idle stretches it (×2 per empty tick
+  /// up to 30s) since EXEC events deliver game starts instantly and
+  /// tracked exits wake the loop early — polling only backstops the rest.
   scan_interval_secs: u64,
   #[arg(long, env = "RSRPC_DB_URL")]
   db_url: Option<String>,
