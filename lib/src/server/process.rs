@@ -842,7 +842,7 @@ impl ProcessServer {
     self
       .appid_cache
       .lock()
-      .unwrap()
+      .map_err(|e| format!("appid_cache lock poisoned: {e}"))?
       .retain(|pid, _| live.contains(pid));
 
     let mut reversed_path = String::with_capacity(256);

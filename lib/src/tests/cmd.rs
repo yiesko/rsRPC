@@ -423,7 +423,7 @@ fn party_privacy_and_status_display_survive_bridge() {
   let payload: serde_json::Value = serde_json::from_str(&cached.json).expect("valid json");
   assert_eq!(
     payload["activity"]["party"],
-    serde_json::json!({"id": "p1", "size": [3, 6], "privacy": 1})
+    json!({"id": "p1", "size": [3, 6], "privacy": 1})
   );
   assert_eq!(payload["activity"]["status_display_type"], 2);
 }

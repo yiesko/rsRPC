@@ -163,7 +163,7 @@ fn subscribe() -> Result<i32, String> {
         libc::SOL_SOCKET,
         libc::SO_RCVBUF,
         &size as *const libc::c_int as *const libc::c_void,
-        std::mem::size_of::<libc::c_int>() as u32,
+        size_of::<libc::c_int>() as u32,
       );
     }
   }
@@ -175,7 +175,7 @@ fn subscribe() -> Result<i32, String> {
     libc::bind(
       fd,
       &addr as *const libc::sockaddr_nl as *const libc::sockaddr,
-      std::mem::size_of::<libc::sockaddr_nl>() as u32,
+      size_of::<libc::sockaddr_nl>() as u32,
     )
   };
   if bound != 0 {
@@ -274,7 +274,7 @@ fn set_recv_timeout(fd: i32, timeout: Option<std::time::Duration>) {
       libc::SOL_SOCKET,
       libc::SO_RCVTIMEO,
       &timeval as *const libc::timeval as *const libc::c_void,
-      std::mem::size_of::<libc::timeval>() as u32,
+      size_of::<libc::timeval>() as u32,
     );
   }
 }

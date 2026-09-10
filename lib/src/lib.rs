@@ -197,7 +197,7 @@ impl RPCServer {
     }
 
     let mut found = server.scan_for_processes()?;
-    found = crate::server::process::apply_ignore_list(found, &self.config.ignored_ids);
+    found = server::process::apply_ignore_list(found, &self.config.ignored_ids);
 
     Ok(
       found

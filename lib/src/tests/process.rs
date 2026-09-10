@@ -950,7 +950,7 @@ fn fake_cache_dir(tag: &str) -> std::path::PathBuf {
 /// `XDG_CACHE_HOME`): each fake root is a unique temp dir, but the
 /// variables themselves are shared, so exactly one of these tests runs at
 /// a time. Restores every variable afterwards.
-static STEAM_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static STEAM_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Run `f` with the Steam env pointed at fake dirs; restore afterwards.
 /// Poison-proof: a panicking holder must not wedge the rest of the suite.
