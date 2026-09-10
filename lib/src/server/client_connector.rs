@@ -760,6 +760,7 @@ impl ClientConnector {
   /**
    * Send one payload to every connected bridge client, pruning dead ones.
    */
+  #[hotpath::measure]
   fn send_to_all(&self, payload: &commands::CachedActivity) {
     let json_clients = self.json_clients.lock().unwrap();
     let msgpack_clients = self.msgpack_clients.lock().unwrap();

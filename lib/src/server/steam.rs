@@ -290,6 +290,7 @@ impl SteamLibraries {
   /// for manifest parsing. Vanished libraries are dropped. Every 12th
   /// tick the roots themselves are re-collected (fresh mounts), since
   /// the `/proc` exe sweep is too expensive for every tick.
+  #[hotpath::measure]
   pub(crate) fn refresh_if_stale(&mut self) {
     self.ticks += 1;
     let folders_changed = self.watched.iter().any(|file| {
