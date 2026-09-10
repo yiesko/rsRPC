@@ -46,6 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   log line; steady state is a single blocking `recv`, and only tracked
   pids can trigger an early scan. The scan cadence itself moved from
   `sleep` to `park_timeout` to allow the wakeups.
+- Overrides v2: `--overrides-dir`/`RSRPC_OVERRIDES_DIR` loads every
+  `*.json` in a directory (array or single object per file, sorted,
+  corrupt files skipped with a warning) additive to `--overrides-file`
+  — the home for MultiMC/Prism/Hydra mappings and Proton-only titles.
+  Loading moved into a library module (`rsrpc::overrides`, shared
+  defaults) and `append_detectables` stages pre-start: `--list-detected`
+  now applies staged overrides AND the ignore-list, so diagnostics show
+  exactly what the daemon would publish (previously main-DB-only).
 
 ## [0.32.2] - 2026-09-09
 

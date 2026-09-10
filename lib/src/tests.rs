@@ -9,6 +9,7 @@ mod cmd;
 mod commands;
 mod ipc_utils;
 mod logger;
+mod overrides;
 mod process;
 mod rpc_server;
 mod state;

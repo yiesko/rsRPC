@@ -17,6 +17,7 @@ pub mod cmd;
 pub mod commands;
 pub mod detection;
 mod logger;
+pub mod overrides;
 mod server;
 pub mod state;
 mod url_params;
@@ -115,6 +116,10 @@ pub struct RPCServer {
   detectable: Arc<Mutex<Vec<Arc<DetectableActivity>>>>,
   connectors: Option<Connectors>,
   config: RPCConfig,
+  /// Overrides staged before [`start`](RPCServer::start): applied to the
+  /// live scanner on start AND to [`detect_once`](RPCServer::detect_once),
+  /// so one-shot diagnostics see exactly what the daemon would.
+  staged_overrides: Vec<DetectableActivity>,
 
   on_process_scan_complete: Option<Arc<Mutex<ProcessCallback>>>,
 }
@@ -137,6 +142,7 @@ impl RPCServer {
       // Default to empty servers
       connectors: None,
       config,
+      staged_overrides: Vec::new(),
 
       // Event listeners
       on_process_scan_complete: None,
@@ -164,14 +170,15 @@ impl RPCServer {
 
   /**
    * Run a single process scan without starting any threads/connectors.
-   * Used by `--list-detected` diagnostics (main DB only; custom overrides
-   * require a running server via `append_detectables`). Reads the database
-   * held by this server; on a started server that database already moved
-   * to the scanner (see the field docs), so call this before `start()`.
+   * Used by `--list-detected` diagnostics. Reads the database held by
+   * this server (call before [`start`](RPCServer::start): startup moves
+   * the database to the scanner, leaving this side empty), applies staged
+   * overrides and the ignore-list exactly like the daemon would — what
+   * you see here is what running would publish.
    */
   pub fn detect_once(&self) -> Result<Vec<DetectedGame>, Box<dyn std::error::Error>> {
     let (tx, _rx) = mpsc::channel();
-    let server = ProcessServer::new(
+    let mut server = ProcessServer::new(
       self
         .detectable
         .lock()
@@ -185,10 +192,15 @@ impl RPCServer {
       Vec::new(),
       None,
     );
+    if !self.staged_overrides.is_empty() {
+      server.append_detectables(self.staged_overrides.clone());
+    }
+
+    let mut found = server.scan_for_processes()?;
+    found = crate::server::process::apply_ignore_list(found, &self.config.ignored_ids);
 
     Ok(
-      server
-        .scan_for_processes()?
+      found
         .iter()
         .map(|a| DetectedGame {
           id: a.id.clone(),
@@ -223,11 +235,18 @@ impl RPCServer {
   }
 
   /**
-   * Add new detectable processes on-the-fly. This should be run AFTER start().
+   * Add new detectable processes on-the-fly. Before [`start`](RPCServer::start)
+   * this stages them (applied to the live scanner on start AND to
+   * [`detect_once`](RPCServer::detect_once)); after `start()` it applies
+   * them to the running scanner directly, as before.
    */
   pub fn append_detectables(&mut self, detectable: Vec<DetectableActivity>) {
     if self.connectors.is_none() {
-      log!("[RPC Server] Cannot append detectables, connectors are not initialized");
+      log!(
+        "[RPC Server] Staging {} detectable(s) for start",
+        detectable.len()
+      );
+      self.staged_overrides.extend(detectable);
       return;
     }
 
@@ -377,6 +396,17 @@ impl RPCServer {
         .lock()
         .unwrap()
         .start(std::time::Duration::from_secs(config.scan_interval_secs));
+    }
+    // Staged overrides (loaded before start): hand them to the live
+    // scanner now that it exists.
+    if !self.staged_overrides.is_empty() {
+      let staged = std::mem::take(&mut self.staged_overrides);
+      log!("[RPC Server] Applying {} staged override(s)", staged.len());
+      connectors
+        .process_server
+        .lock()
+        .unwrap()
+        .append_detectables(staged);
     }
 
     if config.enable_websocket_connector || config.enable_secondary_events {

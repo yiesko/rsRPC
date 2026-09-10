@@ -49,6 +49,12 @@ struct Args {
   exclusions_url: Option<String>,
   #[arg(long, env = "RSRPC_OVERRIDES_FILE")]
   overrides_file: Option<PathBuf>,
+  /// Directory of override files (`*.json`, each an array or a single
+  /// DetectableActivity): MultiMC/Prism/Hydra mappings, Proton-only
+  /// titles, anything the main database misses. Merged with
+  /// --overrides-file; corrupt files are skipped, never fatal.
+  #[arg(long, env = "RSRPC_OVERRIDES_DIR")]
+  overrides_dir: Option<PathBuf>,
   /// Application IDs never published (comma-separated): coexistence with
   /// a richer publisher owning those slots (e.g. a companion presence).
   /// Ignored games behave as absent; clears always pass through.
@@ -210,10 +216,63 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     rsrpc::RPCServer::from_bundled(config)?
   };
 
+  // Load local overrides (overrides.json + overrides.d), a feature originating from rsrpc-wrapper (Polaris).
+  // Single file resolution: --overrides-file > $RSRPC_OVERRIDES_FILE > $XDG_CONFIG_HOME/rsrpc/overrides.json > ~/.config/rsrpc/overrides.json
+  // Directory resolution: --overrides-dir > $RSRPC_OVERRIDES_DIR > $XDG_CONFIG_HOME/rsrpc/overrides.d > ~/.config/rsrpc/overrides.d
+  // Both hold Vec<DetectableActivity> (or single objects), staged BEFORE
+  // any branch below — so --list-detected sees exactly what the daemon
+  // would publish, and start() applies them to the live scanner.
+  let overrides_path = args
+    .overrides_file
+    .clone()
+    .unwrap_or_else(rsrpc::overrides::default_file_path);
+  let overrides_dir = args
+    .overrides_dir
+    .clone()
+    .unwrap_or_else(rsrpc::overrides::default_dir_path);
+  let mut staged = match rsrpc::overrides::load_file(&overrides_path) {
+    Ok(overrides) if !overrides.is_empty() => {
+      println!(
+        "[wrapper] Applying {} override(s) from '{}':",
+        overrides.len(),
+        overrides_path.display()
+      );
+      overrides
+    }
+    Ok(_) => {
+      println!(
+        "[wrapper] No overrides found in '{}'",
+        overrides_path.display()
+      );
+      Vec::new()
+    }
+    Err(err) => {
+      eprintln!(
+        "[wrapper] Could not read overrides from '{}': {}",
+        overrides_path.display(),
+        err
+      );
+      Vec::new()
+    }
+  };
+  let dir_overrides = rsrpc::overrides::load_dir(&overrides_dir);
+  if !dir_overrides.is_empty() {
+    println!(
+      "[wrapper] Applying {} override(s) from '{}':",
+      dir_overrides.len(),
+      overrides_dir.display()
+    );
+    staged.extend(dir_overrides);
+  }
+  for o in &staged {
+    println!("[wrapper]   -> {} ({})", o.name, o.id);
+  }
+  client.append_detectables(staged);
+
   if args.list_detected {
     let found = client.detect_once()?;
     if found.is_empty() {
-      println!("No games detected (main DB only; overrides.json requires a running server).");
+      println!("No games detected (overrides and ignore-list apply here too).");
     } else {
       for game in &found {
         match game.pid {
@@ -247,40 +306,6 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
   // Starts the other threads (process detector, client connector, etc)
   client.start();
 
-  // Load local overrides (overrides.json), a feature originating from rsrpc-wrapper (Polaris)
-  // Resolution order: --overrides-file > $RSRPC_OVERRIDES_FILE > $XDG_CONFIG_HOME/rsrpc/overrides.json > ~/.config/rsrpc/overrides.json
-  // The file holds a Vec<DetectableActivity>, applied via append_detectables (bypasses the OS filter)
-  let overrides_path = args
-    .overrides_file
-    .clone()
-    .unwrap_or_else(overrides_file_path);
-  match load_overrides(&overrides_path) {
-    Ok(overrides) if !overrides.is_empty() => {
-      println!(
-        "[wrapper] Applying {} override(s) from '{}':",
-        overrides.len(),
-        overrides_path.display()
-      );
-      for o in &overrides {
-        println!("[wrapper]   -> {} ({})", o.name, o.id);
-      }
-      client.append_detectables(overrides);
-    }
-    Ok(_) => {
-      println!(
-        "[wrapper] No overrides found in '{}'",
-        overrides_path.display()
-      );
-    }
-    Err(err) => {
-      eprintln!(
-        "[wrapper] Could not read overrides from '{}': {}",
-        overrides_path.display(),
-        err
-      );
-    }
-  }
-
   let (tx, rx) = std::sync::mpsc::channel();
   ctrlc::set_handler(move || {
     let _ = tx.send(());
@@ -297,32 +322,4 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
   std::thread::sleep(std::time::Duration::from_millis(100));
 
   Ok(())
-}
-
-/// Where to look for the overrides file (compatible with rsrpc-wrapper):
-/// $RSRPC_OVERRIDES_FILE, else $XDG_CONFIG_HOME/rsrpc/overrides.json,
-/// else ~/.config/rsrpc/overrides.json.
-fn overrides_file_path() -> PathBuf {
-  if let Ok(custom) = std::env::var("RSRPC_OVERRIDES_FILE") {
-    return PathBuf::from(custom);
-  }
-
-  let base = std::env::var("XDG_CONFIG_HOME")
-    .map(PathBuf::from)
-    .unwrap_or_else(|_| {
-      let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-      PathBuf::from(home).join(".config")
-    });
-
-  base.join("rsrpc").join("overrides.json")
-}
-
-fn load_overrides(path: &PathBuf) -> Result<Vec<DetectableActivity>, Box<dyn std::error::Error>> {
-  if !path.exists() {
-    return Ok(vec![]);
-  }
-
-  let content = std::fs::read_to_string(path)?;
-  let overrides: Vec<DetectableActivity> = serde_json::from_str(&content)?;
-  Ok(overrides)
 }
