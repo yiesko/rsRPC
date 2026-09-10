@@ -151,6 +151,22 @@ fn subscribe() -> Result<i32, String> {
   if fd < 0 {
     return Err(format!("socket failed: {}", last_os_error()));
   }
+  // Room for exec storms: a burst overflowing the default ~200KB rcvbuf
+  // surfaces as ENOBUFS (a dropped event, not a dead socket) — size up
+  // best-effort, the overrun paths below stay correct regardless.
+  {
+    let size = 1024 * 1024 as libc::c_int;
+    // SAFETY: setsockopt with a valid int pointer and length.
+    unsafe {
+      libc::setsockopt(
+        fd,
+        libc::SOL_SOCKET,
+        libc::SO_RCVBUF,
+        &size as *const libc::c_int as *const libc::c_void,
+        std::mem::size_of::<libc::c_int>() as u32,
+      );
+    }
+  }
   let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
   addr.nl_family = libc::AF_NETLINK as u16;
   addr.nl_pid = 0; // kernel picks our port id
@@ -292,8 +308,13 @@ fn self_test(fd: i32) -> bool {
       let received = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
       if received <= 0 {
         // Timeout (EAGAIN/EWOULDBLOCK) or EINTR: keep waiting out the
-        // second; anything else aborts the test.
+        // second. ENOBUFS means the kernel IS delivering (faster than we
+        // drain) — that alone proves liveness. Anything else aborts.
         let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ENOBUFS) {
+          seen = true;
+          break;
+        }
         match err.kind() {
           std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => continue,
           _ => break,
@@ -334,6 +355,11 @@ pub(crate) fn watch(events: mpsc::Sender<ProcEvent>) -> Result<(), String> {
     if received < 0 {
       let err = std::io::Error::last_os_error();
       if err.kind() == std::io::ErrorKind::Interrupted {
+        continue;
+      }
+      // Overrun under burst load drops events but the socket stays valid:
+      // stay subscribed, polling backstops the gap.
+      if err.raw_os_error() == Some(libc::ENOBUFS) {
         continue;
       }
       unsafe {

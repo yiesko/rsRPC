@@ -45,7 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that silently drop `cn_proc` fall back to pure polling with one honest
   log line; steady state is a single blocking `recv`, and only tracked
   pids can trigger an early scan. The scan cadence itself moved from
-  `sleep` to `park_timeout` to allow the wakeups.
+  `sleep` to `park_timeout` to allow the wakeups. Operational note:
+  systemd units sandboxing with `RestrictAddressFamilies` must add
+  `AF_NETLINK`, otherwise the subscription fails and the scanner stays
+  on polling (this was the production failure mode — diagnosed via the
+  missing `watcher live` line).
 - Overrides v2: `--overrides-dir`/`RSRPC_OVERRIDES_DIR` loads every
   `*.json` in a directory (array or single object per file, sorted,
   corrupt files skipped with a warning) additive to `--overrides-file`
