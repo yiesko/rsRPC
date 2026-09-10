@@ -755,7 +755,44 @@ fn match_process_honors_exclusions() {
   assert_eq!(hit.id, "222");
 }
 
-// --- Steam VDF provider (F1.3) ---
+// --- proc-events netlink parser (F1.5) ---
+
+/// One synthetic cn_proc datagram: `cn_msg` header (idx/val = 1/1) +
+/// `proc_event` prefix + pid at the exec/exit union offset.
+fn proc_buf(what: i32, pid: u32) -> Vec<u8> {
+  let mut buf = vec![0u8; 40];
+  buf[0..4].copy_from_slice(&1u32.to_le_bytes());
+  buf[4..8].copy_from_slice(&1u32.to_le_bytes());
+  buf[20..24].copy_from_slice(&what.to_le_bytes());
+  buf[36..40].copy_from_slice(&pid.to_le_bytes());
+  buf
+}
+
+#[test]
+fn proc_event_parses_exec_and_exit() {
+  use crate::server::proc_events::{ProcEvent, parse_event};
+
+  assert_eq!(
+    parse_event(&proc_buf(0x2, 1234)),
+    Some(ProcEvent::Exec(1234))
+  );
+  assert_eq!(
+    parse_event(&proc_buf(0x100, 5678)),
+    Some(ProcEvent::Exit(5678))
+  );
+  // Anything else is ignored, never an error: fork, uid-change...
+  assert_eq!(parse_event(&proc_buf(0x1, 1)), None);
+  assert_eq!(parse_event(&proc_buf(0x4, 1)), None);
+  // ...unknown discriminants...
+  assert_eq!(parse_event(&proc_buf(0x9999, 1)), None);
+  // ...foreign connector traffic...
+  let mut foreign = proc_buf(0x2, 9);
+  foreign[0..4].copy_from_slice(&7u32.to_le_bytes());
+  assert_eq!(parse_event(&foreign), None);
+  // ...and short/corrupt buffers.
+  assert_eq!(parse_event(&[]), None);
+  assert_eq!(parse_event(&proc_buf(0x2, 1)[..10]), None);
+}
 
 #[test]
 fn vdf_parses_libraryfolders_and_manifest() {

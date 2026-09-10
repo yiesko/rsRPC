@@ -5,6 +5,9 @@ pub mod steam;
 pub mod utils;
 pub mod websocket;
 
+#[cfg(target_os = "linux")]
+pub(crate) mod proc_events;
+
 #[cfg(target_os = "windows")]
 pub mod ipc_win;
 

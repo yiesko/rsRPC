@@ -38,6 +38,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assigned by Steam itself to non-Steam shortcuts, e.g. 2532755798):
   those self-identify as non-Steam, so the exe/folder name wins over
   location instead.
+- Event-driven detection (Linux): a netlink `cn_proc` watcher classifies
+  `EXEC` processes the moment they spawn (cards in milliseconds, not next
+  tick) and wakes the scan loop early when a tracked game `EXIT`s
+  (clears at once). Best-effort with a boot self-test — kernels/LSMs
+  that silently drop `cn_proc` fall back to pure polling with one honest
+  log line; steady state is a single blocking `recv`, and only tracked
+  pids can trigger an early scan. The scan cadence itself moved from
+  `sleep` to `park_timeout` to allow the wakeups.
 
 ## [0.32.2] - 2026-09-09
 

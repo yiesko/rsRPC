@@ -1,5 +1,5 @@
 use aho_corasick::{AhoCorasick, PatternID};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -69,6 +69,14 @@ pub struct ProcessServer {
 
   /// Source URL for the detectable games database (auto-refresh).
   db_url: Option<String>,
+  /// Pids of the currently detected games (refreshed every scan tick,
+  /// plus event-driven EXEC hits). Lets the proc-events watcher wake the
+  /// scan loop the moment a TRACKED game exits — untracked exits never
+  /// cause a scan.
+  detected_pids: Arc<Mutex<HashSet<u64>>>,
+  /// Scan thread handle for early wakeups (proc-events EXIT of a tracked
+  /// game). Registered by the scan thread itself on startup.
+  scan_wake: Arc<Mutex<Option<std::thread::Thread>>>,
   /// Discord detection exclusions (installer/crash-reporter basenames +
   /// regexes): excluded processes are dropped before any matching.
   /// Empty until [`ProcessServer::set_exclusions`] (startup fetch) or the
@@ -143,6 +151,8 @@ impl ProcessServer {
       exclusions: Arc::new(Mutex::new(Exclusions::default())),
       exclusions_url,
       steam_libraries: Arc::new(Mutex::new(SteamLibraries::discover())),
+      detected_pids: Arc::new(Mutex::new(HashSet::new())),
+      scan_wake: Arc::new(Mutex::new(None)),
 
       // sysinfo System
       #[cfg(not(target_os = "linux"))]
@@ -336,6 +346,10 @@ impl ProcessServer {
     }
 
     std::thread::spawn(move || {
+      // Register for early wakeups: the proc-events watcher unparks us
+      // the moment a tracked game exits (Linux only; elsewhere None and
+      // the cadence below is a plain sleep).
+      *clone.scan_wake.lock().unwrap() = Some(std::thread::current());
       // Run the process scan repeatedly (every 3 seconds)
       loop {
         let mut detected = match clone.scan_for_processes() {
@@ -345,7 +359,7 @@ impl ProcessServer {
               "[Process Scanner] Error while scanning processes, retrying: {}",
               err
             );
-            std::thread::sleep(wait_time);
+            wait_scan(wait_time);
             continue;
           }
         };
@@ -359,6 +373,10 @@ impl ProcessServer {
             before - detected.len()
           );
         }
+        // Track live game pids for the proc-events watcher: only THEIR
+        // exits wake us early (a build storm's exits never cause a scan).
+        *clone.detected_pids.lock().unwrap() =
+          detected.iter().filter_map(|game| game.pid).collect();
         // Forward EVERY detected game, one event per slot. Downstream
         // publishes per app id and dedups repeats, so co-running games
         // each own their card instead of only the first.
@@ -372,7 +390,7 @@ impl ProcessServer {
               .is_err()
             {
               warn!("[Process Scanner] Event receiver gone, retrying scan");
-              std::thread::sleep(wait_time);
+              wait_scan(wait_time);
               continue;
             }
           }
@@ -417,14 +435,20 @@ impl ProcessServer {
           });
           if cleared.is_err() {
             warn!("[Process Scanner] Event receiver gone, retrying scan");
-            std::thread::sleep(wait_time);
+            wait_scan(wait_time);
             continue;
           }
         }
 
-        std::thread::sleep(wait_time);
+        wait_scan(wait_time);
       }
     });
+
+    // Event-driven fast path (Linux): EXEC classifies one process at once,
+    // EXIT of a tracked game wakes the scan above. Best-effort — setup
+    // failure keeps pure polling, silently.
+    #[cfg(target_os = "linux")]
+    spawn_proc_watcher(self);
   }
 
   #[cfg(not(target_os = "linux"))]
@@ -477,28 +501,18 @@ impl ProcessServer {
       let entry = entry?;
       let path = entry.path();
 
-      if let Ok(cmdline) = fs::read_to_string(path.join("cmdline"))
-        && !cmdline.is_empty()
-      {
-        let mut cmd_iter = cmdline.split('\0');
-        let (cmd_path, cmd_args) = (
-          cmd_iter.next().unwrap_or("").to_string(),
-          cmd_iter.collect::<Vec<_>>().join(" "),
-        );
-        processes.push(Exec {
-          pid: path
-            .file_name()
-            .ok_or("Invalid path")?
-            .to_str()
-            .ok_or("Invalid path")?
-            .parse::<u64>()?,
-          path: cmd_path,
-          arguments: if cmd_args.is_empty() {
-            None
-          } else {
-            Some(cmd_args)
-          },
-        });
+      let Ok(pid) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .parse::<u64>()
+      else {
+        continue;
+      };
+      // Same single-pid reader as the EXEC fast path: unreadable pids
+      // (kernel threads, zombies, races) are skipped, never fatal.
+      if let Some(exec) = read_exec(pid) {
+        processes.push(exec);
       }
     }
 
@@ -804,6 +818,104 @@ impl ProcessServer {
 
     Ok(detected_list)
   }
+}
+
+/// Sleep the scan cadence. `park_timeout` (not `sleep`) so the proc-events
+/// watcher can wake the loop early when a tracked game exits; a permit
+/// stored by an unpark during scan work just causes one early rescan,
+/// which downstream dedups harmlessly.
+fn wait_scan(wait_time: Duration) {
+  std::thread::park_timeout(wait_time);
+}
+
+/// Spawn the netlink dispatch (Linux): EXEC classifies one process and
+/// emits hits at once; EXIT of a tracked game unparks the scan loop for
+/// an immediate natural clear. Setup failure (or a dead receiver on
+/// shutdown) ends the thread quietly — polling carries on.
+#[cfg(target_os = "linux")]
+fn spawn_proc_watcher(server: &ProcessServer) {
+  use super::proc_events::{ProcEvent, watch};
+
+  let (tx, rx) = mpsc::channel();
+  let dispatch = server.clone();
+  std::thread::spawn(move || {
+    let mut variant_bufs: [String; 5] = Default::default();
+    let mut reversed_path = String::with_capacity(256);
+    for event in rx {
+      match event {
+        ProcEvent::Exec(pid) => {
+          let Some(exec) = read_exec(pid) else {
+            debug!("[Process Scanner] exec event: pid {pid} unreadable, skipping");
+            continue;
+          };
+          let detectable_list = dispatch.detectable_list.lock().unwrap();
+          let mut obs_open = false;
+          if let Some(hit) = dispatch.match_process(
+            &exec,
+            &detectable_list,
+            &mut variant_bufs,
+            &mut reversed_path,
+            &mut obs_open,
+          ) && let Some(game_pid) = hit.pid
+          {
+            debug!(
+              "[Process Scanner] exec event: pid {pid} matched {}",
+              hit.name
+            );
+            dispatch.detected_pids.lock().unwrap().insert(game_pid);
+            // Receiver gone means shutdown: end the thread, polling dies
+            // with the daemon anyway.
+            if dispatch
+              .event_sender
+              .send(ProcessDetectedEvent { activity: hit })
+              .is_err()
+            {
+              break;
+            }
+          }
+        }
+        ProcEvent::Exit(pid) => {
+          // Only tracked games wake the scan: the rest of the system's
+          // exits (build storms included) cost one HashSet lookup.
+          if dispatch.detected_pids.lock().unwrap().remove(&pid)
+            && let Some(thread) = dispatch.scan_wake.lock().unwrap().as_ref()
+          {
+            thread.unpark();
+          }
+        }
+      }
+    }
+  });
+  std::thread::spawn(move || {
+    if let Err(err) = watch(tx) {
+      debug!("[Process Scanner] proc-events unavailable ({err}), polling only");
+    }
+  });
+}
+
+/// Read one process's cmdline into an `Exec` (Linux). `None` for kernel
+/// threads, zombies, vanished or unreadable pids — the caller just skips
+/// them; the periodic scan is the backstop.
+#[cfg(target_os = "linux")]
+fn read_exec(pid: u64) -> Option<Exec> {
+  let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).ok()?;
+  if cmdline.is_empty() {
+    return None;
+  }
+  let mut cmd_iter = cmdline.split('\0');
+  let (cmd_path, cmd_args) = (
+    cmd_iter.next().unwrap_or("").to_string(),
+    cmd_iter.collect::<Vec<_>>().join(" "),
+  );
+  Some(Exec {
+    pid,
+    path: cmd_path,
+    arguments: if cmd_args.is_empty() {
+      None
+    } else {
+      Some(cmd_args)
+    },
+  })
 }
 
 fn os_matches(os: &str) -> bool {
