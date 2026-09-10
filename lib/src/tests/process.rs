@@ -757,14 +757,18 @@ fn match_process_honors_exclusions() {
 
 // --- proc-events netlink parser (F1.5) ---
 
-/// One synthetic cn_proc datagram: `cn_msg` header (idx/val = 1/1) +
-/// `proc_event` prefix + pid at the exec/exit union offset.
-fn proc_buf(what: i32, pid: u32) -> Vec<u8> {
-  let mut buf = vec![0u8; 40];
-  buf[0..4].copy_from_slice(&1u32.to_le_bytes());
-  buf[4..8].copy_from_slice(&1u32.to_le_bytes());
-  buf[20..24].copy_from_slice(&what.to_le_bytes());
-  buf[36..40].copy_from_slice(&pid.to_le_bytes());
+/// One synthetic kernel datagram: `nlmsghdr` + `cn_msg` (idx/val = 1/1)
+/// + `proc_event` with `what` and the pid at the exec/exit union offset.
+fn proc_buf(what: u32, pid: u32) -> Vec<u8> {
+  let total = 16 + 20 + 24;
+  let mut buf = vec![0u8; total];
+  buf[0..4].copy_from_slice(&(total as u32).to_le_bytes());
+  buf[4..6].copy_from_slice(&16u16.to_le_bytes());
+  buf[6..8].copy_from_slice(&1u16.to_le_bytes());
+  buf[16..20].copy_from_slice(&1u32.to_le_bytes());
+  buf[20..24].copy_from_slice(&1u32.to_le_bytes());
+  buf[36..40].copy_from_slice(&what.to_le_bytes());
+  buf[52..56].copy_from_slice(&pid.to_le_bytes());
   buf
 }
 
@@ -776,8 +780,9 @@ fn proc_event_parses_exec_and_exit() {
     parse_event(&proc_buf(0x2, 1234)),
     Some(ProcEvent::Exec(1234))
   );
+  // EXIT is a bitmask (0x80000000), not a sequence number.
   assert_eq!(
-    parse_event(&proc_buf(0x100, 5678)),
+    parse_event(&proc_buf(0x8000_0000, 5678)),
     Some(ProcEvent::Exit(5678))
   );
   // Anything else is ignored, never an error: fork, uid-change...
@@ -787,8 +792,20 @@ fn proc_event_parses_exec_and_exit() {
   assert_eq!(parse_event(&proc_buf(0x9999, 1)), None);
   // ...foreign connector traffic...
   let mut foreign = proc_buf(0x2, 9);
-  foreign[0..4].copy_from_slice(&7u32.to_le_bytes());
+  foreign[16..20].copy_from_slice(&7u32.to_le_bytes());
   assert_eq!(parse_event(&foreign), None);
+  // ...control traffic (NOOP / zero-code ERROR ack)...
+  let mut noop = proc_buf(0x2, 9);
+  noop[4..6].copy_from_slice(&1u16.to_le_bytes());
+  assert_eq!(parse_event(&noop), None);
+  let mut ack = proc_buf(0x2, 9);
+  ack[4..6].copy_from_slice(&2u16.to_le_bytes());
+  ack[16..20].copy_from_slice(&0u32.to_le_bytes());
+  assert_eq!(parse_event(&ack), None);
+  // ...while the kernel wraps real events in NLMSG_DONE (seen live).
+  let mut done_exec = proc_buf(0x2, 4242);
+  done_exec[4..6].copy_from_slice(&3u16.to_le_bytes());
+  assert_eq!(parse_event(&done_exec), Some(ProcEvent::Exec(4242)));
   // ...and short/corrupt buffers.
   assert_eq!(parse_event(&[]), None);
   assert_eq!(parse_event(&proc_buf(0x2, 1)[..10]), None);
@@ -861,6 +878,12 @@ fn fake_steam_root(tag: &str, manifests: &[(&str, &str)]) -> std::path::PathBuf 
   root
 }
 
+/// Hermetic fake cache dir, unique per test (sharing one across tests
+/// flakes through cache-file races, even serialized ones).
+fn fake_cache_dir(tag: &str) -> std::path::PathBuf {
+  std::env::temp_dir().join(format!("rsrpc-cache-{}-{tag}", std::process::id()))
+}
+
 /// Serializes the tests that borrow process-global env (`RSRPC_STEAM_ROOT`,
 /// `XDG_CACHE_HOME`): each fake root is a unique temp dir, but the
 /// variables themselves are shared, so exactly one of these tests runs at
@@ -907,7 +930,7 @@ fn steam_libraries_match_prefix_and_refresh() {
   use std::time::SystemTime;
 
   let root = fake_steam_root("prefix", &[("12345", "Vdf Game")]);
-  let cache = std::env::temp_dir().join(format!("rsrpc-cache-{}", std::process::id()));
+  let cache = fake_cache_dir("prefix");
   with_steam_env(Some(&root), Some(&cache), || {
     let db = vec![proton_entry("123", "Vdf Game", None, Some("12345"))];
     let server = proton_server(db);
@@ -965,7 +988,7 @@ fn match_process_prefers_vdf_over_folder() {
   // says AppId 777777 ("Steam Other"). With no launcher AppId, the
   // library wins over guessing.
   let root = fake_steam_root("precedence", &[("777777", "Meccha Chameleon")]);
-  let cache = std::env::temp_dir().join(format!("rsrpc-cache-{}", std::process::id()));
+  let cache = fake_cache_dir("precedence");
   with_steam_env(Some(&root), Some(&cache), || {
     let db = vec![
       proton_entry("888", "Meccha Chameleon", None, None),
@@ -1010,7 +1033,7 @@ fn match_process_shortcut_id_prefers_name() {
   // A small unknown id (real game missing from the DB) keeps the
   // library-first order instead.
   let root = fake_steam_root("shortcut", &[("777777", "Meccha Chameleon")]);
-  let cache = std::env::temp_dir().join(format!("rsrpc-cache-{}", std::process::id()));
+  let cache = fake_cache_dir("shortcut");
   with_steam_env(Some(&root), Some(&cache), || {
     let db = vec![
       proton_entry("888", "Meccha Chameleon", None, None),
@@ -1097,7 +1120,7 @@ fn steam_cache_roundtrip_and_corrupt_fallback() {
   use crate::server::steam::SteamLibraries;
 
   let root = fake_steam_root("cache", &[("12345", "Vdf Game")]);
-  let cache = std::env::temp_dir().join(format!("rsrpc-cache-{}", std::process::id()));
+  let cache = fake_cache_dir("cache");
   let _ = std::fs::remove_dir_all(&cache);
   with_steam_env(Some(&root), Some(&cache), || {
     // First discovery parses and persists the cache.
