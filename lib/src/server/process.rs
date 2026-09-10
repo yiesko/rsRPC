@@ -27,9 +27,9 @@ pub struct ProcessEventListeners {
 
 #[derive(Clone)]
 pub struct Exec {
-  pid: u64,
-  path: String,
-  arguments: Option<String>,
+  pub(crate) pid: u64,
+  pub(crate) path: String,
+  pub(crate) arguments: Option<String>,
 }
 
 #[derive(Clone)]
@@ -47,6 +47,12 @@ pub struct ProcessServer {
 
   custom_detectable_indexes: Arc<Mutex<Vec<[usize; 2]>>>,
   custom_detectable_ac: Arc<Mutex<Option<AhoCorasick>>>,
+
+  /// Proton fallback automaton (Linux only): `win32` executables from the
+  /// main DB, probed after the native patterns and the authoritative Steam
+  /// AppId, but before the stem/folder heuristics. Empty on other platforms.
+  proton_detectable_indexes: Arc<Mutex<Vec<[usize; 2]>>>,
+  proton_detectable_ac: Arc<Mutex<Option<AhoCorasick>>>,
 
   pub detectable_list: Arc<Mutex<Vec<Arc<DetectableActivity>>>>,
   /// Steam AppId (`third_party_skus` distributor `steam`) -> activity index.
@@ -89,6 +95,7 @@ impl ProcessServer {
   ) -> Self {
     log!("[Process Scanner] Building Aho-Corasick patterns for main detectable activities...");
     let (ac, idx) = build_ac_patterns(&detectable);
+    let (proton_ac, proton_idx) = build_proton_ac_patterns(&detectable);
     let (steam_map, name_map) = build_aux_maps(&detectable);
     log!("[Process Scanner] Done!");
 
@@ -105,6 +112,8 @@ impl ProcessServer {
       detectable_ac: Arc::new(Mutex::new(ac)),
       custom_detectable_indexes: Arc::new(Mutex::new(vec![])),
       custom_detectable_ac: Arc::new(Mutex::new(None)),
+      proton_detectable_indexes: Arc::new(Mutex::new(proton_idx)),
+      proton_detectable_ac: Arc::new(Mutex::new(proton_ac)),
 
       // Event listeners
       event_listeners: Arc::new(Mutex::new(event_listeners)),
@@ -154,11 +163,14 @@ impl ProcessServer {
     log!("[Process Scanner] Rebuilding Aho-Corasick patterns for main detectable activities...");
     let detectable: Vec<Arc<DetectableActivity>> = detectable.into_iter().map(Arc::new).collect();
     let (ac, idx) = build_ac_patterns(&detectable);
+    let (proton_ac, proton_idx) = build_proton_ac_patterns(&detectable);
     let (steam_map, name_map) = build_aux_maps(&detectable);
 
     *self.detectable_list.lock().unwrap() = detectable;
     *self.detectable_ac.lock().unwrap() = ac;
     *self.detectable_indexes.lock().unwrap() = idx;
+    *self.proton_detectable_ac.lock().unwrap() = proton_ac;
+    *self.proton_detectable_indexes.lock().unwrap() = proton_idx;
     *self.steam_map.lock().unwrap() = steam_map;
     *self.name_map.lock().unwrap() = name_map;
     log!("[Process Scanner] Done!");
@@ -451,6 +463,165 @@ impl ProcessServer {
     None
   }
 
+  /// Proton fallback probe (main DB `win32` entries on Linux): same shape
+  /// as [`ProcessServer::ac_probe`], consulted only after the native
+  /// patterns, user overrides and the authoritative Steam AppId all miss.
+  /// Empty automaton off-Linux, so this is a cheap `None` there.
+  pub(crate) fn proton_probe(
+    &self,
+    reversed_path: &str,
+    detectable_list: &[Arc<DetectableActivity>],
+  ) -> Option<(Arc<DetectableActivity>, usize)> {
+    let proton = self.proton_detectable_ac.lock().unwrap();
+    let automaton = proton.as_ref()?;
+    let mat = automaton.find(reversed_path)?;
+    let pattern_id: PatternID = mat.pattern();
+    let exe_index = self.proton_detectable_indexes.lock().unwrap()[pattern_id.as_usize()];
+    Some((detectable_list[exe_index[0]].clone(), exe_index[1]))
+  }
+
+  /// Shared variant loop: try `path` plus its 64-bit-stripped variants
+  /// against the native (`proton = false`) or Proton (`proton = true`)
+  /// automaton. First hit in variant order wins.
+  fn probe_variants(
+    &self,
+    path: &str,
+    variant_bufs: &mut [String; 5],
+    reversed_path: &mut String,
+    detectable_list: &[Arc<DetectableActivity>],
+    proton: bool,
+  ) -> Option<(Arc<DetectableActivity>, usize)> {
+    let variant_count = path_variants_into(path, variant_bufs);
+    for variant in &variant_bufs[..variant_count] {
+      reversed_path.clear();
+      reversed_path.extend(variant.chars().rev());
+      let found = if proton {
+        self.proton_probe(reversed_path, detectable_list)
+      } else {
+        self.ac_probe(reversed_path, detectable_list)
+      };
+      if found.is_some() {
+        return found;
+      }
+    }
+    None
+  }
+
+  /// Classify one enumerated process, cheapest source first:
+  /// native AC, bare-exe+cwd, authoritative Steam AppId, Proton (`win32`)
+  /// AC, then the stem/folder heuristics. Lazy `/proc` reads (cwd,
+  /// environ, stat) happen only on misses/hits respectively — never for
+  /// the whole table. Extracted from the scan loop for reuse and testing;
+  /// the loop itself just maps over it.
+  pub(crate) fn match_process(
+    &self,
+    process: &Exec,
+    detectable_list: &[Arc<DetectableActivity>],
+    variant_bufs: &mut [String; 5],
+    reversed_path: &mut String,
+    obs_open: &mut bool,
+  ) -> Option<Arc<DetectableActivity>> {
+    // Process path (but consistent slashes, so we can compare properly)
+    let mut process_path = process.path.to_ascii_lowercase();
+
+    if process_path.contains('\\') {
+      process_path = process_path.replace('\\', "/");
+    }
+
+    if !process_path.starts_with('/') {
+      process_path.insert(0, '/');
+    }
+
+    if !*obs_open && (process_path.contains("obs64") || process_path.contains("streamlabs")) {
+      *obs_open = true;
+    }
+
+    // Aho-Corasick matching against the path and its 64-bit-stripped
+    // variants (so `wow64.exe` also matches a `wow.exe` pattern, like
+    // arrpc/pog5-rsrpc). First hit in variant order wins.
+    let mut found = self.probe_variants(
+      &process_path,
+      variant_bufs,
+      reversed_path,
+      detectable_list,
+      false,
+    );
+
+    // Proton bare-exe probe (DOOM Eternal case): argv[0] without
+    // directories plus the process cwd often reconstructs the install
+    // path the DB knows. Only for bare exes (paths with directories
+    // already had their full match above); one readlink per miss.
+    if found.is_none()
+      && let Some(exe) = bare_exe(&process_path)
+      && let Some(cwd) = read_cwd(process.pid)
+    {
+      let candidate = format!("{cwd}/{exe}");
+      debug!(
+        "[Process Scanner] Bare exe, probing cwd-joined path for pid {}",
+        process.pid
+      );
+      found = self.probe_variants(
+        &candidate,
+        variant_bufs,
+        reversed_path,
+        detectable_list,
+        false,
+      );
+      if found.is_some() {
+        debug!("[Process Scanner] Cwd match for pid {}", process.pid);
+      }
+    }
+
+    let (obj, exe_index) = match found {
+      Some(found) => found,
+      None => {
+        // The AppId lives in environ (kilobytes per process), so it is
+        // read here — only for the few misses — never for the whole table.
+        // When environ is unreadable (sandboxed Proton runtimes such as
+        // pressure-vessel hide it from service contexts while cmdline
+        // stays readable), fall back to the AppId in the command line
+        // (`reaper SteamLaunch AppId=4508340 ...`).
+        let app_id = read_steam_app_id(process.pid);
+        let (app_id, via_cmdline) = match app_id {
+          Some(id) => (Some(id), false),
+          None => (app_id_from_args(process.arguments.as_deref()), true),
+        };
+        if via_cmdline && let Some(id) = app_id.as_deref() {
+          debug!(
+            "[Process Scanner] AppId {} for pid {} from command line (environ unreadable)",
+            id, process.pid
+          );
+        }
+        // Authoritative Steam AppId first: a store id beats every fuzzy
+        // path heuristic below.
+        if let Some(hit) = match_steam_id(
+          app_id.as_deref(),
+          process.pid,
+          &self.steam_map,
+          detectable_list,
+        ) {
+          return Some(hit);
+        }
+        // Proton fallback: `win32` executables from the main DB. Catches
+        // Wine/Proton games whose store id is unreadable and whose exe is
+        // too generic for the stem/folder heuristics.
+        if let Some((obj, exe_index)) = self.probe_variants(
+          &process_path,
+          variant_bufs,
+          reversed_path,
+          detectable_list,
+          true,
+        ) {
+          return finish_direct_hit(&obj, exe_index, process);
+        }
+        // Last resort: exe-stem == game name, then install-folder walk.
+        return match_name_or_folder(&process_path, process.pid, &self.name_map, detectable_list);
+      }
+    };
+
+    finish_direct_hit(&obj, exe_index, process)
+  }
+
   pub fn scan_for_processes(
     &self,
   ) -> Result<Vec<Arc<DetectableActivity>>, Box<dyn std::error::Error>> {
@@ -481,126 +652,13 @@ impl ProcessServer {
     let mut detected_list: Vec<Arc<DetectableActivity>> = processes
       .iter()
       .filter_map(|process| {
-        // Process path (but consistent slashes, so we can compare properly)
-        let mut process_path = process.path.to_ascii_lowercase();
-
-        if process_path.contains('\\') {
-          process_path = process_path.replace('\\', "/");
-        }
-
-        if !process_path.starts_with('/') {
-          process_path.insert(0, '/');
-        }
-
-        if !obs_open && (process_path.contains("obs64") || process_path.contains("streamlabs")) {
-          obs_open = true;
-        }
-
-        // Aho-Corasick matching against the path and its 64-bit-stripped
-        // variants (so `wow64.exe` also matches a `wow.exe` pattern, like
-        // arrpc/pog5-rsrpc). First hit in variant order wins, exactly as
-        // before — only the allocations are gone.
-        let mut found: Option<(Arc<DetectableActivity>, usize)> = None;
-        let variant_count = path_variants_into(&process_path, &mut variant_bufs);
-        'variants: for variant in &variant_bufs[..variant_count] {
-          reversed_path.clear();
-          reversed_path.extend(variant.chars().rev());
-          found = self.ac_probe(&reversed_path, &detectable_list);
-          if found.is_some() {
-            break 'variants;
-          }
-        }
-
-        // Proton bare-exe probe (DOOM Eternal case): argv[0] without
-        // directories plus the process cwd often reconstructs the install
-        // path the DB knows. Only for bare exes (paths with directories
-        // already had their full match above); one readlink per miss.
-        if found.is_none()
-          && let Some(exe) = bare_exe(&process_path)
-          && let Some(cwd) = read_cwd(process.pid)
-        {
-          let candidate = format!("{cwd}/{exe}");
-          debug!(
-            "[Process Scanner] Bare exe, probing cwd-joined path for pid {}",
-            process.pid
-          );
-          let variant_count = path_variants_into(&candidate, &mut variant_bufs);
-          'cwd: for variant in &variant_bufs[..variant_count] {
-            reversed_path.clear();
-            reversed_path.extend(variant.chars().rev());
-            found = self.ac_probe(&reversed_path, &detectable_list);
-            if found.is_some() {
-              debug!("[Process Scanner] Cwd match for pid {}", process.pid);
-              break 'cwd;
-            }
-          }
-        }
-
-        // No executable-name hit: try Steam AppId, then the conservative
-        // exe-stem == game-name fallback. Both cover DB entries that ship
-        // empty `executables` (e.g. How to Fish) with no overrides.json.
-        // The AppId lives in environ (kilobytes per process), so it is
-        // read here — only for the few misses — never for the whole table.
-        // When environ is unreadable (sandboxed Proton runtimes such as
-        // pressure-vessel hide it from service contexts while cmdline
-        // stays readable), fall back to the AppId in the command line
-        // (`reaper SteamLaunch AppId=4508340 ...`).
-        let (obj, exe_index) = match found {
-          Some(found) => found,
-          None => {
-            let app_id = read_steam_app_id(process.pid);
-            let (app_id, via_cmdline) = match app_id {
-              Some(id) => (Some(id), false),
-              None => (app_id_from_args(process.arguments.as_deref()), true),
-            };
-            if via_cmdline && let Some(id) = app_id.as_deref() {
-              debug!(
-                "[Process Scanner] AppId {} for pid {} from command line (environ unreadable)",
-                id, process.pid
-              );
-            }
-            return match_aux_process(
-              &process_path,
-              app_id.as_deref(),
-              process.pid,
-              &self.steam_map,
-              &self.name_map,
-              &detectable_list,
-            );
-          }
-        };
-
-        // Argument checks: when the database declares `arguments` for an
-        // executable, the process command line must contain them (parity with
-        // arrpc/pog5-rsrpc, e.g. TF2 `-game tf`, Garry's Mod `-game garrysmod`).
-        let executable = &obj.executables.as_ref().unwrap()[exe_index];
-
-        if let Some(exec_args) = &executable.arguments {
-          let has_args = process
-            .arguments
-            .as_ref()
-            .is_some_and(|args| args.contains(exec_args));
-          if !has_args {
-            debug!(
-              "[Process Scanner] Argument mismatch for pid {}, skipping",
-              process.pid
-            );
-            return None;
-          }
-        }
-
-        // Suspended (SIGSTOP'd) games are not being played: drop the match
-        // so the scan reports them absent (and clears). Checked here — once
-        // per hit — never for the whole table.
-        if is_suspended(process.pid) {
-          debug!(
-            "[Process Scanner] Ignoring suspended process (pid {})",
-            process.pid
-          );
-          return None;
-        }
-
-        Some(stamp_activity(&obj, process.pid))
+        self.match_process(
+          process,
+          &detectable_list,
+          &mut variant_bufs,
+          &mut reversed_path,
+          &mut obs_open,
+        )
       })
       .collect();
 
@@ -877,31 +935,62 @@ pub(crate) fn apply_ignore_list(
     .collect()
 }
 
-/// Last-resort matching for processes no executable pattern hit.
-/// 1. `SteamAppId` (store games with empty `executables`, legit Steam).
-/// 2. Exact exe-stem == multi-word game name (shortcuts/renamed exes).
-///
-/// Custom overrides (`append_detectables`) always win: they run first via AC.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn match_aux_process(
-  process_path: &str,
+/// Shared tail of every direct path hit (native or Proton): when the
+/// database declares `arguments` for an executable, the process command
+/// line must contain them (parity with arrpc/pog5-rsrpc, e.g. TF2
+/// `-game tf`); then the suspended check + timestamp stamp via
+/// `live_or_none`.
+fn finish_direct_hit(
+  obj: &Arc<DetectableActivity>,
+  exe_index: usize,
+  process: &Exec,
+) -> Option<Arc<DetectableActivity>> {
+  let executable = &obj.executables.as_ref().unwrap()[exe_index];
+
+  if let Some(exec_args) = &executable.arguments {
+    let has_args = process
+      .arguments
+      .as_ref()
+      .is_some_and(|args| args.contains(exec_args));
+    if !has_args {
+      debug!(
+        "[Process Scanner] Argument mismatch for pid {}, skipping",
+        process.pid
+      );
+      return None;
+    }
+  }
+
+  live_or_none(obj, process.pid)
+}
+
+/// Authoritative aux lookup: `SteamAppId` (store games with empty
+/// `executables`, legit Steam). Runs before every fuzzy heuristic — a
+/// store id beats path guessing.
+pub(crate) fn match_steam_id(
   steam_app_id: Option<&str>,
   pid: u64,
   steam_map: &Mutex<HashMap<String, usize>>,
+  detectable_list: &[Arc<DetectableActivity>],
+) -> Option<Arc<DetectableActivity>> {
+  let appid = steam_app_id?;
+  let &idx = steam_map.lock().unwrap().get(appid)?;
+  let obj = detectable_list.get(idx)?;
+  debug!(
+    "[Process Scanner] Steam match: {} (appid {})",
+    obj.name, appid
+  );
+  live_or_none(obj, pid)
+}
+/// Heuristic aux lookup: exact exe-stem == multi-word
+/// game name, then the install-folder walk. Runs after the Proton AC probe
+/// in the scan loop — a DB-declared path (even `win32`) beats guessing.
+pub(crate) fn match_name_or_folder(
+  process_path: &str,
+  pid: u64,
   name_map: &Mutex<HashMap<String, usize>>,
   detectable_list: &[Arc<DetectableActivity>],
 ) -> Option<Arc<DetectableActivity>> {
-  if let Some(appid) = steam_app_id
-    && let Some(&idx) = steam_map.lock().unwrap().get(appid)
-    && let Some(obj) = detectable_list.get(idx)
-  {
-    debug!(
-      "[Process Scanner] Steam match: {} (appid {})",
-      obj.name, appid
-    );
-    return live_or_none(obj, pid);
-  }
-
   let stem = exe_stem(process_path);
   if name_matchable(&stem)
     && let Some(&idx) = name_map.lock().unwrap().get(&stem)
@@ -1116,21 +1205,67 @@ fn build_ac_patterns_with_os_filter(
           continue;
         }
 
-        // Make paths consistent, and fix some additional checks
-        let mut exec_name = executable.name.replace('\\', "/").to_lowercase();
-
-        // Checks adapted from arrpc, remain the '>' in DetectableActivity for later argument checks
-        if exec_name.starts_with(">") {
-          exec_name.replace_range(0..1, "/");
-        } else if !exec_name.starts_with("/") {
-          exec_name.insert(0, '/');
-        }
-
-        exe_patterns.push(exec_name.chars().rev().collect::<String>());
+        exe_patterns.push(normalize_exe_pattern(&executable.name));
         exe_indexes.push([activity_index, exe_index]);
       }
     }
   }
 
   (AhoCorasick::new(exe_patterns).unwrap(), exe_indexes)
+}
+
+/// Normalize one DB executable name into a reversed AC pattern: consistent
+/// slashes, lowercase, leading `/` (`>` becomes `/`, arrpc parity).
+fn normalize_exe_pattern(name: &str) -> String {
+  // Make paths consistent, and fix some additional checks
+  let mut exec_name = name.replace('\\', "/").to_lowercase();
+
+  // Checks adapted from arrpc, remain the '>' in DetectableActivity for later argument checks
+  if exec_name.starts_with(">") {
+    exec_name.replace_range(0..1, "/");
+  } else if !exec_name.starts_with("/") {
+    exec_name.insert(0, '/');
+  }
+
+  exec_name.chars().rev().collect::<String>()
+}
+
+/// Proton fallback automaton: `win32` executables from the main DB, for
+/// Wine/Proton games on Linux whose store id is unreadable and whose exe
+/// is too generic for the stem/folder heuristics. Linux-only: `None`
+/// (plus empty indexes) elsewhere, so the probe is a cheap miss off-Linux.
+fn build_proton_ac_patterns(
+  detectables: &[Arc<DetectableActivity>],
+) -> (Option<AhoCorasick>, Vec<[usize; 2]>) {
+  #[cfg(not(target_os = "linux"))]
+  {
+    let _ = detectables;
+    return (None, Vec::new());
+  }
+  #[cfg(target_os = "linux")]
+  {
+    let mut exe_patterns: Vec<String> = Vec::new();
+    let mut exe_indexes: Vec<[usize; 2]> = Vec::new();
+
+    for (activity_index, activity) in detectables.iter().enumerate() {
+      if let Some(executables) = &activity.executables {
+        for (exe_index, executable) in executables.iter().enumerate() {
+          if executable.is_launcher || executable.os != "win32" {
+            continue;
+          }
+          exe_patterns.push(normalize_exe_pattern(&executable.name));
+          exe_indexes.push([activity_index, exe_index]);
+        }
+      }
+    }
+
+    if exe_patterns.is_empty() {
+      return (None, Vec::new());
+    }
+    log!(
+      "[Process Scanner] Proton fallback: {} win32 patterns",
+      exe_patterns.len()
+    );
+    (Some(AhoCorasick::new(exe_patterns).unwrap()), exe_indexes)
+  }
 }

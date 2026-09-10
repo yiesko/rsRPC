@@ -1,7 +1,9 @@
 use std::sync::{Arc, Mutex};
 
 use crate::detection::{DetectableActivity, ThirdPartySku};
-use crate::server::process::{build_aux_maps, exe_stem, match_aux_process, name_matchable};
+use crate::server::process::{
+  build_aux_maps, exe_stem, match_name_or_folder, match_steam_id, name_matchable,
+};
 
 fn activity(id: &str, name: &str, steam_id: Option<&str>) -> Arc<DetectableActivity> {
   Arc::new(DetectableActivity {
@@ -85,29 +87,20 @@ fn aux_match_prefers_steam_then_name() {
   let name_map = Mutex::new(name_map);
 
   // Steam AppId hit (legit Steam install)
-  let hit = match_aux_process(
-    "/home/user/steamapps/common/how to fish/how to fish.exe",
-    Some("4001890"),
-    123,
-    &steam_map,
-    &name_map,
-    &db,
-  );
+  let hit = match_steam_id(Some("4001890"), 123, &steam_map, &db);
   assert_eq!(hit.unwrap().id, "1");
 
   // No AppId (launcher shortcut): exe-stem fallback hits the same entry
-  let hit = match_aux_process(
+  let hit = match_name_or_folder(
     "/home/user/games/how to fish/how to fish.exe",
-    Some("2532755798"),
     456,
-    &steam_map,
     &name_map,
     &db,
   );
   assert_eq!(hit.unwrap().id, "1");
 
   // Generic shell must never match
-  let miss = match_aux_process("/usr/bin/fish", None, 789, &steam_map, &name_map, &db);
+  let miss = match_name_or_folder("/usr/bin/fish", 789, &name_map, &db);
   assert!(miss.is_none());
 }
 
@@ -123,33 +116,30 @@ fn aux_match_falls_back_to_install_folder() {
 
   // Hydra-style layout: generic Unreal exe, title only in the folders
   // (wine path, already slash-normalized and lowercased by the caller).
-  let hit = match_aux_process(
+  let hit = match_name_or_folder(
     "/home/user/games/meccha chameleon/meccha chameleon/chameleon/binaries/win64/penguinhotel-win64-shipping.exe",
-    Some("2987654321"),
     201,
-    &steam_map,
     &name_map,
     &db,
   );
   assert_eq!(hit.unwrap().id, "2");
 
-  // Steam AppId still wins over a conflicting folder name.
-  let hit = match_aux_process(
-    "/home/user/steamapps/common/meccha chameleon/how to fish.exe",
-    Some("4001890"),
+  // Steam AppId still wins over a conflicting folder name (the folder
+  // alone would say "2", the store id says "1").
+  let hit = match_steam_id(Some("4001890"), 202, &steam_map, &db);
+  assert_eq!(hit.unwrap().id, "1");
+  let folder_says = match_name_or_folder(
+    "/home/user/steamapps/common/meccha chameleon/game.exe",
     202,
-    &steam_map,
     &name_map,
     &db,
   );
-  assert_eq!(hit.unwrap().id, "1");
+  assert_eq!(folder_says.unwrap().id, "2");
 
   // Generic folders alone never match, even nested deep.
-  let miss = match_aux_process(
+  let miss = match_name_or_folder(
     "/home/user/games/some game/binaries/win64/game-win64-shipping.exe",
-    Some("2987654321"),
     203,
-    &steam_map,
     &name_map,
     &db,
   );
@@ -157,11 +147,9 @@ fn aux_match_falls_back_to_install_folder() {
 
   // Dotted components (versions, hidden dirs) are skipped, real title
   // behind them still hits.
-  let hit = match_aux_process(
+  let hit = match_name_or_folder(
     "/home/user/.local/share/games/how to fish/v1.2.3/how to fish.bin",
-    None,
     204,
-    &steam_map,
     &name_map,
     &db,
   );
@@ -451,4 +439,164 @@ fn app_id_from_args_parses_steam_launcher_token() {
     app_id_from_args(Some("SomeAppId=1 AppId=22")),
     Some("22".to_string())
   );
+}
+
+// --- Proton (`win32`) fallback automaton (F1.1) ---
+
+/// Synthetic DB entry with one executable (or a Steam-only entry when
+/// `exe` is `None`, like How to Fish).
+fn proton_entry(
+  id: &str,
+  name: &str,
+  exe: Option<(&str, &str, bool)>,
+  steam_id: Option<&str>,
+) -> Arc<DetectableActivity> {
+  use crate::detection::Executable;
+
+  let mut entry = activity(id, name, steam_id);
+  let entry_mut = Arc::get_mut(&mut entry).expect("fresh Arc");
+  entry_mut.executables = exe.map(|(exe_name, os, is_launcher)| {
+    vec![Executable {
+      name: exe_name.to_string(),
+      is_launcher,
+      os: os.to_string(),
+      arguments: None,
+    }]
+  });
+  entry
+}
+
+fn proton_server(db: Vec<Arc<DetectableActivity>>) -> crate::server::process::ProcessServer {
+  use crate::server::process::{ProcessEventListeners, ProcessServer};
+
+  let (_tx, _rx) = std::sync::mpsc::channel();
+  ProcessServer::new(
+    db,
+    _tx,
+    ProcessEventListeners::default(),
+    None,
+    false,
+    None,
+    Vec::new(),
+  )
+}
+
+#[test]
+fn proton_automaton_holds_win32_only() {
+  let db = vec![
+    proton_entry(
+      "111",
+      "Native Game",
+      Some(("native/game", "linux", false)),
+      None,
+    ),
+    proton_entry(
+      "222",
+      "Proton Game",
+      Some(("quest\\game.exe", "win32", false)),
+      None,
+    ),
+    proton_entry(
+      "333",
+      "Proton Launcher",
+      Some(("launcher.exe", "win32", true)),
+      None,
+    ),
+  ];
+  let server = proton_server(db.clone());
+  let reversed = |path: &str| path.chars().rev().collect::<String>();
+
+  // win32 entry hits (backslash in the DB name is normalized).
+  assert_eq!(
+    server
+      .proton_probe(&reversed("/games/quest/game.exe"), &db)
+      .map(|(obj, _)| obj.id.clone()),
+    Some("222".to_string())
+  );
+  // Native entries stay out of the fallback automaton...
+  assert!(
+    server
+      .proton_probe(&reversed("/native/game"), &db)
+      .is_none()
+  );
+  // ...as do launchers.
+  assert!(
+    server
+      .proton_probe(&reversed("/launcher.exe"), &db)
+      .is_none()
+  );
+  // Native automaton is untouched by win32 entries.
+  assert!(
+    server
+      .ac_probe(&reversed("/games/quest/game.exe"), &db)
+      .is_none()
+  );
+  assert_eq!(
+    server
+      .ac_probe(&reversed("/native/game"), &db)
+      .map(|(obj, _)| obj.id.clone()),
+    Some("111".to_string())
+  );
+}
+
+#[test]
+fn match_process_detects_win32_game_and_prefers_steam_id() {
+  use crate::server::process::Exec;
+
+  let db = vec![
+    proton_entry(
+      "222",
+      "Proton Quest",
+      Some(("quest/game.exe", "win32", false)),
+      None,
+    ),
+    proton_entry("999", "Steam Other", None, Some("999999")),
+  ];
+  let server = proton_server(db.clone());
+  let mut variant_bufs: [String; 5] = Default::default();
+  let mut reversed_path = String::with_capacity(256);
+  let mut obs_open = false;
+  // Impossible pid: every lazy /proc read (environ, cwd, stat) fails
+  // deterministically, so only the pure matching chain is exercised.
+  let classify = |server: &crate::server::process::ProcessServer,
+                  arguments: Option<String>,
+                  variant_bufs: &mut [String; 5],
+                  reversed_path: &mut String,
+                  obs_open: &mut bool| {
+    server.match_process(
+      &Exec {
+        pid: u64::MAX,
+        path: "C:\\games\\quest\\game.exe".to_string(),
+        arguments,
+      },
+      &db,
+      variant_bufs,
+      reversed_path,
+      obs_open,
+    )
+  };
+
+  // No AppId anywhere: the Proton fallback catches the win32 path.
+  let hit = classify(
+    &server,
+    None,
+    &mut variant_bufs,
+    &mut reversed_path,
+    &mut obs_open,
+  );
+  let hit = hit.expect("win32 path must match via Proton automaton");
+  assert_eq!(hit.id, "222");
+  assert_eq!(hit.pid, Some(u64::MAX));
+
+  // Same process, but the command line carries another game's Steam AppId:
+  // the authoritative store id wins over the fuzzy path match.
+  let hit = classify(
+    &server,
+    Some("reaper SteamLaunch AppId=999999 -- /games/other".to_string()),
+    &mut variant_bufs,
+    &mut reversed_path,
+    &mut obs_open,
+  );
+  let hit = hit.expect("steam AppId must match");
+  assert_eq!(hit.id, "999");
 }

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Proton-aware detection: `win32` executables from the main database are
+  now indexed in a fallback automaton on Linux. Wine/Proton games whose
+  Steam AppId is unreadable match by path instead of staying invisible.
+  Precedence is native patterns, then user overrides, then the Steam
+  AppId, then the Proton patterns, then the stem/folder heuristics.
+
 ## [0.32.2] - 2026-09-09
 
 ### Fixed
