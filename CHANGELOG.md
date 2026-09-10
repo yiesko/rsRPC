@@ -25,6 +25,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tools/updater` now uses the shared `rsrpc::detection::trim_detectable`
   instead of a hand-rolled copy (the copy had silently dropped aliases
   from the bundled snapshot).
+- Steam library provider: install-dir -> AppId from Steam's own files
+  (`libraryfolders.vdf` + `appmanifest_<id>.acf` + `compatdata/<id>/pfx`),
+  for games whose per-process store id is unreadable. Roots are found
+  dynamically (running `steam` via `/proc`, `PATH`, mounted partitions
+  via `/proc/mounts`, home fallbacks — a secondary library never shadows
+  the primary root); `$RSRPC_STEAM_ROOT` overrides exclusively,
+  `$RSRPC_STEAM_LIBRARIES` (`:`-separated) adds manually. A JSON cache
+  with per-library fingerprints revalidates by stat and reparses only
+  what changed. Precedence: Steam AppId, Proton patterns, Steam
+  install-dir, stem/folder — except shortcut-range AppIds (high bit set,
+  assigned by Steam itself to non-Steam shortcuts, e.g. 2532755798):
+  those self-identify as non-Steam, so the exe/folder name wins over
+  location instead.
 
 ## [0.32.2] - 2026-09-09
 

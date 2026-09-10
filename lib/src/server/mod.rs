@@ -1,6 +1,7 @@
 pub mod client_connector;
 pub mod ipc_utils;
 pub mod process;
+pub mod steam;
 pub mod utils;
 pub mod websocket;
 

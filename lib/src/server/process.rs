@@ -15,6 +15,7 @@ use crate::{debug, log, warn};
 
 use super::super::DetectableActivity;
 use super::super::detection::{Exclusions, parse_exclusions};
+use super::steam::SteamLibraries;
 
 #[derive(Default, Clone)]
 pub struct ProcessScanState {
@@ -75,6 +76,9 @@ pub struct ProcessServer {
   exclusions: Arc<Mutex<Exclusions>>,
   /// Source URL for the exclusions list (same hourly refresh as the DB).
   exclusions_url: Option<String>,
+  /// Steam install-dir -> AppId (VDF provider): refreshed once per scan
+  /// tick when a `libraryfolders.vdf` changed, consulted on path misses.
+  steam_libraries: Arc<Mutex<SteamLibraries>>,
   /// Refresh the detectable games database periodically when set.
   enable_db_update: bool,
   /// ETag captured by the startup fetch: seeds the refresh thread so its
@@ -138,6 +142,7 @@ impl ProcessServer {
       ignored_ids,
       exclusions: Arc::new(Mutex::new(Exclusions::default())),
       exclusions_url,
+      steam_libraries: Arc::new(Mutex::new(SteamLibraries::discover())),
 
       // sysinfo System
       #[cfg(not(target_os = "linux"))]
@@ -217,6 +222,24 @@ impl ProcessServer {
   /// thread overwrites it on the same cadence when `exclusions_url` is set.
   pub fn set_exclusions(&self, exclusions: Exclusions) {
     *self.exclusions.lock().unwrap() = exclusions;
+  }
+
+  /// AppId whose Steam install dir prefixes `normalized_path` (already
+  /// lowercased `/`-separated). Cloned out of the lock; tiny strings.
+  pub(crate) fn steam_prefix_app_id(&self, normalized_path: &str) -> Option<String> {
+    self
+      .steam_libraries
+      .lock()
+      .unwrap()
+      .match_prefix(normalized_path)
+      .map(str::to_string)
+  }
+
+  /// Revalidate the Steam libraries (stats only unless something changed).
+  /// Called once per scan tick; the scan loop goes through here so tests
+  /// can drive the same path.
+  pub(crate) fn refresh_steam_libraries(&self) {
+    self.steam_libraries.lock().unwrap().refresh_if_stale();
   }
 
   /// Refresh the exclusions list once, best-effort: failures keep the
@@ -556,7 +579,9 @@ impl ProcessServer {
 
   /// Classify one enumerated process, cheapest source first:
   /// native AC, bare-exe+cwd, authoritative Steam AppId, Proton (`win32`)
-  /// AC, then the stem/folder heuristics. Lazy `/proc` reads (cwd,
+  /// AC, Steam install-dir, then the stem/folder heuristics — except when
+  /// the launcher supplied a shortcut-range AppId (Steam-assigned
+  /// non-Steam id): then stem/folder run before the install-dir. Lazy `/proc` reads (cwd,
   /// environ, stat) happen only on misses/hits respectively — never for
   /// the whole table. Extracted from the scan loop for reuse and testing;
   /// the loop itself just maps over it.
@@ -659,6 +684,20 @@ impl ProcessServer {
         ) {
           return Some(hit);
         }
+        // An AppId the launcher gave us but the database doesn't know needs
+        // a second look: Steam itself assigns high-bit-set ids
+        // (e.g. 2532755798) to non-Steam shortcuts, while real store ids
+        // are small. A shortcut-range id is a self-identified non-Steam
+        // game, so its own exe/folder name beats install location; a
+        // small unknown id is a real game missing from the DB, where
+        // location (Steam's ground truth) still beats name guessing.
+        let non_steam = app_id.as_deref().is_some_and(is_shortcut_id);
+        if non_steam
+          && let Some(hit) =
+            match_name_or_folder(&process_path, process.pid, &self.name_map, detectable_list)
+        {
+          return Some(hit);
+        }
         // Proton fallback: `win32` executables from the main DB. Catches
         // Wine/Proton games whose store id is unreadable and whose exe is
         // too generic for the stem/folder heuristics.
@@ -671,7 +710,28 @@ impl ProcessServer {
         ) {
           return finish_direct_hit(&obj, exe_index, process);
         }
-        // Last resort: exe-stem == game name, then install-folder walk.
+        // Steam's own word: the process runs under a known install dir,
+        // so it inherits that entry's AppId. Beats name guessing below,
+        // loses to a DB-declared path above.
+        if let Some(library_appid) = self.steam_prefix_app_id(&process_path)
+          && let Some(hit) = match_steam_id(
+            Some(&library_appid),
+            process.pid,
+            &self.steam_map,
+            detectable_list,
+          )
+        {
+          debug!(
+            "[Process Scanner] Steam library match: {} (appid {})",
+            hit.name, library_appid
+          );
+          return Some(hit);
+        }
+        // Last resort: exe-stem == game name, then install-folder walk
+        // (already consulted above for shortcut-range AppIds).
+        if non_steam {
+          return None;
+        }
         return match_name_or_folder(&process_path, process.pid, &self.name_map, detectable_list);
       }
     };
@@ -700,6 +760,10 @@ impl ProcessServer {
       .detectable_list
       .lock()
       .map_err(|e| format!("detectable_list lock poisoned: {e}"))?;
+
+    // Steam generation marker: one stat per watched libraryfolders.vdf;
+    // the parse itself runs only when something actually changed.
+    self.refresh_steam_libraries();
 
     let mut reversed_path = String::with_capacity(256);
     // Variant scratch space, reused for every process: the scan allocates
@@ -1030,6 +1094,15 @@ fn finish_direct_hit(
   }
 
   live_or_none(obj, process.pid)
+}
+
+/// Steam's non-Steam shortcut range: ids Steam itself assigns when a
+/// shortcut is added carry the high bit (`crc32(exe + name) | 0x80000000`,
+/// e.g. 2532755798 for "How to Fish" — verified against a live
+/// `shortcuts.vdf`); real store ids are small. Unknown to the DB +
+/// shortcut-range means a self-identified non-Steam game.
+pub(crate) fn is_shortcut_id(app_id: &str) -> bool {
+  app_id.parse::<u32>().is_ok_and(|id| id & 0x8000_0000 != 0)
 }
 
 /// Authoritative aux lookup: `SteamAppId` (store games with empty

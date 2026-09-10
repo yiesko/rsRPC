@@ -1,0 +1,815 @@
+//! Steam library provider: install-dir -> AppId from Steam's own files.
+//!
+//! Covers games whose per-process store id is unreadable (no environ, no
+//! `AppId=` on the command line): Steam knows exactly what it installed
+//! where, so a process running under `<library>/steamapps/common/<dir>/`
+//! inherits that library entry's AppId. Read-only by design: we never
+//! write Steam's files, only parse them.
+//!
+//! Sources: `<root>/steamapps/libraryfolders.vdf` (library list, new
+//! `"path"` format and legacy numeric format) plus each library's
+//! `steamapps/appmanifest_<id>.acf` (`appid` + `installdir`).
+//!
+//! Roots are discovered dynamically, most reliable first:
+//! `$RSRPC_STEAM_ROOT` (exclusive override), `$RSRPC_STEAM_LIBRARIES`
+//! (user-defined, additive), a running `steam`/`steamcmd` process
+//! (`/proc` exe walk-up), `PATH` lookup, mounted partitions probed for
+//! library layouts (`/proc/mounts`), plus conventional home locations
+//! (cheap stats — a found secondary library never shadows the primary
+//! root). Only ONE valid root already gives full coverage: its
+//! `libraryfolders.vdf` lists every other library, wherever mounted.
+//!
+//! Light by design: a JSON cache (`$XDG_CACHE_HOME/rsrpc/steam-libraries.json`)
+//! stores each library's prefix map with a fingerprint (steamapps dir
+//! mtime + manifest count + newest manifest mtime). Restarts and scan
+//! ticks revalidate with stats only and reparse solely what changed.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::{debug, log};
+
+/// Override for non-standard installs (and hermetic tests): when set to an
+/// existing directory, only it is used as the Steam root.
+const STEAM_ROOT_ENV: &str = "RSRPC_STEAM_ROOT";
+/// Extra library roots defined by the user, `:`-separated, merged with
+/// everything discovered automatically.
+const STEAM_LIBRARIES_ENV: &str = "RSRPC_STEAM_LIBRARIES";
+/// Cache filename under `$XDG_CACHE_HOME` (else `~/.cache`).
+const CACHE_FILE: &str = "rsrpc/steam-libraries.json";
+
+#[derive(Clone, Debug)]
+pub(crate) enum Vdf {
+  Str(String),
+  Map(HashMap<String, Vdf>),
+}
+
+/// Tokenize Valve VDF: quoted strings plus braces. Everything else
+/// (whitespace, stray bytes) is skipped — manifests are machine-written,
+/// no need for error recovery beyond "unparseable".
+fn tokenize(input: &str) -> Vec<String> {
+  let mut tokens = Vec::new();
+  let mut chars = input.chars();
+  while let Some(char) = chars.next() {
+    match char {
+      '"' => {
+        let mut string = String::new();
+        loop {
+          match chars.next() {
+            None | Some('"') => break,
+            // VDF escapes (`\"`, `\\`): keep the escaped char literally.
+            Some('\\') => {
+              if let Some(escaped) = chars.next() {
+                string.push(escaped);
+              }
+            }
+            Some(char) => string.push(char),
+          }
+        }
+        tokens.push(string);
+      }
+      '{' => tokens.push("{".to_string()),
+      '}' => tokens.push("}".to_string()),
+      _ => {}
+    }
+  }
+  tokens
+}
+
+/// Parse a token stream into nested maps: `"key" "value"` or
+/// `"key" { ... }`. Returns the top-level map; trailing garbage after a
+/// complete document is ignored.
+fn parse_vdf(tokens: &[String]) -> HashMap<String, Vdf> {
+  fn block(tokens: &[String], pos: &mut usize) -> HashMap<String, Vdf> {
+    let mut map = HashMap::new();
+    while *pos < tokens.len() {
+      let key = tokens[*pos].clone();
+      *pos += 1;
+      if key == "}" {
+        break;
+      }
+      if *pos >= tokens.len() {
+        break;
+      }
+      if tokens[*pos] == "{" {
+        *pos += 1;
+        map.insert(key, Vdf::Map(block(tokens, pos)));
+      } else {
+        let value = tokens[*pos].clone();
+        *pos += 1;
+        map.insert(key, Vdf::Str(value));
+      }
+    }
+    map
+  }
+  block(tokens, &mut 0)
+}
+
+/// Parse a whole VDF document into nested maps.
+pub(crate) fn parse_vdf_str(input: &str) -> HashMap<String, Vdf> {
+  parse_vdf(&tokenize(input))
+}
+
+/// Library paths from a parsed `libraryfolders.vdf`: new format nests them
+/// under `"path"`, legacy format stores the path directly as the value.
+pub(crate) fn library_paths(doc: &HashMap<String, Vdf>) -> Vec<String> {
+  let folders = doc
+    .get("libraryfolders")
+    .or_else(|| doc.get("LibraryFolders"));
+  let inner = match folders {
+    Some(Vdf::Map(map)) => map,
+    _ => return Vec::new(),
+  };
+  let mut paths = Vec::new();
+  for value in inner.values() {
+    match value {
+      Vdf::Str(path) => paths.push(path.clone()),
+      Vdf::Map(map) => {
+        if let Some(Vdf::Str(path)) = map.get("path") {
+          paths.push(path.clone());
+        }
+      }
+    }
+  }
+  paths
+}
+
+/// `(appid, installdir)` from a parsed `appmanifest_<id>.acf`.
+pub(crate) fn manifest_ids(doc: &HashMap<String, Vdf>) -> Option<(String, String)> {
+  let state = match doc.get("AppState") {
+    Some(Vdf::Map(map)) => map,
+    _ => return None,
+  };
+  let appid = match state.get("appid") {
+    Some(Vdf::Str(id)) if !id.trim().is_empty() => id.trim().to_string(),
+    _ => return None,
+  };
+  let installdir = match state.get("installdir") {
+    Some(Vdf::Str(dir)) if !dir.trim().is_empty() => dir.trim().to_string(),
+    _ => return None,
+  };
+  Some((appid, installdir))
+}
+
+/// Lowercased `.../steamapps/common/<installdir>/` (or
+/// `.../steamapps/compatdata/<id>/`) for prefix matching against the
+/// scanner's normalized process paths.
+fn common_prefix(library: &str, installdir: &str) -> String {
+  let mut prefix = format!("{library}/steamapps/common/{installdir}").to_lowercase();
+  if !prefix.ends_with('/') {
+    prefix.push('/');
+  }
+  if !prefix.starts_with('/') {
+    prefix.insert(0, '/');
+  }
+  prefix
+}
+
+/// Change marker for one library: steamapps dir mtime, manifest count,
+/// and newest manifest file mtime. Installs, uninstalls, moves and
+/// content edits each change at least one of the three (count covers
+/// add/remove, dir mtime covers rename churn, newest-file covers
+/// in-place rewrites).
+#[derive(Clone, Debug, PartialEq)]
+struct Fingerprint {
+  dir_mtime_ms: u64,
+  manifests: usize,
+  newest_manifest_ms: u64,
+}
+
+fn file_mtime_ms(path: &Path) -> Option<u64> {
+  std::fs::metadata(path)
+    .and_then(|meta| meta.modified())
+    .ok()?
+    .duration_since(UNIX_EPOCH)
+    .ok()
+    .map(|age| age.as_millis() as u64)
+}
+
+fn dir_fingerprint(apps_dir: &Path) -> Option<Fingerprint> {
+  let dir_mtime_ms = file_mtime_ms(apps_dir)?;
+  let mut manifests = 0;
+  let mut newest_manifest_ms = 0;
+  if let Ok(entries) = std::fs::read_dir(apps_dir) {
+    for entry in entries.flatten() {
+      let name = entry.file_name();
+      let name = name.to_string_lossy();
+      if name.starts_with("appmanifest_") && name.ends_with(".acf") {
+        manifests += 1;
+        if let Some(mtime) = file_mtime_ms(&entry.path()) {
+          newest_manifest_ms = newest_manifest_ms.max(mtime);
+        }
+      }
+    }
+  }
+  Some(Fingerprint {
+    dir_mtime_ms,
+    manifests,
+    newest_manifest_ms,
+  })
+}
+
+/// Install-dir -> AppId over every known Steam library.
+#[derive(Clone, Debug, Default)]
+pub struct SteamLibraries {
+  /// `libraryfolders.vdf` files whose mtime gates a refresh.
+  watched: Vec<PathBuf>,
+  /// Last-seen mtimes of the watched files.
+  mtimes: HashMap<PathBuf, SystemTime>,
+  /// Lowercased install-dir prefix -> AppId.
+  dirs: HashMap<String, String>,
+  /// Library path (string form) -> fingerprint at last scan.
+  fingerprints: HashMap<String, Fingerprint>,
+  /// Ticks since last full root re-collection (mounts are re-probed
+  /// every 12th tick, ~60s at the default cadence — not every tick, the
+  /// `/proc` exe sweep is the most expensive discovery source).
+  ticks: u64,
+}
+
+impl SteamLibraries {
+  /// Full discovery: collect roots from every source, resolve them to
+  /// libraries, reuse the on-disk cache wherever fingerprints still
+  /// match, parse only what is new or changed.
+  pub(crate) fn discover() -> Self {
+    let mut libraries = Self::default();
+    let cached = load_cache();
+    let mut scanned = 0;
+    let mut reused = 0;
+    for root in collect_roots() {
+      let (libs, folders_file) = root_libraries(&root);
+      if let Some(file) = folders_file {
+        if let Ok(mtime) = std::fs::metadata(&file).and_then(|meta| meta.modified()) {
+          libraries.mtimes.insert(file.clone(), mtime);
+        }
+        if !libraries.watched.contains(&file) {
+          libraries.watched.push(file);
+        }
+      }
+      for lib in libs {
+        let key = lib.to_string_lossy().to_string();
+        let live = dir_fingerprint(&lib.join("steamapps"));
+        let cached_dirs = live.as_ref().and_then(|live| {
+          cached
+            .get(&key)
+            .and_then(|entry| (entry.fingerprint == *live).then(|| entry.dirs.clone()))
+        });
+        match cached_dirs {
+          Some(dirs) => {
+            if libraries.fingerprints.contains_key(&key) {
+              continue; // same library via another root: already merged
+            }
+            reused += 1;
+            for (prefix, appid) in dirs {
+              libraries.dirs.entry(prefix).or_insert(appid);
+            }
+            libraries.fingerprints.insert(key, live.unwrap());
+          }
+          None => {
+            if libraries.fingerprints.contains_key(&key) {
+              continue; // same library via another root: already parsed
+            }
+            scanned += 1;
+            libraries.scan_library(&lib);
+          }
+        }
+      }
+    }
+    log!(
+      "[Process Scanner] Steam libraries: {} install dirs ({} parsed, {} from cache)",
+      libraries.dirs.len(),
+      scanned,
+      reused
+    );
+    save_cache(&libraries);
+    libraries
+  }
+
+  /// Revalidate once per scan tick: one stat per watched file plus one
+  /// fingerprint per known library; only new or changed libraries pay
+  /// for manifest parsing. Vanished libraries are dropped. Every 12th
+  /// tick the roots themselves are re-collected (fresh mounts), since
+  /// the `/proc` exe sweep is too expensive for every tick.
+  pub(crate) fn refresh_if_stale(&mut self) {
+    self.ticks += 1;
+    let folders_changed = self.watched.iter().any(|file| {
+      std::fs::metadata(file)
+        .and_then(|meta| meta.modified())
+        .ok()
+        != self.mtimes.get(file).cloned()
+    });
+    // New libraries appear via a folders-file change (installs register
+    // there) or a fresh mount: re-collect roots (stats only) when the
+    // marker moved or the mount-probe tick hit, else re-fingerprint the
+    // known libraries.
+    let mut libs: Vec<PathBuf>;
+    if folders_changed || self.ticks.is_multiple_of(12) {
+      if folders_changed {
+        debug!("[Process Scanner] Steam folders changed, re-resolving libraries");
+      }
+      libs = Vec::new();
+      for root in collect_roots() {
+        let (root_libs, folders_file) = root_libraries(&root);
+        if let Some(file) = folders_file {
+          if let Ok(mtime) = std::fs::metadata(&file).and_then(|meta| meta.modified()) {
+            self.mtimes.insert(file.clone(), mtime);
+          }
+          if !self.watched.contains(&file) {
+            self.watched.push(file);
+          }
+        }
+        libs.extend(root_libs);
+      }
+      libs.sort();
+      libs.dedup();
+    } else {
+      libs = self.fingerprints.keys().map(PathBuf::from).collect();
+    }
+    let mut changed = false;
+    let mut fresh_dirs: HashMap<String, String> = HashMap::new();
+    let mut fresh_fingerprints: HashMap<String, Fingerprint> = HashMap::new();
+    for lib in &libs {
+      let key = lib.to_string_lossy().to_string();
+      match dir_fingerprint(&lib.join("steamapps")) {
+        // Vanished (unmounted, deleted): drop it.
+        None => changed = true,
+        Some(live) => {
+          if self.fingerprints.get(&key) == Some(&live) {
+            // Unchanged: keep this library's current prefixes.
+            for (prefix, appid) in &self.dirs {
+              if library_owns_prefix(lib, prefix) {
+                fresh_dirs.insert(prefix.clone(), appid.clone());
+              }
+            }
+            fresh_fingerprints.insert(key, live);
+          } else {
+            changed = true;
+            let before = fresh_dirs.len();
+            self.scan_library_into(lib, &mut fresh_dirs);
+            debug!(
+              "[Process Scanner] Steam library rescanned: {} ({} prefixes)",
+              lib.display(),
+              fresh_dirs.len().saturating_sub(before)
+            );
+            fresh_fingerprints.insert(key, live);
+          }
+        }
+      }
+    }
+    self.fingerprints = fresh_fingerprints;
+    if changed || fresh_dirs.len() != self.dirs.len() {
+      self.dirs = fresh_dirs;
+      save_cache(self);
+    }
+  }
+
+  /// AppId whose install dir is the longest prefix of `normalized_path`
+  /// (already lowercased, `/`-separated, leading `/` — the scanner's form).
+  pub(crate) fn match_prefix(&self, normalized_path: &str) -> Option<&str> {
+    let mut best: Option<&str> = None;
+    let mut best_len = 0;
+    for (prefix, appid) in &self.dirs {
+      if prefix.len() > best_len && normalized_path.starts_with(prefix.as_str()) {
+        best = Some(appid.as_str());
+        best_len = prefix.len();
+      }
+    }
+    best
+  }
+
+  /// Parse one library's manifests into the map. Unconditional: callers
+  /// decide freshness via fingerprints first.
+  fn scan_library(&mut self, library: &Path) {
+    let mut dirs = std::mem::take(&mut self.dirs);
+    self.scan_library_into(library, &mut dirs);
+    self.dirs = dirs;
+    let key = library.to_string_lossy().to_string();
+    if let Some(fingerprint) = dir_fingerprint(&library.join("steamapps")) {
+      self.fingerprints.insert(key, fingerprint);
+    }
+  }
+
+  fn scan_library_into(&self, library: &Path, dirs: &mut HashMap<String, String>) {
+    let apps_dir = library.join("steamapps");
+    let Ok(entries) = std::fs::read_dir(&apps_dir) else {
+      return;
+    };
+    let mut manifests = 0;
+    for entry in entries.flatten() {
+      let name = entry.file_name();
+      let name = name.to_string_lossy();
+      // Proton prefix without a manifest (deleted/never-written acf):
+      // `steamapps/compatdata/<id>/` still names its owner.
+      if name.chars().all(|c| c.is_ascii_digit()) && entry.path().join("pfx").is_dir() {
+        let mut prefix = format!(
+          "{}/steamapps/compatdata/{}/",
+          library.to_string_lossy().to_lowercase(),
+          name
+        );
+        if !prefix.starts_with('/') {
+          prefix.insert(0, '/');
+        }
+        dirs.entry(prefix).or_insert(name.to_string());
+        continue;
+      }
+      if !name.starts_with("appmanifest_") || !name.ends_with(".acf") {
+        continue;
+      }
+      if let Ok(body) = std::fs::read_to_string(entry.path())
+        && let Some((appid, installdir)) = manifest_ids(&parse_vdf_str(&body))
+      {
+        dirs
+          .entry(common_prefix(&library.to_string_lossy(), &installdir))
+          .or_insert(appid);
+        manifests += 1;
+      }
+    }
+    debug!(
+      "[Process Scanner] Steam library {}: {} manifests",
+      library.display(),
+      manifests
+    );
+  }
+}
+
+/// Whether `prefix` (a cached install-dir key) belongs to `library`.
+/// Keys are built as `<library-lower>/steamapps/...`, so a string-prefix
+/// test on the lowercased library path is exact.
+fn library_owns_prefix(library: &Path, prefix: &str) -> bool {
+  let mut lib = library.to_string_lossy().to_lowercase();
+  if !lib.ends_with('/') {
+    lib.push('/');
+  }
+  if !lib.starts_with('/') {
+    lib.insert(0, '/');
+  }
+  prefix.starts_with(&format!("{lib}steamapps/"))
+}
+
+/// One root's libraries: itself plus every path its `libraryfolders.vdf`
+/// lists (secondary disks, custom mounts). Missing file means the root
+/// alone is the only library.
+fn root_libraries(root: &Path) -> (Vec<PathBuf>, Option<PathBuf>) {
+  let steamapps = root.join("steamapps");
+  if !steamapps.is_dir() {
+    return (Vec::new(), None);
+  }
+  let folders_file = steamapps.join("libraryfolders.vdf");
+  let mut libraries = vec![root.to_path_buf()];
+  if let Ok(body) = std::fs::read_to_string(&folders_file) {
+    libraries.extend(
+      library_paths(&parse_vdf_str(&body))
+        .iter()
+        .map(PathBuf::from),
+    );
+  } else {
+    debug!(
+      "[Process Scanner] No libraryfolders.vdf under {}",
+      root.display()
+    );
+  }
+  libraries.sort();
+  libraries.dedup();
+  (libraries, Some(folders_file))
+}
+
+/// Every candidate root, duplicates removed: explicit override (exclusive),
+/// user list, running processes, PATH, mounted partitions, home fallbacks.
+fn collect_roots() -> Vec<PathBuf> {
+  if let Ok(custom) = std::env::var(STEAM_ROOT_ENV) {
+    let custom = PathBuf::from(custom);
+    if custom.is_dir() {
+      return vec![custom];
+    }
+  }
+  let mut candidates = Vec::new();
+  if let Ok(extra) = std::env::var(STEAM_LIBRARIES_ENV) {
+    candidates.extend(
+      extra
+        .split(':')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from),
+    );
+  }
+  candidates.extend(running_steam_roots());
+  candidates.extend(path_steam_roots());
+  candidates.extend(mount_library_roots());
+  // Conventional locations always join: a few cheap stats, and a found
+  // secondary library must never shadow the primary root (real-world
+  // case: a mounted SteamLibrary hid ~/.local/share/Steam).
+  candidates.extend(fallback_steam_roots());
+  let mut roots = Vec::new();
+  for root in candidates {
+    push_valid_root(&mut roots, root);
+  }
+  if roots.is_empty() {
+    // Nothing discovered anywhere: conventional locations or nothing.
+    for root in fallback_steam_roots() {
+      push_valid_root(&mut roots, root);
+    }
+  }
+  roots
+}
+
+/// Keep `root` when it actually holds a Steam layout, deduplicated.
+/// Symlinks are resolved first (`~/.steam/steam` classically points at
+/// `~/.local/share/Steam`): without this the same library is scanned
+/// once per alias on every change.
+fn push_valid_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
+  let canonical = std::fs::canonicalize(&root).unwrap_or(root);
+  if canonical.join("steamapps").is_dir() && !roots.contains(&canonical) {
+    roots.push(canonical);
+  }
+}
+
+/// Walk `start` upward (plus itself, up to 5 levels) for the ancestor
+/// holding a `steamapps` directory. Turns any known-inside-Steam path
+/// (client exe, resolved symlink) into the root, wherever it is mounted.
+fn walk_up_for_steamapps(start: &Path) -> Option<PathBuf> {
+  let mut current = Some(start);
+  for _ in 0..6 {
+    let dir = current?;
+    if dir.join("steamapps").is_dir() {
+      return Some(dir.to_path_buf());
+    }
+    current = dir.parent();
+  }
+  None
+}
+
+/// Roots from a running `steam`/`steamcmd` process: read `/proc/<pid>/exe`,
+/// walk upward. Linux-only; empty elsewhere.
+#[cfg(target_os = "linux")]
+fn running_steam_roots() -> Vec<PathBuf> {
+  let mut roots = Vec::new();
+  let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+    return roots;
+  };
+  for entry in proc_dir.flatten() {
+    if !entry
+      .file_name()
+      .to_string_lossy()
+      .chars()
+      .all(|c| c.is_ascii_digit())
+    {
+      continue;
+    }
+    let Ok(exe) = std::fs::read_link(entry.path().join("exe")) else {
+      continue;
+    };
+    let name = exe.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    if name != "steam" && name != "steamcmd" {
+      continue;
+    }
+    if let Some(parent) = exe.parent()
+      && let Some(root) = walk_up_for_steamapps(parent)
+      && !roots.contains(&root)
+    {
+      debug!(
+        "[Process Scanner] Steam root from pid {}: {}",
+        entry.file_name().to_string_lossy(),
+        root.display()
+      );
+      roots.push(root);
+    }
+  }
+  roots
+}
+
+#[cfg(not(target_os = "linux"))]
+fn running_steam_roots() -> Vec<PathBuf> {
+  Vec::new()
+}
+
+/// Roots from `steam`/`steamcmd` on `PATH`, symlinks resolved
+/// (`/usr/bin/steam` classically links into the real install).
+fn path_steam_roots() -> Vec<PathBuf> {
+  let mut roots = Vec::new();
+  let paths: Vec<PathBuf> = std::env::var_os("PATH")
+    .map(|paths| std::env::split_paths(&paths).collect())
+    .unwrap_or_default();
+  for dir in paths {
+    for binary in ["steam", "steamcmd"] {
+      let candidate = dir.join(binary);
+      if !candidate.is_file() {
+        continue;
+      }
+      let resolved = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+      if let Some(parent) = resolved.parent()
+        && let Some(root) = walk_up_for_steamapps(parent)
+        && !roots.contains(&root)
+      {
+        roots.push(root);
+      }
+    }
+  }
+  roots
+}
+
+/// Partition-aware probing (Linux): every locally-mounted filesystem is
+/// checked for a handful of conventional library layouts
+/// (`<mnt>/SteamLibrary`, `<mnt>/Steam`, ...). Stats only, startup and
+/// folders-change ticks — never a walk. Catches libraries on disks Steam
+/// itself no longer lists (moved drives, copied folders, other users).
+/// Pure over a mounts-table string for testability; the live table comes
+/// from `/proc/mounts`.
+pub(crate) fn mount_library_roots_for(mounts: &str) -> Vec<PathBuf> {
+  const SKIP_TYPES: &[&str] = &[
+    "proc",
+    "sysfs",
+    "cgroup",
+    "cgroup2",
+    "tmpfs",
+    "devtmpfs",
+    "devpts",
+    "overlay",
+    "squashfs",
+    "nsfs",
+    "tracefs",
+    "debugfs",
+    "securityfs",
+    "configfs",
+    "fusectl",
+    "selinuxfs",
+    "overlayfs",
+    "fuse.portal",
+  ];
+  const LAYOUTS: &[&str] = &["", "SteamLibrary", "Steam", "steam", "Games/SteamLibrary"];
+  let mut roots = Vec::new();
+  for line in mounts.lines() {
+    let mut parts = line.split_whitespace();
+    let (Some(_device), Some(mount), Some(fstype)) = (parts.next(), parts.next(), parts.next())
+    else {
+      continue;
+    };
+    if SKIP_TYPES.contains(&fstype) {
+      continue;
+    }
+    // Pseudo trees even on real fstypes: never libraries there.
+    if mount.starts_with("/proc/") || mount.starts_with("/sys/") || mount.starts_with("/dev/") {
+      continue;
+    }
+    let mount = mount.replace("\\040", " ");
+    for layout in LAYOUTS {
+      let candidate = if layout.is_empty() {
+        PathBuf::from(&mount)
+      } else {
+        PathBuf::from(&mount).join(layout)
+      };
+      if candidate.join("steamapps").is_dir() && !roots.contains(&candidate) {
+        debug!(
+          "[Process Scanner] Steam library on mount: {}",
+          candidate.display()
+        );
+        roots.push(candidate);
+      }
+    }
+  }
+  roots
+}
+
+#[cfg(target_os = "linux")]
+fn mount_library_roots() -> Vec<PathBuf> {
+  std::fs::read_to_string("/proc/mounts")
+    .map(|mounts| mount_library_roots_for(&mounts))
+    .unwrap_or_default()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_library_roots() -> Vec<PathBuf> {
+  Vec::new()
+}
+
+/// Conventional home locations: a few cheap stats, always consulted.
+/// Kept because Steam's own `~/.steam/steam` symlink contract is stable —
+/// a discovered secondary library must never shadow the primary root.
+fn fallback_steam_roots() -> Vec<PathBuf> {
+  let mut roots = Vec::new();
+  if let Ok(home) = std::env::var("HOME") {
+    for candidate in [
+      format!("{home}/.steam/steam"),
+      format!("{home}/.local/share/Steam"),
+      format!("{home}/.steam/root"),
+      format!("{home}/.var/app/com.valvesoftware.Steam/data/Steam"),
+    ] {
+      let path = PathBuf::from(candidate);
+      if path.join("steamapps").is_dir() && !roots.contains(&path) {
+        roots.push(path);
+      }
+    }
+  }
+  roots
+}
+
+/// On-disk cache: per-library prefix maps with fingerprints. Best-effort
+/// accelerator — corrupt/missing cache means a full parse, never an error.
+#[derive(Clone, Debug)]
+struct CachedLibrary {
+  fingerprint: Fingerprint,
+  dirs: HashMap<String, String>,
+}
+
+fn cache_path() -> Option<PathBuf> {
+  let base = std::env::var_os("XDG_CACHE_HOME")
+    .map(PathBuf::from)
+    .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+  Some(base.join(CACHE_FILE))
+}
+
+fn fingerprint_to_json(fingerprint: &Fingerprint) -> serde_json::Value {
+  serde_json::json!({
+    "dir_mtime_ms": fingerprint.dir_mtime_ms,
+    "manifests": fingerprint.manifests,
+    "newest_manifest_ms": fingerprint.newest_manifest_ms,
+  })
+}
+
+fn fingerprint_from_json(value: &serde_json::Value) -> Option<Fingerprint> {
+  Some(Fingerprint {
+    dir_mtime_ms: value.get("dir_mtime_ms")?.as_u64()?,
+    manifests: value.get("manifests")?.as_u64()? as usize,
+    newest_manifest_ms: value.get("newest_manifest_ms")?.as_u64()?,
+  })
+}
+
+fn load_cache() -> HashMap<String, CachedLibrary> {
+  let mut cached = HashMap::new();
+  let Some(path) = cache_path() else {
+    return cached;
+  };
+  let Ok(body) = std::fs::read_to_string(&path) else {
+    return cached;
+  };
+  let Ok(doc) = serde_json::from_str::<serde_json::Value>(&body) else {
+    return cached;
+  };
+  if doc.get("version").and_then(|v| v.as_u64()) != Some(1) {
+    return cached;
+  }
+  if let Some(libraries) = doc.get("libraries").and_then(|v| v.as_object()) {
+    for (lib_path, entry) in libraries {
+      let (Some(fingerprint), Some(dirs)) = (
+        entry.get("fingerprint").and_then(fingerprint_from_json),
+        entry.get("dirs").and_then(|v| v.as_object()),
+      ) else {
+        continue;
+      };
+      let dirs = dirs
+        .iter()
+        .filter_map(|(prefix, appid)| Some((prefix.clone(), appid.as_str()?.to_string())))
+        .collect();
+      cached.insert(lib_path.clone(), CachedLibrary { fingerprint, dirs });
+    }
+  }
+  cached
+}
+
+fn save_cache(libraries: &SteamLibraries) {
+  let Some(path) = cache_path() else {
+    return;
+  };
+  if let Some(parent) = path.parent()
+    && std::fs::create_dir_all(parent).is_err()
+  {
+    return;
+  }
+  // Invert dirs by owning library (see `library_owns_prefix`): one cache
+  // entry per library keeps validation per-library too.
+  let mut by_library: HashMap<String, HashMap<String, String>> = HashMap::new();
+  for lib_path in libraries.fingerprints.keys() {
+    by_library.insert(lib_path.clone(), HashMap::new());
+  }
+  for (prefix, appid) in &libraries.dirs {
+    for lib_path in by_library.keys().cloned().collect::<Vec<_>>() {
+      if library_owns_prefix(Path::new(&lib_path), prefix) {
+        if let Some(entry) = by_library.get_mut(&lib_path) {
+          entry.insert(prefix.clone(), appid.clone());
+        }
+        break;
+      }
+    }
+  }
+  let mut doc = serde_json::Map::new();
+  doc.insert("version".to_string(), serde_json::Value::from(1));
+  let mut libs = serde_json::Map::new();
+  for (lib_path, fingerprint) in &libraries.fingerprints {
+    let mut entry = serde_json::Map::new();
+    entry.insert("fingerprint".to_string(), fingerprint_to_json(fingerprint));
+    let dirs = by_library
+      .remove(lib_path)
+      .unwrap_or_default()
+      .into_iter()
+      .map(|(prefix, appid)| (prefix, serde_json::Value::String(appid)))
+      .collect();
+    entry.insert("dirs".to_string(), serde_json::Value::Object(dirs));
+    libs.insert(lib_path.clone(), serde_json::Value::Object(entry));
+  }
+  doc.insert("libraries".to_string(), serde_json::Value::Object(libs));
+  let body = serde_json::Value::Object(doc).to_string();
+  // Atomic: tmp + rename, so a crash mid-write never corrupts the cache.
+  let tmp = path.with_extension("json.tmp");
+  if std::fs::write(&tmp, body).is_ok() {
+    let _ = std::fs::rename(&tmp, &path);
+  }
+}
