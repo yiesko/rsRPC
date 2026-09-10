@@ -114,6 +114,7 @@ fn parse_ignore_ids(input: Option<&str>) -> Vec<String> {
     .collect()
 }
 
+#[hotpath::main]
 pub fn main() -> Result<(), Box<dyn std::error::Error>> {
   // Fail-fast supervision (ADR-1): worker threads dying silently would
   // leave a zombie daemon (systemd green, detection/bridge dead) that

@@ -673,6 +673,7 @@ impl ClientConnector {
    * Broadcast an activity payload to all connected clients, updating the
    * replay cache so clients connecting later catch up on the current presence.
    */
+  #[hotpath::measure]
   fn broadcast_activity(&self, payload: commands::CachedActivity, socket_id: String) {
     // Keep the replay cache in sync, pruning cleared activities
     let is_clear = serde_json::from_str::<Value>(&payload.json)

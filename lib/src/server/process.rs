@@ -599,6 +599,7 @@ impl ProcessServer {
   /// environ, stat) happen only on misses/hits respectively — never for
   /// the whole table. Extracted from the scan loop for reuse and testing;
   /// the loop itself just maps over it.
+  #[hotpath::measure]
   pub(crate) fn match_process(
     &self,
     process: &Exec,
@@ -753,6 +754,7 @@ impl ProcessServer {
     finish_direct_hit(&obj, exe_index, process)
   }
 
+  #[hotpath::measure]
   pub fn scan_for_processes(
     &self,
   ) -> Result<Vec<Arc<DetectableActivity>>, Box<dyn std::error::Error>> {
