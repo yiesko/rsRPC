@@ -13,6 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Steam AppId is unreadable match by path instead of staying invisible.
   Precedence is native patterns, then user overrides, then the Steam
   AppId, then the Proton patterns, then the stem/folder heuristics.
+- Alternative titles (`aliases`) are preserved by the trim and indexed
+  for stem/folder matching (same conservative multi-word gate as
+  canonical names, which win ties). The bundled snapshot was regenerated
+  with aliases (1397 entries carry them).
+- Discord detection exclusions (`GET /games/detectable/exclusions`):
+  installer/crash-reporter basenames + regex patterns are dropped before
+  any matching. Fetched hourly alongside the DB when `--enable-db-update`
+  is set (`--exclusions-url`/`RSRPC_EXCLUSIONS_URL` overrides); empty set
+  behaves exactly like before.
+- `tools/updater` now uses the shared `rsrpc::detection::trim_detectable`
+  instead of a hand-rolled copy (the copy had silently dropped aliases
+  from the bundled snapshot).
 
 ## [0.32.2] - 2026-09-09
 

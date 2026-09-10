@@ -21,6 +21,7 @@ chrono = "0.4"
 interprocess = "2.2"
 aho-corasick = "1.1"
 libc = "0.2"
+regex = "1.11"
 ureq = { version = "3", default-features = false, features = ["rustls", "charset"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]

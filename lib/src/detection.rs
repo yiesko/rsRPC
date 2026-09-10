@@ -9,7 +9,7 @@ pub const BUNDLED_DETECTABLE: &str = include_str!("../resources/detectable.json"
 
 /**
  * Trim a raw detectable games database down to the fields rsrpc actually
- * uses: `id`/`name`/`hook`, `executables{name,is_launcher,os,arguments}`
+ * uses: `id`/`name`/`hook`/`aliases`, `executables{name,is_launcher,os,arguments}`
  * and `third_party_skus{distributor,id}`.
  *
  * Shared by the process scanner, the CLI and `tools/updater` so the copies
@@ -43,6 +43,20 @@ pub fn trim_detectable_value(body: &str) -> Result<serde_json::Value, Box<dyn st
         "hook".to_string(),
         game.get("hook").cloned().unwrap_or_else(|| false.into()),
       );
+      // Keep aliases (alternative titles): the scanner indexes matchable
+      // ones for stem/folder matching. Empty/missing stays missing so the
+      // trimmed snapshot carries no dead weight.
+      if let Some(aliases) = game.get("aliases").and_then(|v| v.as_array()) {
+        let kept: Vec<serde_json::Value> = aliases
+          .iter()
+          .filter_map(|a| a.as_str())
+          .filter(|a| !a.trim().is_empty())
+          .map(|a| serde_json::Value::String(a.to_string()))
+          .collect();
+        if !kept.is_empty() {
+          entry.insert("aliases".to_string(), serde_json::Value::Array(kept));
+        }
+      }
       let executables: Vec<serde_json::Value> = game
         .get("executables")
         .and_then(|v| v.as_array())
@@ -200,4 +214,65 @@ pub struct ThirdPartySku {
   pub distributor: String,
   pub id: Option<String>,
   pub sku: Option<String>,
+}
+
+/// Discord's game-detection exclusions (`GET /games/detectable/exclusions`):
+/// process basenames that must never match (`executables`) plus regex
+/// patterns against the basename (`patterns`, e.g. installers, crash
+/// reporters, `vcredist.*\.exe$`). The scanner drops these processes
+/// before any matching, so they cost one basename lookup instead of a
+/// full probe chain — and can never shadow a real game.
+#[derive(Clone, Debug, Default)]
+pub struct Exclusions {
+  /// Lowercased basenames, exact match.
+  pub executables: Vec<String>,
+  /// Compiled case-insensitively (the DB is Windows-centric; matching
+  /// stays correct for Proton paths). Invalid patterns are skipped at
+  /// parse, never fatal.
+  pub patterns: Vec<regex::Regex>,
+}
+
+impl Exclusions {
+  /// Basename already normalized (lowercase, `/`-separated path): `true`
+  /// when this process must stay invisible to detection.
+  pub fn is_excluded(&self, basename: &str) -> bool {
+    if self.executables.is_empty() && self.patterns.is_empty() {
+      return false;
+    }
+    if self.executables.iter().any(|exe| exe == basename) {
+      return true;
+    }
+    self.patterns.iter().any(|re| re.is_match(basename))
+  }
+}
+
+/**
+ * Parse an exclusions body. Tolerant by design (best-effort background
+ * data): missing sections become empty, non-string entries and invalid
+ * regexes are skipped, a wholly invalid body yields empty exclusions
+ * instead of an error — callers keep serving the previous set.
+ */
+pub fn parse_exclusions(body: &str) -> Exclusions {
+  let mut exclusions = Exclusions::default();
+  let value: serde_json::Value = match serde_json::from_str(body) {
+    Ok(value) => value,
+    Err(_) => return exclusions,
+  };
+  if let Some(executables) = value.get("executables").and_then(|v| v.as_array()) {
+    exclusions.executables = executables
+      .iter()
+      .filter_map(|e| e.as_str())
+      .map(|e| e.trim().to_lowercase())
+      .filter(|e| !e.is_empty())
+      .collect();
+  }
+  if let Some(patterns) = value.get("patterns").and_then(|v| v.as_array()) {
+    exclusions.patterns = patterns
+      .iter()
+      .filter_map(|p| p.as_str())
+      .filter(|p| !p.trim().is_empty())
+      .filter_map(|p| regex::Regex::new(&format!("(?i){p}")).ok())
+      .collect();
+  }
+  exclusions
 }

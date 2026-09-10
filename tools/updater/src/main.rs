@@ -39,96 +39,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     games.len()
   );
 
-  let trimmed: Vec<serde_json::Value> = games
-    .into_iter()
-    .map(|game| {
-      let mut entry = serde_json::Map::new();
-      entry.insert(
-        "id".to_string(),
-        game.get("id").cloned().unwrap_or_else(|| "".into()),
-      );
-      entry.insert(
-        "name".to_string(),
-        game.get("name").cloned().unwrap_or_else(|| "".into()),
-      );
-      entry.insert(
-        "hook".to_string(),
-        game.get("hook").cloned().unwrap_or_else(|| false.into()),
-      );
-
-      let executables: Vec<serde_json::Value> = game
-        .get("executables")
-        .and_then(|value| value.as_array())
-        .map(|executables| {
-          executables
-            .iter()
-            .map(|exe| {
-              let mut trimmed_exe = serde_json::Map::new();
-              trimmed_exe.insert(
-                "name".to_string(),
-                exe.get("name").cloned().unwrap_or_else(|| "".into()),
-              );
-              trimmed_exe.insert(
-                "is_launcher".to_string(),
-                exe
-                  .get("is_launcher")
-                  .cloned()
-                  .unwrap_or_else(|| false.into()),
-              );
-              trimmed_exe.insert(
-                "os".to_string(),
-                exe.get("os").cloned().unwrap_or_else(|| "".into()),
-              );
-              if let Some(args) = exe.get("arguments")
-                && !args.as_str().unwrap_or_default().is_empty()
-              {
-                trimmed_exe.insert("arguments".to_string(), args.clone());
-              }
-              serde_json::Value::Object(trimmed_exe)
-            })
-            .collect()
-        })
-        .unwrap_or_default();
-      entry.insert(
-        "executables".to_string(),
-        serde_json::Value::Array(executables),
-      );
-
-      // Keep third-party store ids (Steam AppId etc) for automatic matching
-      // of games that ship empty `executables` (e.g. How to Fish).
-      let skus: Vec<serde_json::Value> = game
-        .get("third_party_skus")
-        .and_then(|v| v.as_array())
-        .map(|skus| {
-          skus
-            .iter()
-            .filter_map(|sku| {
-              let distributor = sku.get("distributor")?.as_str()?;
-              let id = sku.get("id").map(|v| match v {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string().trim_matches('"').to_string(),
-              })?;
-              if distributor.is_empty() || id.is_empty() {
-                return None;
-              }
-              let mut m = serde_json::Map::new();
-              m.insert("distributor".to_string(), distributor.into());
-              m.insert("id".to_string(), id.into());
-              Some(serde_json::Value::Object(m))
-            })
-            .collect()
-        })
-        .unwrap_or_default();
-      entry.insert(
-        "third_party_skus".to_string(),
-        serde_json::Value::Array(skus),
-      );
-
-      serde_json::Value::Object(entry)
-    })
-    .collect();
-
-  let output = serde_json::to_string(&trimmed)?;
+  // Single source of truth: the same trim the scanner, the CLI fallback
+  // and the hourly refresh use (see `rsrpc::detection::trim_detectable`).
+  // A hand-rolled copy here drifted before (aliases were silently dropped
+  // from the bundled snapshot); never duplicate it again.
+  let output = rsrpc::detection::trim_detectable(&body)?;
   let path = output_path();
   if let Some(parent) = path.parent() {
     std::fs::create_dir_all(parent)?;

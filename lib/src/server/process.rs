@@ -14,6 +14,7 @@ use crate::ProcessCallback;
 use crate::{debug, log, warn};
 
 use super::super::DetectableActivity;
+use super::super::detection::{Exclusions, parse_exclusions};
 
 #[derive(Default, Clone)]
 pub struct ProcessScanState {
@@ -67,6 +68,13 @@ pub struct ProcessServer {
 
   /// Source URL for the detectable games database (auto-refresh).
   db_url: Option<String>,
+  /// Discord detection exclusions (installer/crash-reporter basenames +
+  /// regexes): excluded processes are dropped before any matching.
+  /// Empty until [`ProcessServer::set_exclusions`] (startup fetch) or the
+  /// hourly refresh fills it; empty behaves exactly like no exclusions.
+  exclusions: Arc<Mutex<Exclusions>>,
+  /// Source URL for the exclusions list (same hourly refresh as the DB).
+  exclusions_url: Option<String>,
   /// Refresh the detectable games database periodically when set.
   enable_db_update: bool,
   /// ETag captured by the startup fetch: seeds the refresh thread so its
@@ -84,6 +92,10 @@ pub struct ProcessServer {
 unsafe impl Sync for ProcessServer {}
 
 impl ProcessServer {
+  // Eight discovery sources (DB, refresh, ignore-list, exclusions) thread
+  // through here; bundling them would churn the public constructor for no
+  // runtime gain.
+  #[allow(clippy::too_many_arguments)]
   pub fn new(
     detectable: Vec<Arc<DetectableActivity>>,
     event_sender: mpsc::Sender<ProcessDetectedEvent>,
@@ -92,6 +104,7 @@ impl ProcessServer {
     enable_db_update: bool,
     initial_db_etag: Option<String>,
     ignored_ids: Vec<String>,
+    exclusions_url: Option<String>,
   ) -> Self {
     log!("[Process Scanner] Building Aho-Corasick patterns for main detectable activities...");
     let (ac, idx) = build_ac_patterns(&detectable);
@@ -123,6 +136,8 @@ impl ProcessServer {
       enable_db_update,
       initial_db_etag,
       ignored_ids,
+      exclusions: Arc::new(Mutex::new(Exclusions::default())),
+      exclusions_url,
 
       // sysinfo System
       #[cfg(not(target_os = "linux"))]
@@ -198,6 +213,33 @@ impl ProcessServer {
     self.update_custom_detectables();
   }
 
+  /// Replace the exclusions set (startup fetch, tests). The hourly refresh
+  /// thread overwrites it on the same cadence when `exclusions_url` is set.
+  pub fn set_exclusions(&self, exclusions: Exclusions) {
+    *self.exclusions.lock().unwrap() = exclusions;
+  }
+
+  /// Refresh the exclusions list once, best-effort: failures keep the
+  /// previous set (empty at first boot = current behavior).
+  fn refresh_exclusions(&self) {
+    let Some(url) = self.exclusions_url.clone() else {
+      return;
+    };
+    match fetch_exclusions(&url) {
+      Ok(exclusions) => {
+        log!(
+          "[Process Scanner] Exclusions updated: {} names, {} patterns",
+          exclusions.executables.len(),
+          exclusions.patterns.len()
+        );
+        self.set_exclusions(exclusions);
+      }
+      Err(err) => {
+        warn!("[Process Scanner] Error updating exclusions, retrying in 1h: {err}");
+      }
+    }
+  }
+
   pub fn start(&self, scan_interval: Duration) {
     let wait_time = scan_interval;
     let clone = self.clone();
@@ -221,8 +263,13 @@ impl ProcessServer {
         // flaps (new tag, identical bytes), which a tag-only check would
         // rebuild pointlessly.
         let mut content_hash: Option<u64> = None;
+        // Unlike the DB, exclusions are NOT fetched synchronously at
+        // startup (tiny payload, empty = current behavior), so prime them
+        // here instead of waiting an hour for the first set.
+        db_clone.refresh_exclusions();
         loop {
           std::thread::sleep(Duration::from_secs(3600));
+          db_clone.refresh_exclusions();
           let url = db_clone.db_url.clone().unwrap();
           match fetch_detectable_etag(&url, etag.as_deref(), content_hash) {
             Ok(FetchOutcome::Unchanged) => {
@@ -530,6 +577,16 @@ impl ProcessServer {
 
     if !process_path.starts_with('/') {
       process_path.insert(0, '/');
+    }
+
+    // Discord exclusions first: installers, crash reporters and friends
+    // are invisible before any matching (one basename lookup instead of
+    // the full probe chain, and they can never shadow a real game).
+    // Before the OBS flag too: an excluded process is absent, period.
+    let basename = process_path.rsplit('/').next().unwrap_or(&process_path);
+    if self.exclusions.lock().unwrap().is_excluded(basename) {
+      debug!("[Process Scanner] Excluded process, skipping: {basename}");
+      return None;
     }
 
     if !*obs_open && (process_path.contains("obs64") || process_path.contains("streamlabs")) {
@@ -872,6 +929,9 @@ fn stamp_activity(obj: &Arc<DetectableActivity>, pid: u64) -> Arc<DetectableActi
 
 /// Auxiliary lookup maps over the main DB:
 /// Steam store id -> activity index, normalized game name -> activity index.
+/// Alternative titles (`aliases`) join the name map under the same
+/// conservative gate — exact, multi-word only — so a generic alias can
+/// never collide; canonical names are inserted first and win ties.
 pub(crate) fn build_aux_maps(
   detectables: &[Arc<DetectableActivity>],
 ) -> (HashMap<String, usize>, HashMap<String, usize>) {
@@ -895,6 +955,14 @@ pub(crate) fn build_aux_maps(
     let normalized = normalize_name(&activity.name);
     if name_matchable(&normalized) {
       name_map.entry(normalized).or_insert(index);
+    }
+    if let Some(aliases) = activity.aliases.as_ref() {
+      for alias in aliases {
+        let normalized = normalize_name(alias);
+        if name_matchable(&normalized) {
+          name_map.entry(normalized).or_insert(index);
+        }
+      }
     }
   }
 
@@ -1053,6 +1121,22 @@ pub(crate) fn body_hash(body: &str) -> u64 {
   let mut hasher = DefaultHasher::new();
   body.hash(&mut hasher);
   hasher.finish()
+}
+
+/**
+ * Fetch Discord's detection exclusions (installer/crash-reporter names +
+ * regex patterns). Tiny payload (a few KB): plain GET with a 1 MiB cap, no
+ * ETag dance — the hourly cadence dominates the cost, and parsing is
+ * `tolerant by design` (see [`parse_exclusions`]).
+ */
+pub(crate) fn fetch_exclusions(url: &str) -> Result<Exclusions, Box<dyn std::error::Error>> {
+  let body = ureq::get(url)
+    .call()?
+    .into_body()
+    .with_config()
+    .limit(1024 * 1024)
+    .read_to_string()?;
+  Ok(parse_exclusions(&body))
 }
 
 /**

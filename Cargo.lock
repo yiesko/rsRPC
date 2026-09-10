@@ -1227,6 +1227,7 @@ dependencies = [
  "criterion",
  "interprocess",
  "libc",
+ "regex",
  "rmp-serde",
  "serde",
  "serde_json",

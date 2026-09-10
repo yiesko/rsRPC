@@ -6,6 +6,7 @@ use rsrpc::detection::{DetectableActivity, trim_detectable};
 use std::path::PathBuf;
 
 const DEFAULT_DB_URL: &str = "https://discord.com/api/v9/applications/detectable";
+const DEFAULT_EXCLUSIONS_URL: &str = "https://discord.com/api/v9/games/detectable/exclusions";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -41,6 +42,11 @@ struct Args {
   db_url: Option<String>,
   #[arg(long, env = "RSRPC_ENABLE_DB_UPDATE")]
   enable_db_update: bool,
+  /// Source URL for Discord's detection exclusions (installer/crash
+  /// reporter names + regexes). Defaults to the official endpoint when
+  /// --enable-db-update is set (same hourly refresh as the DB).
+  #[arg(long, env = "RSRPC_EXCLUSIONS_URL")]
+  exclusions_url: Option<String>,
   #[arg(long, env = "RSRPC_OVERRIDES_FILE")]
   overrides_file: Option<PathBuf>,
   /// Application IDs never published (comma-separated): coexistence with
@@ -137,6 +143,15 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
       None
     }
   });
+  // Same rule for exclusions: official endpoint when refreshing, unless
+  // overridden. An explicit empty value disables the fetch.
+  let effective_exclusions_url = args.exclusions_url.clone().or_else(|| {
+    if args.enable_db_update {
+      Some(DEFAULT_EXCLUSIONS_URL.to_string())
+    } else {
+      None
+    }
+  });
   let mut config = RPCConfig {
     enable_process_scanner: !args.no_process_scan,
     port: args.bridge_port,
@@ -148,6 +163,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     db_url: effective_db_url.clone(),
     enable_db_update: args.enable_db_update,
     ignored_ids: parse_ignore_ids(args.ignore_ids.as_deref()),
+    exclusions_url: effective_exclusions_url.filter(|url| !url.trim().is_empty()),
     ..Default::default()
   };
 

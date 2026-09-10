@@ -69,6 +69,11 @@ pub struct RPCConfig {
   /// are indistinguishable on that path, and the companion must flow).
   /// Ignored games behave as absent: null event, clear.
   pub ignored_ids: Vec<String>,
+  /// Source URL for Discord's detection exclusions (installer/crash
+  /// reporter names + regexes), refreshed hourly alongside the DB when
+  /// `enable_db_update` is set. `None` disables the fetch (empty set =
+  /// current behavior).
+  pub exclusions_url: Option<String>,
 }
 
 impl Default for RPCConfig {
@@ -88,6 +93,7 @@ impl Default for RPCConfig {
       enable_db_update: false,
       initial_db_etag: None,
       ignored_ids: Vec::new(),
+      exclusions_url: None,
     }
   }
 }
@@ -177,6 +183,7 @@ impl RPCServer {
       false,
       None,
       Vec::new(),
+      None,
     );
 
     Ok(
@@ -339,6 +346,7 @@ impl RPCServer {
         self.config.enable_db_update,
         self.config.initial_db_etag.clone(),
         self.config.ignored_ids.clone(),
+        self.config.exclusions_url.clone(),
       ))),
       client_connector: Arc::new(Mutex::new(client_connector)),
       ipc_connector: Arc::new(Mutex::new(ipc_connector)),

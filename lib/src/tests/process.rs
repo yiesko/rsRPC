@@ -280,6 +280,7 @@ fn ac_probe_needs_directories_that_cwd_reconstructs() {
     false,
     None,
     Vec::new(),
+    None,
   );
   let reversed = |path: &str| path.chars().rev().collect::<String>();
   // Bare exe alone misses (no directories for the suffix to anchor on)...
@@ -478,6 +479,7 @@ fn proton_server(db: Vec<Arc<DetectableActivity>>) -> crate::server::process::Pr
     false,
     None,
     Vec::new(),
+    None,
   )
 }
 
@@ -599,4 +601,156 @@ fn match_process_detects_win32_game_and_prefers_steam_id() {
   );
   let hit = hit.expect("steam AppId must match");
   assert_eq!(hit.id, "999");
+}
+
+// --- Aliases + exclusions (F1.2) ---
+
+#[test]
+fn trim_keeps_aliases_drops_unknown() {
+  use crate::detection::trim_detectable_value;
+
+  let body = r#"[{
+    "id": "1", "name": "PUBG: Battlegrounds", "hook": true,
+    "aliases": ["PUBG", "PlayerUnknown's Battlegrounds", "", 42],
+    "executables": [{"name": "tslgame.exe", "is_launcher": false, "os": "win32"}],
+    "third_party_skus": [{"distributor": "steam", "id": "578080"}],
+    "themes": ["shooter"], "overlay": true
+  }]"#;
+  let trimmed = trim_detectable_value(body).unwrap();
+  let entry = &trimmed.as_array().unwrap()[0];
+  // Aliases survive the trim (strings only, blanks/non-strings dropped)...
+  assert_eq!(
+    entry.get("aliases").unwrap().as_array().unwrap(),
+    &vec![
+      serde_json::Value::String("PUBG".to_string()),
+      serde_json::Value::String("PlayerUnknown's Battlegrounds".to_string())
+    ]
+  );
+  // ...unknown top-level fields do not.
+  assert!(entry.get("themes").is_none());
+  assert!(entry.get("overlay").is_none());
+  assert_eq!(entry.get("id").unwrap(), "1");
+}
+
+#[test]
+fn aliases_indexed_and_gated() {
+  // Multi-word alias indexed; single-word alias rejected by the same
+  // conservative gate as canonical names; canonical names win ties.
+  let mut pubg = activity("1", "PUBG: Battlegrounds", None);
+  Arc::get_mut(&mut pubg).expect("fresh Arc").aliases = Some(vec![
+    "PUBG".to_string(),
+    "PlayerUnknown's Battlegrounds".to_string(),
+  ]);
+  let mut clash = activity("2", "PlayerUnknown's Battlegrounds", None);
+  Arc::get_mut(&mut clash).expect("fresh Arc").aliases = Some(vec!["Some Other Title".to_string()]);
+  let db = vec![pubg, clash];
+  let (steam_map, name_map) = build_aux_maps(&db);
+  assert_eq!(name_map.get("playerunknown's battlegrounds"), Some(&0));
+  assert!(!name_map.contains_key("pubg"));
+  assert_eq!(name_map.get("some other title"), Some(&1));
+  let _ = steam_map;
+
+  // The alias resolves through the real stem fallback.
+  let hit = match_name_or_folder(
+    "/games/playerunknown's battlegrounds/tslgame.exe",
+    11,
+    &Mutex::new(name_map),
+    &db,
+  );
+  assert_eq!(hit.unwrap().id, "1");
+}
+
+#[test]
+fn exclusions_parse_and_match() {
+  use crate::detection::{Exclusions, parse_exclusions};
+
+  // Shape mirrors the live endpoint (subset): exact names, one regex,
+  // plus garbage a tolerant parser must swallow.
+  let body = r#"{
+    "executables": ["crashreportclient.exe", "  ", 42, "UnityCrashHandler64.exe"],
+    "patterns": ["vcredist.*\\.exe$", "([invalid", 7],
+    "unexpected": [1, 2]
+  }"#;
+  let exclusions = parse_exclusions(body);
+  assert_eq!(
+    exclusions.executables,
+    vec!["crashreportclient.exe", "unitycrashhandler64.exe"]
+  );
+  assert_eq!(exclusions.patterns.len(), 1);
+
+  // Exact (basenames arrive lowercased from the scanner)...
+  assert!(exclusions.is_excluded("crashreportclient.exe"));
+  assert!(exclusions.is_excluded("unitycrashhandler64.exe"));
+  // ...regex, case-insensitively (Windows-centric DB, Proton paths)...
+  assert!(exclusions.is_excluded("vcredist_x64.exe"));
+  assert!(exclusions.is_excluded("VCREDIST_X86.EXE"));
+  // ...and real games pass through.
+  assert!(!exclusions.is_excluded("htgame.exe"));
+  assert!(!exclusions.is_excluded("client-win64-shipping.exe"));
+
+  // Wholly invalid body degrades to empty, never errors.
+  let empty = parse_exclusions("not json{{{");
+  assert!(!empty.is_excluded("crashreportclient.exe"));
+  let _ = Exclusions::default();
+}
+
+#[test]
+fn match_process_honors_exclusions() {
+  use crate::detection::parse_exclusions;
+  use crate::server::process::Exec;
+
+  let db = vec![proton_entry(
+    "222",
+    "Proton Quest",
+    Some(("quest/game.exe", "win32", false)),
+    None,
+  )];
+  let server = proton_server(db.clone());
+  server.set_exclusions(parse_exclusions(
+    r#"{"executables": ["game.exe"], "patterns": []}"#,
+  ));
+  let mut variant_bufs: [String; 5] = Default::default();
+  let mut reversed_path = String::with_capacity(256);
+  let mut obs_open = false;
+
+  // Would match via the Proton automaton — excluded first.
+  let miss = server.match_process(
+    &Exec {
+      pid: u64::MAX,
+      path: "C:\\games\\quest\\game.exe".to_string(),
+      arguments: None,
+    },
+    &db,
+    &mut variant_bufs,
+    &mut reversed_path,
+    &mut obs_open,
+  );
+  assert!(miss.is_none());
+
+  // Same game under a non-excluded exe name still detects (fresh entry:
+  // cloning the Arc would share ownership and block mutation).
+  let db2 = vec![proton_entry(
+    "222",
+    "Proton Quest",
+    Some(("quest/launcher-free.exe", "win32", false)),
+    None,
+  )];
+  let server2 = proton_server(db2.clone());
+  server2.set_exclusions(parse_exclusions(
+    r#"{"executables": ["game.exe"], "patterns": []}"#,
+  ));
+  let hit = server2
+    .match_process(
+      &Exec {
+        pid: u64::MAX,
+        path: "/games/quest/launcher-free.exe".to_string(),
+        arguments: None,
+      },
+      &db2,
+      &mut variant_bufs,
+      &mut reversed_path,
+      &mut obs_open,
+    )
+    .expect("non-excluded path must match");
+  assert_eq!(hit.id, "222");
 }
