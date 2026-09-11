@@ -806,7 +806,12 @@ impl ProcessServer {
         let app_id = self.cached_app_id(process.pid);
         let (app_id, via_cmdline) = match app_id {
           Some(id) => (Some(id), false),
-          None => (app_id_from_args(process.arguments.as_deref()), true),
+          // Owned copy: only paid when environ is unreadable (sandboxed
+          // Proton), so the common paths stay borrow-only.
+          None => (
+            app_id_from_args(process.arguments.as_deref()).map(|id| id.to_string()),
+            true,
+          ),
         };
         if via_cmdline && let Some(id) = app_id.as_deref() {
           debug!(
@@ -1211,7 +1216,7 @@ fn read_steam_app_id(_pid: u64) -> Option<String> {
 /// this, every such game is invisible to automatic detection. Same trust
 /// as environ (both launcher-provided, display-only use): the token must
 /// stand alone (`AppId=` at a word boundary, followed by digits).
-pub(crate) fn app_id_from_args(arguments: Option<&str>) -> Option<String> {
+pub(crate) fn app_id_from_args(arguments: Option<&str>) -> Option<&str> {
   const TOKEN: &str = "AppId=";
   let args = arguments?;
   let mut rest = args;
@@ -1225,9 +1230,11 @@ pub(crate) fn app_id_from_args(arguments: Option<&str>) -> Option<String> {
     if !boundary {
       continue;
     }
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    if !digits.is_empty() {
-      return Some(digits);
+    // Borrow the digit run instead of collecting it: ASCII digits are
+    // single-byte, so the byte count is always a char boundary.
+    let len = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if len > 0 {
+      return Some(&rest[..len]);
     }
   }
   None

@@ -428,7 +428,7 @@ fn app_id_from_args_parses_steam_launcher_token() {
   // Real reaper shape: token stands alone, digits follow.
   assert_eq!(
     app_id_from_args(Some("SteamLaunch AppId=4508340 -- /games/nte")),
-    Some("4508340".to_string())
+    Some("4508340")
   );
   // No token, empty input, token without digits: nothing.
   assert_eq!(app_id_from_args(Some("htgame.exe /Game/Map")), None);
@@ -437,10 +437,7 @@ fn app_id_from_args_parses_steam_launcher_token() {
   // Suffix of a longer key is not a token (`SomeAppId=`).
   assert_eq!(app_id_from_args(Some("SomeAppId=123")), None);
   // First boundary-valid token with digits wins.
-  assert_eq!(
-    app_id_from_args(Some("SomeAppId=1 AppId=22")),
-    Some("22".to_string())
-  );
+  assert_eq!(app_id_from_args(Some("SomeAppId=1 AppId=22")), Some("22"));
 }
 
 // --- Proton (`win32`) fallback automaton (F1.1) ---
