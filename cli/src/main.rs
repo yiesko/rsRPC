@@ -17,10 +17,16 @@ struct Args {
     short,
     long,
     alias = "no-process-scanning",
-    env = "RSRPC_NO_PROCESS_SCAN"
+    env = "RSRPC_NO_PROCESS_SCAN",
+    value_parser = clap::builder::BoolishValueParser::new()
   )]
   no_process_scan: bool,
-  #[arg(long, short = 'D', env = "RSRPC_DEBUG")]
+  #[arg(
+    long,
+    short = 'D',
+    env = "RSRPC_DEBUG",
+    value_parser = clap::builder::BoolishValueParser::new()
+  )]
   /// Print the resolved configuration plus per-tick debug logging
   /// (scan ticks, repeat sends, match details).
   debug: bool,
@@ -43,7 +49,7 @@ struct Args {
   scan_interval_secs: u64,
   #[arg(long, env = "RSRPC_DB_URL")]
   db_url: Option<String>,
-  #[arg(long, env = "RSRPC_ENABLE_DB_UPDATE")]
+  #[arg(long, env = "RSRPC_ENABLE_DB_UPDATE", value_parser = clap::builder::BoolishValueParser::new())]
   enable_db_update: bool,
   /// Source URL for Discord's detection exclusions (installer/crash
   /// reporter names + regexes). Defaults to the official endpoint when
@@ -61,10 +67,11 @@ struct Args {
   /// Application IDs never published (comma-separated): coexistence with
   /// a richer publisher owning those slots (e.g. a companion presence).
   /// Ignored games behave as absent; clears always pass through.
-  /// `--list-detected` still shows them (diagnostics stay truthful).
+  /// `--list-detected` honors this too (shows what running would publish).
   #[arg(long, env = "RSRPC_IGNORE_IDS")]
   ignore_ids: Option<String>,
-  /// Run a single process scan, print detected games and exit (main DB only)
+  /// Run a single process scan, print detected games and exit (staged
+  /// overrides and ignore-list apply, like the daemon would publish)
   #[arg(long, env = "RSRPC_LIST_DETECTED")]
   list_detected: bool,
   /// Print a database summary (entry/executable counts + first entries)

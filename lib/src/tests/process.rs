@@ -1289,6 +1289,7 @@ fn steam_cache_roundtrip_and_corrupt_fallback() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn read_exec_sees_proc_files_despite_zero_size() {
   use crate::server::process::read_exec;
 
@@ -1300,4 +1301,21 @@ fn read_exec_sees_proc_files_despite_zero_size() {
   let exec = read_exec(here).expect("own cmdline must be readable");
   assert_eq!(exec.pid, here);
   assert!(!exec.path.is_empty());
+}
+
+#[test]
+fn scan_guard_serializes_and_releases() {
+  use std::sync::Arc;
+  use std::sync::atomic::AtomicBool;
+
+  use crate::server::process::ScanGuard;
+
+  let flag = Arc::new(AtomicBool::new(false));
+  let first = ScanGuard::try_acquire(&flag);
+  assert!(first.is_some());
+  // Held: second acquisition fails instead of interleaving.
+  assert!(ScanGuard::try_acquire(&flag).is_none());
+  drop(first);
+  // Released (even via Drop): acquirable again.
+  assert!(ScanGuard::try_acquire(&flag).is_some());
 }

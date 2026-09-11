@@ -128,6 +128,34 @@ pub(crate) struct ProcessServer {
   sysinfo: Arc<Mutex<System>>,
 }
 
+/// Re-entrancy guard for [`ProcessServer::scan_for_processes`]: acquired
+/// atomically, released on drop (all exit paths, panics included).
+pub(crate) struct ScanGuard {
+  flag: Arc<AtomicBool>,
+}
+
+impl ScanGuard {
+  pub(crate) fn try_acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
+    flag
+      .compare_exchange(
+        false,
+        true,
+        std::sync::atomic::Ordering::Acquire,
+        std::sync::atomic::Ordering::Relaxed,
+      )
+      .ok()?;
+    Some(Self {
+      flag: Arc::clone(flag),
+    })
+  }
+}
+
+impl Drop for ScanGuard {
+  fn drop(&mut self) {
+    self.flag.store(false, std::sync::atomic::Ordering::Release);
+  }
+}
+
 unsafe impl Sync for ProcessServer {}
 
 impl ProcessServer {
@@ -888,12 +916,13 @@ impl ProcessServer {
 
     debug!("[Process Scanner] Process scan triggered");
 
-    if self.scanning.load(std::sync::atomic::Ordering::Relaxed) {
+    // Re-entrancy guard: a manual `scan_for_processes` racing the scan
+    // thread (or two manual triggers) must not interleave. RAII so every
+    // exit path — including `?` and panics — releases it.
+    let _scan_guard = ScanGuard::try_acquire(&self.scanning).ok_or_else(|| {
       debug!("[Process Scanner] Scanning already in progress");
-      return Err(crate::error::RsrpcError::Message(
-        "Scanning already in progress".to_string(),
-      ));
-    }
+      crate::error::RsrpcError::Message("Scanning already in progress".to_string())
+    })?;
 
     let mut obs_open = false;
 
