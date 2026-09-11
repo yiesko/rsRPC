@@ -1445,9 +1445,23 @@ pub(crate) fn parse_stat_state(stat: &str) -> Option<char> {
 /// matches `ascii_case_insensitive` — one consistent rule for a
 /// Windows-centric database, instead of half the paths folding Unicode
 /// and the other half not.
+///
+/// Punctuation forbidden in Windows filenames (`: ? " < > | * / \`)
+/// is dropped (via a space, runs collapsed): no real folder or exe stem
+/// can ever contain those characters, so a DB title like `Name:
+/// Subtitle` still matches its on-disk `Name Subtitle` folder — while
+/// the multi-word/length gate keeps generic collisions out exactly as
+/// before.
 #[inline]
-fn normalize_name(name: &str) -> String {
-  name.trim().to_ascii_lowercase()
+pub(crate) fn normalize_name(name: &str) -> String {
+  const FORBIDDEN: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+  name
+    .trim()
+    .to_ascii_lowercase()
+    .replace(&FORBIDDEN[..], " ")
+    .split_whitespace()
+    .collect::<Vec<_>>()
+    .join(" ")
 }
 
 /// Conservative gate for the exe-stem fallback: exact, multi-word names with

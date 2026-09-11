@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::detection::{DetectableActivity, ThirdPartySku};
 use crate::server::process::{
-  build_aux_maps, exe_stem, match_name_or_folder, match_steam_id, name_matchable,
+  build_aux_maps, exe_stem, match_name_or_folder, match_steam_id, name_matchable, normalize_name,
 };
 
 fn activity(id: &str, name: &str, steam_id: Option<&str>) -> Arc<DetectableActivity> {
@@ -68,6 +68,21 @@ fn name_matchable_rejects_generic_stems() {
 }
 
 #[test]
+fn normalize_name_drops_windows_forbidden_punctuation() {
+  // Titles ship `:`/`?`/… (legal in DB text); Windows folders never can.
+  assert_eq!(
+    normalize_name("Starlight Odyssey: Emberfall"),
+    "starlight odyssey emberfall"
+  );
+  assert_eq!(
+    normalize_name("  Starlight   Odyssey  |  Emberfall  "),
+    "starlight odyssey emberfall"
+  );
+  assert_eq!(normalize_name("How to Fish"), "how to fish");
+  assert_eq!(normalize_name("Fish"), "fish");
+}
+
+#[test]
 fn aux_maps_cover_empty_executable_entries() {
   let db = vec![
     activity("1", "How to Fish", Some("4001890")),
@@ -98,6 +113,41 @@ fn aux_match_finds_custom_steam_sku_without_executables() {
   // Unknown ids miss everywhere.
   let miss = match_steam_id(Some("7654321"), 323, &steam_map, &db, &custom);
   assert!(miss.is_none());
+}
+
+#[test]
+fn colon_titled_game_matches_spaceless_folder() {
+  use crate::server::process::Exec;
+
+  // DB title carries a colon (Windows-forbidden, so no real folder ever
+  // has one); the on-disk folder spells the same words with spaces; the
+  // exe stem is single-word (gated by design). The folder must carry it.
+  // Mirrors SKU-only entries (no executables): automata cannot help.
+  let db = vec![proton_entry(
+    "4242",
+    "Starlight Odyssey: Emberfall",
+    None,
+    Some("565656"),
+  )];
+  let server = proton_server(db);
+  let bundle = server.bundle();
+  let mut variant_bufs: [String; 5] = Default::default();
+  let mut reversed_path = String::with_capacity(256);
+  let mut obs_open = false;
+  let hit = server
+    .match_process(
+      &Exec {
+        pid: u64::MAX,
+        path: "/games/starlight odyssey emberfall/StarlightOdyssey.exe".to_string(),
+        arguments: None,
+      },
+      &bundle,
+      &mut variant_bufs,
+      &mut reversed_path,
+      &mut obs_open,
+    )
+    .expect("folder words must match the punctuated title");
+  assert_eq!(hit.id, "4242");
 }
 
 #[test]
