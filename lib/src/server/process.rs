@@ -576,6 +576,10 @@ impl ProcessServer {
       let mut idle_ticks: u32 = 0;
       // Game ids already announced this boot (first-sighting INFO below).
       let mut seen_ids: HashSet<String> = HashSet::new();
+      // First-tick liveness proof (INFO, once): a scan thread that never
+      // completes tick one is otherwise indistinguishable from an idle
+      // one without a debug build.
+      let mut first_tick = true;
       // Run the process scan repeatedly (base cadence, stretched while idle)
       loop {
         *clone.last_scan.lock().unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now();
@@ -598,6 +602,17 @@ impl ProcessServer {
           debug!(
             "[Process Scanner] Ignored {} detected game(s)",
             before - detected.len()
+          );
+        }
+        // First-tick liveness proof (INFO, once per boot): proves the
+        // loop enumerated and classified, whatever it found. A boot
+        // with games running that reports 0 here is a wedged scan,
+        // not an idle one — distinguishable without debug builds.
+        if first_tick {
+          first_tick = false;
+          log!(
+            "[Process Scanner] First tick complete: {} game(s)",
+            detected.len()
           );
         }
         // First sightings this boot, at INFO: without this, a daemon

@@ -152,6 +152,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bundled`, `empty`); the scan loop logs first sightings per game id
   per boot at INFO (bounded, same cadence as bridge publishes). A silent
   daemon is now distinguishable from a blind scanner.
+- Scan liveness tripwire: the first completed tick logs its game count
+  at INFO once per boot (`First tick complete: N game(s)`), so a scan
+  loop that never completes its first pass is visible without debug.
 - Native-presence capture: a peer that connects but never handshakes
   (bailed SDK probe, crashed launcher) logs one INFO line instead of
   debug-only, so clients the bridge never identifies leave a trace.
