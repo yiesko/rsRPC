@@ -5,6 +5,8 @@ use rsrpc::RPCConfig;
 use rsrpc::detection::{DetectableActivity, trim_detectable};
 use std::path::PathBuf;
 
+mod update;
+
 const DEFAULT_DB_URL: &str = "https://discord.com/api/v9/applications/detectable";
 const DEFAULT_EXCLUSIONS_URL: &str = "https://discord.com/api/v9/games/detectable/exclusions";
 
@@ -86,6 +88,41 @@ struct Args {
     value_parser = clap::builder::BoolishValueParser::new()
   )]
   list_database: bool,
+  /// Check for a newer release and exit (exit code 2 when one is
+  /// available, 0 when up to date).
+  #[arg(
+    long,
+    env = "RSRPC_CHECK_UPDATE",
+    value_parser = clap::builder::BoolishValueParser::new()
+  )]
+  check_update: bool,
+  /// Download, verify (SHA256) and stage the newest release; it applies
+  /// on the next start (the binary swaps itself and re-executes).
+  #[arg(
+    long,
+    env = "RSRPC_UPDATE",
+    value_parser = clap::builder::BoolishValueParser::new()
+  )]
+  update: bool,
+  /// Answer "yes" to the staging prompt (non-interactive use).
+  #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
+  yes: bool,
+  /// Restore the previous binary kept by the last update and exit.
+  #[arg(
+    long,
+    env = "RSRPC_ROLLBACK",
+    value_parser = clap::builder::BoolishValueParser::new()
+  )]
+  rollback: bool,
+  /// In the daemon, also stage available updates in the background
+  /// (opt-in; applying still happens on the next start — the daemon is
+  /// never restarted by itself).
+  #[arg(
+    long,
+    env = "RSRPC_AUTO_UPDATE",
+    value_parser = clap::builder::BoolishValueParser::new()
+  )]
+  auto_update: bool,
 }
 
 fn fetch_detectable(url: &str) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
@@ -181,6 +218,20 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
   }
 
   let args = Args::parse();
+  if args.rollback {
+    update::cmd_rollback()?;
+    return Ok(());
+  }
+  // Apply any staged update first: on success this swaps the binary and
+  // re-executes (diverging), so everything below runs the new version.
+  // Never fails boot — problems discard the staged file and continue.
+  update::apply_pending_on_boot();
+  if args.check_update {
+    return update::cmd_check();
+  }
+  if args.update {
+    return update::cmd_stage(args.yes);
+  }
   if args.debug {
     // SAFETY: same as above, still single-threaded startup.
     unsafe {
@@ -367,6 +418,10 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
   // Starts the other threads (process detector, client connector, etc).
   // Bind failures surface here (no exit inside the library).
   client.start()?;
+
+  // Daily background update check: logs availability, and stages when
+  // --auto-update is set (opt-in). Never restarts anything by itself.
+  update::spawn_watcher(args.auto_update);
 
   let (tx, rx) = std::sync::mpsc::channel();
   ctrlc::set_handler(move || {

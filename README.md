@@ -85,6 +85,17 @@
                                    ignore-list apply, like the daemon)
       --list-database             Print a database summary (entry/executable
                                    counts + first entries) and exit
+      --check-update              Check for a newer release and exit (exit
+                                   code 2 when one is available)
+      --update                    Download, verify (SHA256) and stage the
+                                   newest release; it applies on the next
+                                   start (self-swap + re-exec)
+      --yes                       Answer "yes" to the staging prompt
+      --rollback                  Restore the previous binary kept by the
+                                   last update and exit
+      --auto-update               In the daemon, also stage available updates
+                                   in the background (opt-in; applying still
+                                   happens on the next start)
   -D, --debug                     Print the resolved configuration
 ```
 
@@ -100,6 +111,13 @@ Severities, chattiest first: `DEBUG` (per-tick internals, needs `--debug`/`RSRPC
 * `--db-url <URL>` fetches and trims the list at startup (keeps only `id/name/hook/aliases`, `executables{name,is_launcher,os,arguments}` and `third_party_skus{distributor,id}`), with fallback to the bundled snapshot on failure.
 * `--enable-db-update` keeps refreshing that list every hour in the background. Without `--db-url` it defaults to `https://discord.com/api/v9/applications/detectable`.
 * Regenerate the snapshot with: `cargo run --manifest-path tools/updater/Cargo.toml` (writes `lib/resources/detectable.json`).
+
+### Self-update (OTA)
+
+* `--check-update` reports newer releases (exit 2 when one is available); `--update` downloads, SHA256-verifies against the release `SHA256SUMS.txt`, and stages the binary under `~/.cache/rsrpc/ota/` (`$RSRPC_OTA_DIR` overrides).
+* The staged binary applies on the next start: it is re-verified, atomically swapped in (previous image kept as `.prev` for `--rollback`), and the process re-executes — on Linux in the same PID, invisible to systemd.
+* The daemon checks once a day in the background and only logs availability, unless `--auto-update`/`RSRPC_AUTO_UPDATE=1` opts into background staging (applying still waits for the next start; the daemon never restarts itself).
+* Self-update refuses dev builds (`target/`), `cargo install` copies (`~/.cargo/bin`), oddly named binaries, and read-only install dirs with a plain message. MVP covers Linux x86_64 + ARM64 (other targets report "no published builds").
 
 ### Process detection notes
 

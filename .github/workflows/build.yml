@@ -162,6 +162,17 @@ jobs:
             rm -rf "$dir"
           done
 
+      - name: Stage OTA binaries and checksums
+        run: |
+          set -e
+          # Raw (unarchived) binaries for the self-update client, plus a
+          # sha256sum-compatible manifest covering everything uploaded.
+          # MVP targets only: Linux x86_64 + ARM64.
+          cp "artifacts/rsrpc-x86_64-unknown-linux-gnu/rsrpc-cli" ./rsrpc-cli-x86_64-unknown-linux-gnu
+          cp "artifacts/rsrpc-aarch64-unknown-linux-gnu/rsrpc-cli" ./rsrpc-cli-aarch64-unknown-linux-gnu
+          sha256sum rsrpc-cli-x86_64-unknown-linux-gnu rsrpc-cli-aarch64-unknown-linux-gnu rsrpc*.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
       - name: Changelog
         run: |
           PREV_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || true)
@@ -181,7 +192,11 @@ jobs:
         uses: softprops/action-gh-release@v3
         if: github.event_name != 'schedule'
         with:
-          files: rsrpc*.zip
+          files: |
+            rsrpc*.zip
+            rsrpc-cli-x86_64-unknown-linux-gnu
+            rsrpc-cli-aarch64-unknown-linux-gnu
+            SHA256SUMS.txt
           token: ${{ secrets.GITHUB_TOKEN }}
           # Release name is the tag name
           name: ${{ github.ref_name }} - ${{ github.sha }}

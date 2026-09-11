@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Self-update (OTA) for `rsrpc-cli` (Linux x86_64 + ARM64): `--check-update`
+  (exit 2 when a newer release exists), `--update [--yes]` (downloads,
+  SHA256-verifies against the release manifest, stages under
+  `~/.cache/rsrpc/ota/`), `--rollback` (restores the kept `.prev` image),
+  and opt-in `--auto-update`/`RSRPC_AUTO_UPDATE=1` for background staging
+  in the daemon (daily check + log either way). Staged binaries apply on
+  the next start via atomic swap + re-exec (same PID on Linux); dev builds,
+  `cargo install` copies, foreign names and read-only dirs are refused with
+  a plain message. CI publishes raw `rsrpc-cli-{target}` binaries plus
+  `SHA256SUMS.txt` on tag releases.
+
 ### Fixed
 - `SET_ACTIVITY` replies now echo the activity intact (official echo
   semantics): `name`/`type` (Playing/Listening/Watching/Competing) and
