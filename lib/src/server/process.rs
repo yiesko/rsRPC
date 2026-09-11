@@ -328,6 +328,7 @@ impl ProcessServer {
 
   /// Drop one pid's memoized AppId (EXEC: same pid, new image, possibly
   /// new environ). Called by the proc-events watcher before reclassifying.
+  #[cfg(target_os = "linux")]
   pub(crate) fn drop_appid(&self, pid: u64) {
     self
       .appid_cache
@@ -343,6 +344,7 @@ impl ProcessServer {
   /// one of them matches the game, so unwedged wakes would unpark the
   /// loop several times per second (measured 0.76s effective cadence
   /// instead of 5s during NFS).
+  #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
   pub(crate) fn should_wake_on_exit(&self, pid: u64) -> bool {
     if !self
       .detected_pids
@@ -666,6 +668,7 @@ impl ProcessServer {
   /// Scan ticks and EXEC events each hold one Arc for their whole
   /// classification, so a concurrent refresh can only swap in the NEXT
   /// fully-built generation — never a torn mix.
+  #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
   pub(crate) fn bundle(&self) -> Arc<DetectablesBundle> {
     self
       .detectables
@@ -1790,7 +1793,7 @@ fn build_proton_ac_patterns(
   #[cfg(not(target_os = "linux"))]
   {
     let _ = detectables;
-    return (None, Vec::new());
+    (None, Vec::new())
   }
   #[cfg(target_os = "linux")]
   {

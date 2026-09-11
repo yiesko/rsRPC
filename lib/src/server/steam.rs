@@ -733,6 +733,7 @@ fn path_steam_roots() -> Vec<PathBuf> {
 /// Pure over a mounts-table string for testability; the live table comes
 /// from `/proc/mounts`.
 #[must_use]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn mount_library_roots_for(mounts: &str) -> Vec<PathBuf> {
   const SKIP_TYPES: &[&str] = &[
     "proc",

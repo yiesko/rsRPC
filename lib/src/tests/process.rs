@@ -897,10 +897,11 @@ fn concurrent_swap_and_scan_never_tears() {
   assert_eq!(hit.id, "444");
 }
 
-// --- proc-events netlink parser (F1.5) ---
+// --- proc-events netlink parser (F1.5, Linux-only) ---
 
 /// One synthetic kernel datagram: `nlmsghdr` + `cn_msg` (idx/val = 1/1)
 /// + `proc_event` with `what` and the pid at the exec/exit union offset.
+#[cfg(target_os = "linux")]
 fn proc_buf(what: u32, pid: u32) -> Vec<u8> {
   let total = 16 + 20 + 24;
   let mut buf = vec![0u8; total];
@@ -915,6 +916,7 @@ fn proc_buf(what: u32, pid: u32) -> Vec<u8> {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn proc_event_parses_exec_and_exit() {
   use crate::server::proc_events::{ProcEvent, parse_event};
 
