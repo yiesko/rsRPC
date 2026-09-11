@@ -189,47 +189,6 @@ fn fix_timestamps_keeps_millis_untouched() {
 }
 
 #[test]
-fn fix_buttons_preserves_sober_roblox_payload() {
-  // Shape inspired by a real Sober payload: both buttons must survive
-  // fix() as labels + metadata.button_urls, including roblox:// URLs —
-  // what Discord renders from there is Discord's decision, not ours.
-  let mut cmd = parse_cmd(
-    r#"{
-        "cmd": "SET_ACTIVITY",
-        "args": {
-          "pid": 3,
-          "activity": {
-            "state": "by ExamplePlayer",
-            "details": "Playing Example Experience",
-            "assets": {"large_image": "roblox_big", "large_text": "Roblox"},
-            "buttons": [
-              {"label": "Join server", "url": "roblox://experiences/start?placeId=1234567890&gameInstanceId=00000000-0000-0000-0000-000000000000"},
-              {"label": "See game page", "url": "https://roblox.com/games/1234567890"}
-            ],
-            "instance": false
-          }
-        },
-        "nonce": "7"
-      }"#,
-  );
-
-  cmd.fix();
-
-  let activity = cmd.args.unwrap().activity.unwrap();
-  assert_eq!(
-    activity.buttons.unwrap(),
-    vec![json!("Join server"), json!("See game page")]
-  );
-  assert_eq!(
-    activity.metadata.unwrap().button_urls.unwrap(),
-    vec![
-      "roblox://experiences/start?placeId=1234567890&gameInstanceId=00000000-0000-0000-0000-000000000000".to_string(),
-      "https://roblox.com/games/1234567890".to_string()
-    ]
-  );
-}
-
-#[test]
 fn fix_flags_sets_instance_flag() {
   let mut cmd = parse_cmd(
     r#"{

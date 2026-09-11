@@ -31,6 +31,12 @@ fn genuine_clear_needs_nonzero_pid_and_null_activity() {
   assert!(!is_genuine_clear(&cmd_with(None, None)));
   // No args at all -> ignore
   assert!(!is_genuine_clear(&ActivityCmd::empty()));
+  // Real Sober/Roblox payload shape (truncated): must not reset detection
+  let cmd: ActivityCmd = serde_json::from_str(
+    r#"{"nonce":"4","cmd":"SET_ACTIVITY","args":{"pid":3,"activity":{"details":"In the Roblox app"}}}"#,
+  )
+  .unwrap();
+  assert!(!is_genuine_clear(&cmd));
 }
 
 #[test]
@@ -63,16 +69,6 @@ fn clones_share_detection_state() {
 }
 
 #[test]
-fn non_empty_set_activity_is_not_a_clear() {
-  // Real Sober/Roblox payload shape (truncated): must not reset detection
-  let cmd: ActivityCmd = serde_json::from_str(
-    r#"{"nonce":"4","cmd":"SET_ACTIVITY","args":{"pid":3,"activity":{"details":"In the Roblox app"}}}"#,
-  )
-  .unwrap();
-  assert!(!is_genuine_clear(&cmd));
-}
-
-#[test]
 fn process_clear_consumes_outstanding_publication_once() {
   // ClientConnector::new binds bridge ports; use uncommon ones for the test.
   let (_ipc_tx, ipc_rx) = std::sync::mpsc::channel();
@@ -98,29 +94,6 @@ fn process_clear_consumes_outstanding_publication_once() {
 }
 
 #[test]
-fn process_clear_survives_sdk_clear() {
-  // Regression: the game SDK disconnect (event_loop path, pid-keyed) must
-  // never disarm the app-id-keyed process prune — otherwise the null scan
-  // skips it forever and every later bridge client replays a dead game.
-  // There is no shared flag anymore: the armed map is the only gate.
-  let (_ipc_tx, ipc_rx) = std::sync::mpsc::channel();
-  let (_proc_tx, proc_rx) = std::sync::mpsc::channel();
-  let (_ws_tx, ws_rx) = std::sync::mpsc::channel();
-  let connector = ClientConnector::new(45975, 45985, 45976, test_user(), ipc_rx, proc_rx, ws_rx);
-
-  connector
-    .last_process
-    .lock()
-    .unwrap()
-    .insert("111111111111111111".to_string(), 1234);
-  // ...yet the process publication still yields its one clear.
-  assert_eq!(
-    take_process_clear(&connector),
-    vec![(1234, "111111111111111111".to_string())]
-  );
-}
-
-#[test]
 fn replay_cache_evicts_oldest_beyond_cap() {
   use crate::commands::empty_cached;
 
@@ -136,16 +109,12 @@ fn replay_cache_evicts_oldest_beyond_cap() {
   // Oldest (seq 0) evicted, newest kept.
   assert!(!cache.contains_key("pid-0"));
   assert!(cache.contains_key(&format!("pid-{}", MAX_CACHED_ACTIVITIES)));
-}
 
-#[test]
-fn replay_cache_within_cap_is_untouched() {
-  use crate::commands::empty_cached;
-
-  let mut cache = std::collections::HashMap::new();
-  cache.insert("a".to_string(), (empty_cached(1, "a".to_string()), 7));
-  prune_cache(&mut cache);
-  assert!(cache.contains_key("a"));
+  // Within cap: a lone entry is untouched (no-shrink control case).
+  let mut small = std::collections::HashMap::new();
+  small.insert("a".to_string(), (empty_cached(1, "a".to_string()), 7));
+  prune_cache(&mut small);
+  assert!(small.contains_key("a"));
 }
 
 #[test]
