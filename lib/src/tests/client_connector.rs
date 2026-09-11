@@ -1,7 +1,7 @@
 use crate::cmd::{ActivityCmd, ActivityCmdArgs};
 use crate::server::client_connector::{
-  ClientConnector, MAX_CACHED_ACTIVITIES, handle_bridge_control, is_genuine_clear, prune_cache,
-  state_activities, take_process_clear,
+  ClientConnector, MAX_CACHED_ACTIVITIES, MAX_HANDOFF_ENTRIES, handle_bridge_control,
+  is_genuine_clear, prune_cache, state_activities, take_process_clear,
 };
 use crate::user::RpcUser;
 
@@ -374,4 +374,32 @@ fn generic_payload_start_is_numeric_millis() {
     "start must serialize as a number, got {start}"
   );
   assert_eq!(start.as_u64(), Some(1_700_000_000_000));
+}
+
+#[test]
+fn handoff_tables_are_bounded() {
+  use crate::server::client_connector::{HandoffState, ScannedGame};
+
+  let mut handoff = HandoffState::default();
+  // Flooding with dead owners (crashed companions that never cleared):
+  // purged, never accumulated.
+  for i in 0..(MAX_HANDOFF_ENTRIES + 10) {
+    handoff.note_publish(&format!("dead-app-{i}"), u64::MAX);
+    handoff.note_scan(Some(ScannedGame {
+      id: format!("dead-scan-{i}"),
+      name: "Dead".to_string(),
+      pid: u64::MAX,
+      start: 1,
+    }));
+  }
+  assert!(handoff.live_ipc_len() <= MAX_HANDOFF_ENTRIES);
+  assert!(handoff.last_scans_len() <= MAX_HANDOFF_ENTRIES);
+
+  // Flooding with one LIVE pid (malicious/buggy client, infinite ids):
+  // hard-capped, legitimate slots (<5) never near it.
+  let live = std::process::id() as u64;
+  for i in 0..(MAX_HANDOFF_ENTRIES + 10) {
+    handoff.note_publish(&format!("live-app-{i}"), live);
+  }
+  assert_eq!(handoff.live_ipc_len(), MAX_HANDOFF_ENTRIES);
 }

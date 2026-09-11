@@ -58,6 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   defaults) and `append_detectables` stages pre-start: `--list-detected`
   now applies staged overrides AND the ignore-list, so diagnostics show
   exactly what the daemon would publish (previously main-DB-only).
+- Hardening (correctness + DoS): the detection database (automata,
+  indexes, lists, aux maps) now swaps atomically per generation — a
+  refresh landing mid-scan can no longer panic or mis-attribute games;
+  the VDF parser is iterative with depth/file/token caps; exclusion
+  regexes are capped and matched as one size-limited `RegexSet`; the
+  handoff tables are bounded (dead owners purged, hard cap 64); all
+  network fetches carry timeouts; `/proc`/VDF reads are size-capped;
+  hot-path locks survive poisoning instead of killing the daemon.
 - Scan efficiency (measured with hotpath-rs, see `cargo profile
   profiling`): case-insensitive automata (no per-process lowercase
   allocation), borrowed paths (`Cow`, zero alloc on the common case),

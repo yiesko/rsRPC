@@ -74,7 +74,9 @@ struct Args {
 }
 
 fn fetch_detectable(url: &str) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
-  let response = ureq::get(url).call()?;
+  let response = rsrpc::http_agent(std::time::Duration::from_secs(30))
+    .get(url)
+    .call()?;
   let etag = response
     .headers()
     .get("etag")

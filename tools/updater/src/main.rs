@@ -26,7 +26,8 @@ fn output_path() -> PathBuf {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
   println!("Fetching detectable.json from {DETECTABLE_URL}...");
 
-  let body = ureq::get(DETECTABLE_URL)
+  let body = rsrpc::http_agent(std::time::Duration::from_secs(60))
+    .get(DETECTABLE_URL)
     .call()?
     .into_body()
     .with_config()

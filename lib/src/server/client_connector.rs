@@ -82,9 +82,33 @@ pub(crate) struct HandoffState {
   last_scans: HashMap<String, ScannedGame>,
 }
 
+/// Cap for the handoff tables: distinct live app-ids are tiny in practice
+/// (co-running games plus their companions). The cap only bites a client
+/// publishing hundreds of ids without clearing (malicious or buggy) —
+/// without it, memory grows forever on untrusted input. Enforcement
+/// purges dead owners first (the actual garbage), so live slots are only
+/// evicted in pathological cases, and even then the next scan or publish
+/// re-arms them (self-healing).
+pub(crate) const MAX_HANDOFF_ENTRIES: usize = 64;
+
 impl HandoffState {
   pub(crate) fn note_publish(&mut self, app_id: &str, pid: u64) {
+    if self.live_ipc.len() >= MAX_HANDOFF_ENTRIES {
+      // Purge dead owners first (the actual garbage: crashed companions
+      // that never cleared). Whatever remains is live.
+      self.live_ipc.retain(|_, owner| process_alive(*owner));
+    }
     self.live_ipc.insert(app_id.to_string(), pid);
+    // Hard bound: even all-live flooding (one pid, infinite ids) stops
+    // here. Evicting a live slot only desuppresses its generic until the
+    // next publish re-arms it — unreachable in legitimate use (<5 ids).
+    while self.live_ipc.len() > MAX_HANDOFF_ENTRIES {
+      if let Some(victim) = self.live_ipc.keys().next().cloned() {
+        self.live_ipc.remove(&victim);
+      } else {
+        break;
+      }
+    }
   }
 
   /// Returns true when the slot was actually released (owner cleared).
@@ -100,7 +124,17 @@ impl HandoffState {
   pub(crate) fn note_scan(&mut self, game: Option<ScannedGame>) {
     match game {
       Some(game) => {
+        if self.last_scans.len() >= MAX_HANDOFF_ENTRIES {
+          self.last_scans.retain(|_, known| process_alive(known.pid));
+        }
         self.last_scans.insert(game.id.clone(), game);
+        while self.last_scans.len() > MAX_HANDOFF_ENTRIES {
+          if let Some(victim) = self.last_scans.keys().next().cloned() {
+            self.last_scans.remove(&victim);
+          } else {
+            break;
+          }
+        }
       }
       // Null scan: the table is empty, forget every game.
       None => self.last_scans.clear(),
@@ -121,6 +155,18 @@ impl HandoffState {
   /// Whether generic detection must stay out of this slot right now.
   pub(crate) fn suppresses(&self, app_id: &str) -> bool {
     self.live_ipc.contains_key(app_id)
+  }
+
+  /// Table sizes (bounded by [`MAX_HANDOFF_ENTRIES`]; test-only probe).
+  #[cfg(test)]
+  pub(crate) fn live_ipc_len(&self) -> usize {
+    self.live_ipc.len()
+  }
+
+  /// Table sizes (bounded by [`MAX_HANDOFF_ENTRIES`]; test-only probe).
+  #[cfg(test)]
+  pub(crate) fn last_scans_len(&self) -> usize {
+    self.last_scans.len()
   }
 
   /// The game to re-assert when `app_id`'s IPC source cleared, if the
@@ -321,9 +367,24 @@ impl ClientConnector {
     });
 
     // Create a thread for each reciever
-    let ipc_event_rec = self.ipc_event_rec.lock().unwrap().take().unwrap();
-    let proc_event_rec = self.proc_event_rec.lock().unwrap().take().unwrap();
-    let ws_event_rec = self.ws_event_rec.lock().unwrap().take().unwrap();
+    let ipc_event_rec = self
+      .ipc_event_rec
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .take()
+      .unwrap();
+    let proc_event_rec = self
+      .proc_event_rec
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .take()
+      .unwrap();
+    let ws_event_rec = self
+      .ws_event_rec
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .take()
+      .unwrap();
 
     let ipc_clone = self.clone();
     let proc_clone = self.clone();
@@ -369,18 +430,35 @@ impl ClientConnector {
           );
 
           // Send initial connection data
-          send_message(&responder, &user.lock().unwrap().ready_payload(), protocol);
+          send_message(
+            &responder,
+            &user
+              .lock()
+              .unwrap_or_else(|e| e.into_inner())
+              .ready_payload(),
+            protocol,
+          );
 
           // Send any cached activities so late joiners see current presence
-          for (payload, _) in last_activities.lock().unwrap().values() {
+          for (payload, _) in last_activities
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+          {
             send_cached_activity(&responder, payload, protocol);
           }
 
-          clients.lock().unwrap().insert(client_id, responder);
+          clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(client_id, responder);
         }
         Event::Disconnect(client_id) => {
           log!("[Client Connector] Client {} disconnected", client_id);
-          clients.lock().unwrap().remove(&client_id);
+          clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&client_id);
         }
         Event::Message(client_id, message) => {
           debug!(
@@ -397,7 +475,7 @@ impl ClientConnector {
           match &message {
             Message::Text(text) => match handle_bridge_control(&user, text) {
               Some((ack, changed)) => {
-                let mut clients = clients.lock().unwrap();
+                let mut clients = clients.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(responder) = clients.get(&client_id) {
                   responder.send(Message::Text(ack));
                 }
@@ -416,13 +494,21 @@ impl ClientConnector {
                 }
               }
               None => {
-                if let Some(responder) = clients.lock().unwrap().get(&client_id) {
+                if let Some(responder) = clients
+                  .lock()
+                  .unwrap_or_else(|e| e.into_inner())
+                  .get(&client_id)
+                {
                   responder.send(message);
                 }
               }
             },
             _ => {
-              if let Some(responder) = clients.lock().unwrap().get(&client_id) {
+              if let Some(responder) = clients
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&client_id)
+              {
                 responder.send(message);
               }
             }
@@ -454,7 +540,11 @@ impl ClientConnector {
           // IPC-wins handoff: a live SDK presence takes over this app slot
           // from generic detection (last publisher wins across companions).
           if let Some(app) = activity.and_then(|activity| activity.application_id.clone()) {
-            connector.handoff.lock().unwrap().note_publish(&app, pid);
+            connector
+              .handoff
+              .lock()
+              .unwrap_or_else(|e| e.into_inner())
+              .note_publish(&app, pid);
           }
           // NOTE: no ignore-list filtering here by design. Forwarded client
           // frames (companions, native game presences) are indistinguishable
@@ -520,7 +610,7 @@ impl ClientConnector {
             // would flash on the way out (the scanner's null event clears
             // anyway).
             let resume: Vec<ScannedGame> = {
-              let mut handoff = connector.handoff.lock().unwrap();
+              let mut handoff = connector.handoff.lock().unwrap_or_else(|e| e.into_inner());
               match cmd.application_id.clone() {
                 Some(app) if handoff.note_clear(&app, pid) => {
                   handoff.resume_for(&app).into_iter().collect()
@@ -560,7 +650,11 @@ impl ClientConnector {
       let proc_activity = proc_event.activity;
 
       if proc_activity.id == "null" {
-        connector.handoff.lock().unwrap().note_scan(None);
+        connector
+          .handoff
+          .lock()
+          .unwrap_or_else(|e| e.into_inner())
+          .note_scan(None);
         // Clear every outstanding process publication (multi-game scans
         // publish per slot; a lone null means the table is empty). The
         // two keyspaces differ (IPC clears are pid-keyed, process clears
@@ -600,9 +694,19 @@ impl ClientConnector {
       // our generic card if shown and stay out until that source clears.
       // Strictly per-slot: other games' cards are untouched, so co-running
       // games each keep theirs.
-      if connector.handoff.lock().unwrap().suppresses(&game.id) {
+      if connector
+        .handoff
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .suppresses(&game.id)
+      {
         // The armed entry carries its own pid for the clear frame.
-        if let Some(pid) = connector.last_process.lock().unwrap().remove(&game.id) {
+        if let Some(pid) = connector
+          .last_process
+          .lock()
+          .unwrap_or_else(|e| e.into_inner())
+          .remove(&game.id)
+        {
           connector.broadcast_activity(
             commands::empty_cached(pid, game.id.clone()),
             game.id.clone(),
@@ -683,11 +787,14 @@ impl ClientConnector {
       .unwrap_or(false);
 
     {
-      let mut last_activities = self.last_activities.lock().unwrap();
+      let mut last_activities = self
+        .last_activities
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
       if is_clear {
         last_activities.remove(&socket_id);
       } else {
-        let mut seq = self.activity_seq.lock().unwrap();
+        let mut seq = self.activity_seq.lock().unwrap_or_else(|e| e.into_inner());
         *seq = seq.saturating_add(1);
         last_activities.insert(socket_id, (payload.clone(), *seq));
         prune_cache(&mut last_activities);
@@ -750,7 +857,12 @@ impl ClientConnector {
       }),
       ipc: self.ipc_path.clone(),
     };
-    let activities = state_activities(&self.last_activities.lock().unwrap());
+    let activities = state_activities(
+      &self
+        .last_activities
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()),
+    );
     let snapshot = StateSnapshot::new(servers, activities);
     if let Err(err) = state::write_snapshot(&path, &snapshot) {
       debug!("[Client Connector] State snapshot failed: {}", err);
@@ -762,8 +874,11 @@ impl ClientConnector {
    */
   #[hotpath::measure]
   fn send_to_all(&self, payload: &commands::CachedActivity) {
-    let json_clients = self.json_clients.lock().unwrap();
-    let msgpack_clients = self.msgpack_clients.lock().unwrap();
+    let json_clients = self.json_clients.lock().unwrap_or_else(|e| e.into_inner());
+    let msgpack_clients = self
+      .msgpack_clients
+      .lock()
+      .unwrap_or_else(|e| e.into_inner());
     if json_clients.is_empty() && msgpack_clients.is_empty() {
       debug!("[Client Connector] No clients connected, skipping");
       return;
@@ -781,7 +896,7 @@ impl ClientConnector {
         Message::Binary(payload.msgpack.clone()),
       ),
     ] {
-      let mut clients = clients.lock().unwrap();
+      let mut clients = clients.lock().unwrap_or_else(|e| e.into_inner());
       let dead: Vec<u64> = clients
         .iter()
         .filter_map(|(id, responder)| (!responder.send(payload.clone())).then_some(*id))
@@ -797,8 +912,11 @@ impl ClientConnector {
    * Broadcast a non-activity event (e.g. INVITE_BROWSER) as-is to all clients.
    */
   fn broadcast_raw(&self, cmd: &ActivityCmd) {
-    let json_clients = self.json_clients.lock().unwrap();
-    let msgpack_clients = self.msgpack_clients.lock().unwrap();
+    let json_clients = self.json_clients.lock().unwrap_or_else(|e| e.into_inner());
+    let msgpack_clients = self
+      .msgpack_clients
+      .lock()
+      .unwrap_or_else(|e| e.into_inner());
     if json_clients.is_empty() && msgpack_clients.is_empty() {
       debug!("[Client Connector] No clients connected, skipping");
       return;
@@ -894,17 +1012,17 @@ pub(crate) fn handle_bridge_control(
     return None;
   }
   let nonce = body.get("nonce").cloned().unwrap_or(Value::Null);
-  let before = user.lock().unwrap().clone();
+  let before = user.lock().unwrap_or_else(|e| e.into_inner()).clone();
   if msg_type == "SET_USER" {
     // `patch` (arRPC shape) or `data` (defensive alias) carry the patch.
     if let Some(patch) = body.get("patch").or_else(|| body.get("data")) {
-      user.lock().unwrap().patch(patch);
+      user.lock().unwrap_or_else(|e| e.into_inner()).patch(patch);
     }
   } else {
     // Reset to the startup identity (defaults + `RSRPC_USER_*`).
-    *user.lock().unwrap() = RpcUser::from_env();
+    *user.lock().unwrap_or_else(|e| e.into_inner()) = RpcUser::from_env();
   }
-  let after = user.lock().unwrap().clone();
+  let after = user.lock().unwrap_or_else(|e| e.into_inner()).clone();
   let changed = (before != after).then_some(after.clone());
   let user_value = serde_json::to_value(after).unwrap_or(Value::Null);
   let ack_type = format!("{msg_type}_ACK");

@@ -55,9 +55,14 @@ fn tokenize(input: &str) -> Vec<String> {
     match char {
       '"' => {
         let mut string = String::new();
+        let mut closed = false;
         loop {
           match chars.next() {
-            None | Some('"') => break,
+            None => break,
+            Some('"') => {
+              closed = true;
+              break;
+            }
             // VDF escapes (`\"`, `\\`): keep the escaped char literally.
             Some('\\') => {
               if let Some(escaped) = chars.next() {
@@ -67,7 +72,11 @@ fn tokenize(input: &str) -> Vec<String> {
             Some(char) => string.push(char),
           }
         }
-        tokens.push(string);
+        // Unterminated quote (truncated/corrupt file): drop the partial
+        // token instead of merging the rest of the file into it.
+        if closed {
+          tokens.push(string);
+        }
       }
       '{' => tokens.push("{".to_string()),
       '}' => tokens.push("}".to_string()),
@@ -80,35 +89,87 @@ fn tokenize(input: &str) -> Vec<String> {
 /// Parse a token stream into nested maps: `"key" "value"` or
 /// `"key" { ... }`. Returns the top-level map; trailing garbage after a
 /// complete document is ignored.
+///
+/// Iterative (explicit stack, depth-capped): the recursive version
+/// overflowed the stack on crafted nesting (`"a"{"a"...`), killing the
+/// scanning thread from a plain data file.
 fn parse_vdf(tokens: &[String]) -> HashMap<String, Vdf> {
-  fn block(tokens: &[String], pos: &mut usize) -> HashMap<String, Vdf> {
-    let mut map = HashMap::new();
-    while *pos < tokens.len() {
-      let key = tokens[*pos].clone();
-      *pos += 1;
-      if key == "}" {
+  /// Maximum nesting depth (real manifests nest ~3 deep).
+  const MAX_DEPTH: usize = 64;
+  let mut current = HashMap::new();
+  let mut stack: Vec<(HashMap<String, Vdf>, String)> = Vec::new();
+  let mut pending: Option<String> = None;
+  let mut pos = 0;
+  while pos < tokens.len() {
+    let token = &tokens[pos];
+    pos += 1;
+    if token == "}" {
+      // Close current frame into its parent; stray `}` ends the parse.
+      let Some((mut parent, key)) = stack.pop() else {
         break;
-      }
-      if *pos >= tokens.len() {
-        break;
-      }
-      if tokens[*pos] == "{" {
-        *pos += 1;
-        map.insert(key, Vdf::Map(block(tokens, pos)));
-      } else {
-        let value = tokens[*pos].clone();
-        *pos += 1;
-        map.insert(key, Vdf::Str(value));
-      }
+      };
+      parent.insert(key, Vdf::Map(current));
+      current = parent;
+      continue;
     }
-    map
+    if token == "{" {
+      // A `{` needs a pending key; otherwise malformed, skip it.
+      let Some(key) = pending.take() else {
+        continue;
+      };
+      if stack.len() >= MAX_DEPTH {
+        break; // nesting attack: stop, keep what parsed.
+      }
+      stack.push((std::mem::take(&mut current), key));
+      continue;
+    }
+    if let Some(key) = pending.take() {
+      current.insert(key, Vdf::Str(token.clone()));
+    } else {
+      pending = Some(token.clone());
+    }
   }
-  block(tokens, &mut 0)
+  // Unclosed frames (truncated tail): fold back up so the parsed prefix
+  // still yields data instead of nothing. A dangling final key without a
+  // value is dropped, like before.
+  while let Some((mut parent, key)) = stack.pop() {
+    parent.insert(key, Vdf::Map(current));
+    current = parent;
+  }
+  current
 }
 
 /// Parse a whole VDF document into nested maps.
 pub(crate) fn parse_vdf_str(input: &str) -> HashMap<String, Vdf> {
-  parse_vdf(&tokenize(input))
+  let tokens = tokenize(input);
+  // Token-count cap: a 4MB file of quote pairs could otherwise build a
+  // million-entry map. Corrupt/oversized input parses to nothing (the
+  // library is skipped, never the daemon).
+  if tokens.len() > MAX_VDF_TOKENS {
+    return HashMap::new();
+  }
+  parse_vdf(&tokens)
+}
+
+/// Bounds for Steam's own files (see [`read_limited`]): real manifests
+/// are tens of KB; anything bigger is corrupt or hostile.
+const MAX_FOLDERS_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_VDF_TOKENS: usize = 200_000;
+
+/// Read a small text file with a byte cap. Over-cap or non-UTF8 content
+/// is an error the callers already treat as "skip this file".
+fn read_limited(path: &Path, limit: u64) -> Result<String, std::io::Error> {
+  let meta = std::fs::metadata(path)?;
+  if meta.len() > limit {
+    return Err(std::io::Error::new(
+      std::io::ErrorKind::FileTooLarge,
+      "VDF file over size cap",
+    ));
+  }
+  let bytes = std::fs::read(path)?;
+  String::from_utf8(bytes)
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "VDF file not UTF-8"))
 }
 
 /// Library paths from a parsed `libraryfolders.vdf`: new format nests them
@@ -184,7 +245,7 @@ fn file_mtime_ms(path: &Path) -> Option<u64> {
     .ok()?
     .duration_since(UNIX_EPOCH)
     .ok()
-    .map(|age| age.as_millis() as u64)
+    .and_then(|age| u64::try_from(age.as_millis()).ok())
 }
 
 fn dir_fingerprint(apps_dir: &Path) -> Option<Fingerprint> {
@@ -330,7 +391,7 @@ impl SteamLibraries {
   /// already trigger re-collection via the folders-file marker.
   #[hotpath::measure]
   pub(crate) fn refresh_if_stale(&mut self) {
-    self.ticks += 1;
+    self.ticks = self.ticks.saturating_add(1);
     let folders_changed = self.watched.iter().any(|file| {
       std::fs::metadata(file)
         .and_then(|meta| meta.modified())
@@ -466,7 +527,7 @@ impl SteamLibraries {
       if !name.starts_with("appmanifest_") || !name.ends_with(".acf") {
         continue;
       }
-      if let Ok(body) = std::fs::read_to_string(entry.path())
+      if let Ok(body) = read_limited(&entry.path(), MAX_MANIFEST_BYTES)
         && let Some((appid, installdir)) = manifest_ids(&parse_vdf_str(&body))
       {
         dirs
@@ -507,7 +568,7 @@ fn root_libraries(root: &Path) -> (Vec<PathBuf>, Option<PathBuf>) {
   }
   let folders_file = steamapps.join("libraryfolders.vdf");
   let mut libraries = vec![root.to_path_buf()];
-  if let Ok(body) = std::fs::read_to_string(&folders_file) {
+  if let Ok(body) = read_limited(&folders_file, MAX_FOLDERS_BYTES) {
     libraries.extend(
       library_paths(&parse_vdf_str(&body))
         .iter()
@@ -726,7 +787,8 @@ pub(crate) fn mount_library_roots_for(mounts: &str) -> Vec<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn mount_library_roots() -> Vec<PathBuf> {
-  std::fs::read_to_string("/proc/mounts")
+  // Kernel-generated and small in practice; still capped like the rest.
+  read_limited(Path::new("/proc/mounts"), MAX_FOLDERS_BYTES)
     .map(|mounts| mount_library_roots_for(&mounts))
     .unwrap_or_default()
 }
@@ -783,7 +845,7 @@ fn fingerprint_to_json(fingerprint: &Fingerprint) -> serde_json::Value {
 fn fingerprint_from_json(value: &serde_json::Value) -> Option<Fingerprint> {
   Some(Fingerprint {
     dir_mtime_ms: value.get("dir_mtime_ms")?.as_u64()?,
-    manifests: value.get("manifests")?.as_u64()? as usize,
+    manifests: usize::try_from(value.get("manifests")?.as_u64()?).ok()?,
     newest_manifest_ms: value.get("newest_manifest_ms")?.as_u64()?,
   })
 }
@@ -793,7 +855,7 @@ fn load_cache() -> HashMap<String, CachedLibrary> {
   let Some(path) = cache_path() else {
     return cached;
   };
-  let Ok(body) = std::fs::read_to_string(&path) else {
+  let Ok(body) = read_limited(&path, MAX_FOLDERS_BYTES) else {
     return cached;
   };
   let Ok(doc) = serde_json::from_str::<serde_json::Value>(&body) else {

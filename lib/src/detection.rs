@@ -222,16 +222,25 @@ pub struct ThirdPartySku {
 /// reporters, `vcredist.*\.exe$`). The scanner drops these processes
 /// before any matching, so they cost one basename lookup instead of a
 /// full probe chain — and can never shadow a real game.
+///
+/// Hardening: the patterns compile from NETWORK data, so count, length
+/// and compiled size are all capped, invalid patterns are skipped, and
+/// matching runs as one `RegexSet` (single pass, linear-time DFA).
 #[derive(Clone, Debug, Default)]
 pub struct Exclusions {
   /// Lowercased basenames, exact match (hash set: consulted per process
   /// per tick, so O(1) instead of a linear scan over two dozen names).
   pub executables: std::collections::HashSet<String>,
-  /// Compiled case-insensitively (the DB is Windows-centric; matching
-  /// stays correct for Proton paths). Invalid patterns are skipped at
-  /// parse, never fatal.
-  pub patterns: Vec<regex::Regex>,
+  /// Case-insensitive set over the surviving patterns.
+  pub patterns: regex::RegexSet,
 }
+
+/// Caps for network-supplied exclusions (see [`Exclusions`]).
+const MAX_EXCLUSION_NAMES: usize = 1024;
+const MAX_EXCLUSION_PATTERNS: usize = 128;
+const MAX_PATTERN_LEN: usize = 256;
+/// Compiled-size budget for the whole set (bytes of regex program).
+const MAX_PATTERN_BYTES: usize = 1 << 20;
 
 impl Exclusions {
   /// Basename already normalized (lowercase, `/`-separated path): `true`
@@ -243,7 +252,7 @@ impl Exclusions {
     if self.executables.contains(basename) {
       return true;
     }
-    self.patterns.iter().any(|re| re.is_match(basename))
+    self.patterns.is_match(basename)
   }
 }
 
@@ -265,15 +274,40 @@ pub fn parse_exclusions(body: &str) -> Exclusions {
       .filter_map(|e| e.as_str())
       .map(|e| e.trim().to_lowercase())
       .filter(|e| !e.is_empty())
+      .take(MAX_EXCLUSION_NAMES)
       .collect();
   }
   if let Some(patterns) = value.get("patterns").and_then(|v| v.as_array()) {
-    exclusions.patterns = patterns
+    // Validate one by one (a single bad pattern must not kill the set),
+    // then build one case-insensitive RegexSet under a compiled-size
+    // budget. The DB is Windows-centric, so matching stays
+    // case-insensitive for Proton paths.
+    let mut valid: Vec<String> = Vec::new();
+    for pattern in patterns
       .iter()
       .filter_map(|p| p.as_str())
-      .filter(|p| !p.trim().is_empty())
-      .filter_map(|p| regex::Regex::new(&format!("(?i){p}")).ok())
-      .collect();
+      .map(str::trim)
+      .filter(|p| !p.is_empty() && p.len() <= MAX_PATTERN_LEN)
+      .take(MAX_EXCLUSION_PATTERNS)
+    {
+      let ok = regex::RegexBuilder::new(pattern)
+        .case_insensitive(true)
+        .size_limit(64 * 1024)
+        .build()
+        .is_ok();
+      if ok {
+        valid.push(pattern.to_string());
+      }
+    }
+    if !valid.is_empty() {
+      let set = regex::RegexSetBuilder::new(&valid)
+        .case_insensitive(true)
+        .size_limit(MAX_PATTERN_BYTES)
+        .build();
+      if let Ok(set) = set {
+        exclusions.patterns = set;
+      }
+    }
   }
   exclusions
 }

@@ -83,8 +83,6 @@ fn aux_maps_cover_empty_executable_entries() {
 fn aux_match_prefers_steam_then_name() {
   let db = vec![activity("1", "How to Fish", Some("4001890"))];
   let (steam_map, name_map) = build_aux_maps(&db);
-  let steam_map = Mutex::new(steam_map);
-  let name_map = Mutex::new(name_map);
 
   // Steam AppId hit (legit Steam install)
   let hit = match_steam_id(Some("4001890"), 123, &steam_map, &db);
@@ -111,8 +109,6 @@ fn aux_match_falls_back_to_install_folder() {
     activity("2", "Meccha Chameleon", Some("4704690")),
   ];
   let (steam_map, name_map) = build_aux_maps(&db);
-  let steam_map = Mutex::new(steam_map);
-  let name_map = Mutex::new(name_map);
 
   // Hydra-style layout: generic Unreal exe, title only in the folders
   // (wine path, already slash-normalized and lowercased by the caller).
@@ -282,13 +278,18 @@ fn ac_probe_needs_directories_that_cwd_reconstructs() {
     Vec::new(),
     None,
   );
+  let bundle = server.bundle();
   let reversed = |path: &str| path.chars().rev().collect::<String>();
   // Bare exe alone misses (no directories for the suffix to anchor on)...
-  assert!(server.ac_probe(&reversed("/doomx64.exe"), &arcs).is_none());
+  assert!(
+    server
+      .ac_probe(&reversed("/doomx64.exe"), &bundle)
+      .is_none()
+  );
   // ...while the cwd-joined candidate hits the same entry.
   assert_eq!(
     server
-      .ac_probe(&reversed("/games/doom/doomx64.exe"), &arcs)
+      .ac_probe(&reversed("/games/doom/doomx64.exe"), &bundle)
       .map(|(obj, _)| obj.id.clone()),
     Some("424242424242424242".to_string())
   );
@@ -506,36 +507,37 @@ fn proton_automaton_holds_win32_only() {
     ),
   ];
   let server = proton_server(db.clone());
+  let bundle = server.bundle();
   let reversed = |path: &str| path.chars().rev().collect::<String>();
 
   // win32 entry hits (backslash in the DB name is normalized).
   assert_eq!(
     server
-      .proton_probe(&reversed("/games/quest/game.exe"), &db)
+      .proton_probe(&reversed("/games/quest/game.exe"), &bundle)
       .map(|(obj, _)| obj.id.clone()),
     Some("222".to_string())
   );
   // Native entries stay out of the fallback automaton...
   assert!(
     server
-      .proton_probe(&reversed("/native/game"), &db)
+      .proton_probe(&reversed("/native/game"), &bundle)
       .is_none()
   );
   // ...as do launchers.
   assert!(
     server
-      .proton_probe(&reversed("/launcher.exe"), &db)
+      .proton_probe(&reversed("/launcher.exe"), &bundle)
       .is_none()
   );
   // Native automaton is untouched by win32 entries.
   assert!(
     server
-      .ac_probe(&reversed("/games/quest/game.exe"), &db)
+      .ac_probe(&reversed("/games/quest/game.exe"), &bundle)
       .is_none()
   );
   assert_eq!(
     server
-      .ac_probe(&reversed("/native/game"), &db)
+      .ac_probe(&reversed("/native/game"), &bundle)
       .map(|(obj, _)| obj.id.clone()),
     Some("111".to_string())
   );
@@ -565,13 +567,14 @@ fn match_process_detects_win32_game_and_prefers_steam_id() {
                   variant_bufs: &mut [String; 5],
                   reversed_path: &mut String,
                   obs_open: &mut bool| {
+    let bundle = server.bundle();
     server.match_process(
       &Exec {
         pid: u64::MAX,
         path: "C:\\games\\quest\\game.exe".to_string(),
         arguments,
       },
-      &db,
+      &bundle,
       variant_bufs,
       reversed_path,
       obs_open,
@@ -654,7 +657,7 @@ fn aliases_indexed_and_gated() {
   let hit = match_name_or_folder(
     "/games/playerunknown's battlegrounds/tslgame.exe",
     11,
-    &Mutex::new(name_map),
+    &name_map,
     &db,
   );
   assert_eq!(hit.unwrap().id, "1");
@@ -716,13 +719,14 @@ fn match_process_honors_exclusions() {
   let mut obs_open = false;
 
   // Would match via the Proton automaton — excluded first.
+  let bundle = server.bundle();
   let miss = server.match_process(
     &Exec {
       pid: u64::MAX,
       path: "C:\\games\\quest\\game.exe".to_string(),
       arguments: None,
     },
-    &db,
+    &bundle,
     &mut variant_bufs,
     &mut reversed_path,
     &mut obs_open,
@@ -741,6 +745,7 @@ fn match_process_honors_exclusions() {
   server2.set_exclusions(parse_exclusions(
     r#"{"executables": ["game.exe"], "patterns": []}"#,
   ));
+  let bundle2 = server2.bundle();
   let hit = server2
     .match_process(
       &Exec {
@@ -748,7 +753,7 @@ fn match_process_honors_exclusions() {
         path: "/games/quest/launcher-free.exe".to_string(),
         arguments: None,
       },
-      &db2,
+      &bundle2,
       &mut variant_bufs,
       &mut reversed_path,
       &mut obs_open,
@@ -770,6 +775,7 @@ fn ac_matches_mixed_case_without_lowercasing() {
     None,
   )];
   let server = proton_server(db.clone());
+  let bundle = server.bundle();
   let mut variant_bufs: [String; 5] = Default::default();
   let mut reversed_path = String::with_capacity(256);
   let mut obs_open = false;
@@ -786,7 +792,7 @@ fn ac_matches_mixed_case_without_lowercasing() {
           path: path.to_string(),
           arguments: None,
         },
-        &db,
+        &bundle,
         &mut variant_bufs,
         &mut reversed_path,
         &mut obs_open,
@@ -835,6 +841,62 @@ fn idle_wait_stretches_and_caps() {
   );
   // Overflow-safe at the extremes.
   assert_eq!(idle_wait(Duration::MAX, 4), Duration::from_secs(30));
+}
+
+#[test]
+fn concurrent_swap_and_scan_never_tears() {
+  use std::sync::Arc;
+
+  // The hourly refresh swaps the detection bundle while scans (and EXEC
+  // events) classify against it. Generations swap atomically, so any
+  // interleave is safe: this can only fail on a real torn read (index
+  // out of bounds, wrong mapping) — never flake on correct code.
+  // Tiny DB keeps rebuilds cheap; scans read the real /proc table.
+  let db = vec![proton_entry(
+    "444",
+    "Mixed Case",
+    Some(("Mixed/Dir/GAME.EXE", "linux", false)),
+    None,
+  )];
+  let server = Arc::new(proton_server(db));
+  let mut writers = Vec::new();
+  for i in 0..2u32 {
+    let server = server.clone();
+    writers.push(std::thread::spawn(move || {
+      for round in 0..20 {
+        let entry = proton_entry(&format!("custom-{i}-{round}"), "Custom Game", None, None);
+        let entry = Arc::try_unwrap(entry).unwrap_or_else(|shared| (*shared).clone());
+        server.append_detectables(vec![entry]);
+      }
+    }));
+  }
+  for _ in 0..50 {
+    let _ = server.scan_for_processes();
+  }
+  for writer in writers {
+    writer.join().unwrap();
+  }
+  // And the map is still coherent afterwards: the original entry matches
+  // through 40 generation swaps.
+  use crate::server::process::Exec;
+  let bundle = server.bundle();
+  let mut variant_bufs: [String; 5] = Default::default();
+  let mut reversed_path = String::with_capacity(256);
+  let mut obs_open = false;
+  let hit = server
+    .match_process(
+      &Exec {
+        pid: u64::MAX,
+        path: "/games/mixed/dir/game.exe".to_string(),
+        arguments: None,
+      },
+      &bundle,
+      &mut variant_bufs,
+      &mut reversed_path,
+      &mut obs_open,
+    )
+    .expect("map coherent after concurrent swaps");
+  assert_eq!(hit.id, "444");
 }
 
 // --- proc-events netlink parser (F1.5) ---
@@ -891,6 +953,34 @@ fn proc_event_parses_exec_and_exit() {
   // ...and short/corrupt buffers.
   assert_eq!(parse_event(&[]), None);
   assert_eq!(parse_event(&proc_buf(0x2, 1)[..10]), None);
+}
+
+#[test]
+fn vdf_rejects_nesting_attacks_and_truncation() {
+  use crate::server::steam::parse_vdf_str;
+
+  // 10k-deep nesting: iterative parser survives, depth cap stops it.
+  // The shallow prefix still parses (fail-open for data, fail-closed
+  // for the stack).
+  let mut hostile = String::from("\"root\"\n{\n\"ok\" \"yes\"\n");
+  for _ in 0..10_000 {
+    hostile.push_str("\"a\"\n{\n");
+  }
+  let doc = parse_vdf_str(&hostile);
+  assert!(doc.contains_key("root"));
+
+  // Untterminated quote: partial token dropped, prior data kept.
+  let doc = parse_vdf_str("\"a\"\n{\n\"k\" \"v\"\n\"open");
+  let inner = doc.get("a").and_then(|v| match v {
+    crate::server::steam::Vdf::Map(map) => Some(map),
+    _ => None,
+  });
+  // `k/v` parsed before the break; the unterminated tail is gone.
+  assert!(inner.is_some_and(|map| map.get("k").is_some()));
+
+  // Stray closing brace ends the parse instead of corrupting it.
+  let doc = parse_vdf_str("\"a\" \"1\"\n}\n\"b\" \"2\"");
+  assert!(!doc.contains_key("b"));
 }
 
 #[test]
@@ -1029,6 +1119,7 @@ fn match_process_prefers_vdf_over_folder() {
   ];
   let server = proton_server(db.clone());
   server.set_steam_libraries(crate::server::steam::SteamLibraries::from_root(&root));
+  let bundle = server.bundle();
   let mut variant_bufs: [String; 5] = Default::default();
   let mut reversed_path = String::with_capacity(256);
   let mut obs_open = false;
@@ -1044,7 +1135,7 @@ fn match_process_prefers_vdf_over_folder() {
         path: install_path,
         arguments: None,
       },
-      &db,
+      &bundle,
       &mut variant_bufs,
       &mut reversed_path,
       &mut obs_open,
@@ -1071,6 +1162,7 @@ fn match_process_shortcut_id_prefers_name() {
   ];
   let server = proton_server(db.clone());
   server.set_steam_libraries(crate::server::steam::SteamLibraries::from_root(&root));
+  let bundle = server.bundle();
   let mut variant_bufs: [String; 5] = Default::default();
   let mut reversed_path = String::with_capacity(256);
   let mut obs_open = false;
@@ -1087,7 +1179,7 @@ fn match_process_shortcut_id_prefers_name() {
         ),
         arguments,
       },
-      &db,
+      &bundle,
       variant_bufs,
       reversed_path,
       obs_open,

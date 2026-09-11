@@ -28,6 +28,16 @@ mod tests;
 
 pub type ProcessCallback = dyn FnMut(ProcessScanState) + Send + Sync;
 
+/// HTTP agent for Discord fetches (database, exclusions) with a global
+/// timeout: without it, a blackholed endpoint hangs the hourly refresh
+/// thread — or daemon boot — forever. Callers add their own size caps.
+pub fn http_agent(timeout: std::time::Duration) -> ureq::Agent {
+  ureq::Agent::config_builder()
+    .timeout_global(Some(timeout))
+    .build()
+    .into()
+}
+
 /// Minimal game info returned by [`RPCServer::detect_once`].
 #[derive(Clone, Debug)]
 pub struct DetectedGame {
@@ -155,7 +165,7 @@ impl RPCServer {
   pub fn from_file(file: PathBuf, config: RPCConfig) -> Result<Self, Box<dyn std::error::Error>> {
     // Read the detectable games list from file.
     let detectable = std::fs::read_to_string(&file)
-      .unwrap_or_else(|_| panic!("RPCServer could not find file: {:?}", file.display()));
+      .map_err(|err| format!("RPCServer could not find file {:?}: {err}", file.display()))?;
 
     Self::from_json_str(detectable.as_str(), config)
   }
@@ -178,7 +188,7 @@ impl RPCServer {
    */
   pub fn detect_once(&self) -> Result<Vec<DetectedGame>, Box<dyn std::error::Error>> {
     let (tx, _rx) = mpsc::channel();
-    let mut server = ProcessServer::new(
+    let server = ProcessServer::new(
       self
         .detectable
         .lock()
