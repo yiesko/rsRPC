@@ -103,6 +103,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `1/0/true/false/yes/no/on/off` now.
 - Dead re-entrancy guard (`scanning` checked but never set): real RAII
   guard, acquired atomically and released on every exit path.
+- IPC/bridge bind exhaustion no longer panics the daemon: `create_socket`
+  failures surface as typed `RsrpcError::IpcBind` / `WsBind` (keeping the
+  last `io::Error` as source) through the fallible `start()`; `to_fs_name`
+  failures propagate instead of unwrapping.
+- Poison-tolerance gaps closed: the last bare `lock().unwrap()`s on hot
+  paths (bridge, handoff, replay cache, Steam prefix, `start()`) use
+  `into_inner`; double `start()` on any connector is a logged no-op
+  instead of a panic (including a `started` guard on the scan loop).
+- Automaton build failures (pathological DB exceeding builder limits)
+  keep the current generation with a warning instead of panicking the
+  refresh thread or startup; same fail-open as the empty-DB guard.
+- Error fidelity: `InvalidJson` keeps the serde error as `source`;
+  `database_summary` returns `RsrpcError`; bridge bind message lowercased
+  without log prefix; `# Errors` on all fallible constructors.
+- Custom steam SKUs participate in AppId matching (linear fallback,
+  canonical map wins); main patterns beat custom ones across 64-bit
+  path variants (automata probed outer, variants inner) — both
+  regression-tested.
+- Stale AppId race closed: memoized environ carries an invalidation
+  sequence, so an EXEC racing an in-flight read discards (never pins)
+  the pre-exec environ; EXIT-wake debounce peeks before consuming, so a
+  recent tracked EXIT can still wake later.
+- Diagnostics parity: `--list-detected` applies exclusions when hourly
+  updates are on (fail-open fetch, like the daemon); a fetched-but-garbage
+  DB falls back to the bundled snapshot instead of killing boot.
+- Watcher honesty: netlink fallback logs at `warn` (the documented
+  one-line diagnosis for `AF_NETLINK` sandboxing); the boot self-test
+  falls back to polling (never claims live) when it cannot prove
+  delivery; steady-state datagrams sized 64KiB for EXEC storms.
+- Steam provider hardening: cache entries re-validate library ownership
+  on load; fingerprints cover `compatdata` appearances; `read_limited`
+  re-checks size after reading (stat/read TOCTOU); VDF tokenizer caps
+  tokens and counts mid-stream; mounts-table escapes decoded in one pass;
+  library scans capped; `mount_library_roots_for` tested for escapes.
+- Input robustness: WebSocket handlers drop (logged) frames that cannot
+  encode instead of panicking the poll loop; fan-out encode failures and
+  dead-peer IPC replies log at debug; `last_process` bounded like the
+  handoff tables; remaining bool flags (`--list-detected`,
+  `--list-database`) and the logger accept boolish values.
 
 ## [0.32.2] - 2026-09-09
 
