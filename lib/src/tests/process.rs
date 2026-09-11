@@ -81,12 +81,75 @@ fn aux_maps_cover_empty_executable_entries() {
 }
 
 #[test]
+fn aux_match_finds_custom_steam_sku_without_executables() {
+  let db = vec![activity("1", "How to Fish", Some("4001890"))];
+  let (steam_map, _) = build_aux_maps(&db);
+  // Override carrying only a steam distributor id (no executables to
+  // index): invisible to the map, must still match as custom fallback.
+  let custom = vec![activity("9", "Custom Fish Port", Some("1234567"))];
+
+  let hit = match_steam_id(Some("1234567"), 321, &steam_map, &db, &custom);
+  assert_eq!(hit.unwrap().id, "9");
+
+  // Canonical map hits still win over the custom fallback.
+  let hit = match_steam_id(Some("4001890"), 322, &steam_map, &db, &custom);
+  assert_eq!(hit.unwrap().id, "1");
+
+  // Unknown ids miss everywhere.
+  let miss = match_steam_id(Some("7654321"), 323, &steam_map, &db, &custom);
+  assert!(miss.is_none());
+}
+
+#[test]
+fn main_pattern_beats_custom_across_stripped_variants() {
+  use crate::server::process::Exec;
+
+  // Main knows `wow.exe`; the override knows the 64-bit `wow64.exe`.
+  // The stripped variant collides: main must still win (precedence is
+  // per automaton, not per variant).
+  let db = vec![proton_entry(
+    "1",
+    "Wow Game",
+    Some(("wow.exe", "linux", false)),
+    None,
+  )];
+  let server = proton_server(db);
+  let custom = proton_entry(
+    "9",
+    "Custom Wow Port",
+    Some(("wow64.exe", "linux", false)),
+    None,
+  );
+  let custom = Arc::try_unwrap(custom).unwrap_or_else(|shared| (*shared).clone());
+  server.append_detectables(vec![custom]);
+
+  let bundle = server.bundle();
+  let mut variant_bufs: [String; 5] = Default::default();
+  let mut reversed_path = String::with_capacity(256);
+  let mut obs_open = false;
+  let hit = server
+    .match_process(
+      &Exec {
+        pid: u64::MAX,
+        path: "/games/wow/wow64.exe".to_string(),
+        arguments: None,
+      },
+      &bundle,
+      &mut variant_bufs,
+      &mut reversed_path,
+      &mut obs_open,
+    )
+    .expect("stripped variant must match");
+  assert_eq!(hit.id, "1");
+}
+
+#[test]
 fn aux_match_prefers_steam_then_name() {
   let db = vec![activity("1", "How to Fish", Some("4001890"))];
   let (steam_map, name_map) = build_aux_maps(&db);
 
   // Steam AppId hit (legit Steam install)
-  let hit = match_steam_id(Some("4001890"), 123, &steam_map, &db);
+  let hit = match_steam_id(Some("4001890"), 123, &steam_map, &db, &[]);
   assert_eq!(hit.unwrap().id, "1");
 
   // No AppId (launcher shortcut): exe-stem fallback hits the same entry
@@ -123,7 +186,7 @@ fn aux_match_falls_back_to_install_folder() {
 
   // Steam AppId still wins over a conflicting folder name (the folder
   // alone would say "2", the store id says "1").
-  let hit = match_steam_id(Some("4001890"), 202, &steam_map, &db);
+  let hit = match_steam_id(Some("4001890"), 202, &steam_map, &db, &[]);
   assert_eq!(hit.unwrap().id, "1");
   let folder_says = match_name_or_folder(
     "/home/user/steamapps/common/meccha chameleon/game.exe",
@@ -1234,6 +1297,21 @@ fn mount_roots_detect_partition_layouts() {
       .any(|r| r.starts_with("/proc") || r.starts_with("/sys"))
   );
   let _ = std::fs::remove_dir_all(&disk);
+}
+
+#[test]
+fn mount_escapes_decode_octal() {
+  use crate::server::steam::unescape_mount;
+
+  assert_eq!(unescape_mount("/mnt/data"), "/mnt/data");
+  assert_eq!(unescape_mount("/mnt/my\\040disk"), "/mnt/my disk");
+  assert_eq!(unescape_mount("/mnt/a\\012b"), "/mnt/a\nb");
+  assert_eq!(unescape_mount("/mnt/back\\134slash"), "/mnt/back\\slash");
+  // Encoded backslash followed by digits is literal, not a space.
+  assert_eq!(unescape_mount("/mnt/x\\134040"), "/mnt/x\\040");
+  // Truncated/invalid escapes pass through untouched.
+  assert_eq!(unescape_mount("/mnt/tail\\"), "/mnt/tail\\");
+  assert_eq!(unescape_mount("/mnt/x\\4y"), "/mnt/x\\4y");
 }
 
 #[test]

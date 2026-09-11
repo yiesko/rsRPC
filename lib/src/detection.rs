@@ -262,10 +262,13 @@ pub fn parse_exclusions(body: &str) -> Exclusions {
     Err(_) => return exclusions,
   };
   if let Some(executables) = value.get("executables").and_then(|v| v.as_array()) {
+    // ASCII fold, matching the lookup side (`to_ascii_lowercase` on the
+    // basename) and the automaton: one consistent rule, see
+    // `normalize_name`.
     exclusions.executables = executables
       .iter()
       .filter_map(|e| e.as_str())
-      .map(|e| e.trim().to_lowercase())
+      .map(|e| e.trim().to_ascii_lowercase())
       .filter(|e| !e.is_empty())
       .take(MAX_EXCLUSION_NAMES)
       .collect();
@@ -293,13 +296,40 @@ pub fn parse_exclusions(body: &str) -> Exclusions {
       }
     }
     if !valid.is_empty() {
-      let set = regex::RegexSetBuilder::new(&valid)
+      // Keep-fit under the compiled-size budget: if the whole set
+      // overflows, binary-search the longest fitting prefix instead of
+      // disabling every exclusion (one crafted pattern must not disarm
+      // the other 127). Program size grows with the pattern count, so
+      // the fitting range is a prefix search.
+      let mut len = valid.len();
+      if regex::RegexSetBuilder::new(&valid)
         .case_insensitive(true)
         .size_limit(MAX_PATTERN_BYTES)
-        .build();
-      if let Ok(set) = set {
-        exclusions.patterns = set;
+        .build()
+        .is_err()
+      {
+        let mut lo = 0;
+        let mut hi = valid.len();
+        while lo < hi {
+          let mid = (lo + hi).div_ceil(2);
+          if regex::RegexSetBuilder::new(&valid[..mid])
+            .case_insensitive(true)
+            .size_limit(MAX_PATTERN_BYTES)
+            .build()
+            .is_ok()
+          {
+            lo = mid;
+          } else {
+            hi = mid - 1;
+          }
+        }
+        len = lo;
       }
+      exclusions.patterns = regex::RegexSetBuilder::new(&valid[..len])
+        .case_insensitive(true)
+        .size_limit(MAX_PATTERN_BYTES)
+        .build()
+        .unwrap_or_else(|_| regex::RegexSet::empty());
     }
   }
   exclusions

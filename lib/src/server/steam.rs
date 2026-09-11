@@ -48,14 +48,30 @@ pub(crate) enum Vdf {
 /// Tokenize Valve VDF: quoted strings plus braces. Everything else
 /// (whitespace, stray bytes) is skipped — manifests are machine-written,
 /// no need for error recovery beyond "unparseable".
+///
+/// Note: quoted braces (`"{"`) are indistinguishable from structural
+/// ones downstream — a manifest *value* containing a bare brace would
+/// misparse its entry into a skipped map (fail-closed: the library is
+/// dropped, never mis-attributed). Real manifests never contain braces
+/// in values, so a sentinel token type is not worth the churn.
 fn tokenize(input: &str) -> Vec<String> {
+  /// Longest single value kept (real paths/manifest fields are bytes):
+  /// longer quoted runs are consumed but dropped, so a many-MB quoted
+  /// blob cannot balloon one `String`.
+  const MAX_TOKEN_LEN: usize = 64 * 1024;
   let mut tokens = Vec::new();
   let mut chars = input.chars();
   while let Some(char) = chars.next() {
+    // Token-count cap enforced mid-stream (see `MAX_VDF_TOKENS`): stop
+    // early instead of building millions of tokens just to discard them.
+    if tokens.len() >= MAX_VDF_TOKENS {
+      break;
+    }
     match char {
       '"' => {
         let mut string = String::new();
         let mut closed = false;
+        let mut overlong = false;
         loop {
           match chars.next() {
             None => break,
@@ -65,15 +81,30 @@ fn tokenize(input: &str) -> Vec<String> {
             }
             // VDF escapes (`\"`, `\\`): keep the escaped char literally.
             Some('\\') => {
-              if let Some(escaped) = chars.next() {
+              if let Some(escaped) = chars.next()
+                && !overlong
+              {
                 string.push(escaped);
               }
             }
-            Some(char) => string.push(char),
+            Some(char) => {
+              if overlong {
+                continue;
+              }
+              if string.len() >= MAX_TOKEN_LEN {
+                overlong = true;
+                continue;
+              }
+              string.push(char);
+            }
           }
         }
         // Unterminated quote (truncated/corrupt file): drop the partial
         // token instead of merging the rest of the file into it.
+        // Overlong tokens are pushed truncated (not dropped): dropping
+        // would shift key/value pairing and risk mis-attribution, while
+        // a truncated path/id simply fails closed downstream (`is_dir`
+        // misses, AppId lookups miss).
         if closed {
           tokens.push(string);
         }
@@ -99,10 +130,7 @@ fn parse_vdf(tokens: &[String]) -> HashMap<String, Vdf> {
   let mut current = HashMap::new();
   let mut stack: Vec<(HashMap<String, Vdf>, String)> = Vec::new();
   let mut pending: Option<String> = None;
-  let mut pos = 0;
-  while pos < tokens.len() {
-    let token = &tokens[pos];
-    pos += 1;
+  for token in tokens {
     if token == "}" {
       // Close current frame into its parent; stray `}` ends the parse.
       let Some((mut parent, key)) = stack.pop() else {
@@ -159,16 +187,22 @@ const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_VDF_TOKENS: usize = 200_000;
 
 /// Read a small text file with a byte cap. Over-cap or non-UTF8 content
-/// is an error the callers already treat as "skip this file".
+/// is an error the callers already treat as "skip this file". Both the
+/// pre-read stat AND the post-read length are checked: a concurrent
+/// grow/replace (Steam rewriting manifests, symlink swap) between the
+/// two must not bypass the cap.
 fn read_limited(path: &Path, limit: u64) -> Result<String, std::io::Error> {
+  fn too_large() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::FileTooLarge, "VDF file over size cap")
+  }
   let meta = std::fs::metadata(path)?;
   if meta.len() > limit {
-    return Err(std::io::Error::new(
-      std::io::ErrorKind::FileTooLarge,
-      "VDF file over size cap",
-    ));
+    return Err(too_large());
   }
   let bytes = std::fs::read(path)?;
+  if bytes.len() as u64 > limit {
+    return Err(too_large());
+  }
   String::from_utf8(bytes)
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "VDF file not UTF-8"))
 }
@@ -230,15 +264,20 @@ fn common_prefix(library: &str, installdir: &str) -> String {
 }
 
 /// Change marker for one library: steamapps dir mtime, manifest count,
-/// and newest manifest file mtime. Installs, uninstalls, moves and
-/// content edits each change at least one of the three (count covers
-/// add/remove, dir mtime covers rename churn, newest-file covers
-/// in-place rewrites).
+/// newest manifest file mtime, and compatdata dir mtime. Installs,
+/// uninstalls, moves and content edits each change at least one of the
+/// four (count covers add/remove, dir mtime covers rename churn,
+/// newest-file covers in-place rewrites, compatdata covers Proton-prefix
+/// appearances with no manifest change). In-place edits *inside* an
+/// existing pfx without any mtime movement stay invisible until an
+/// unrelated change forces a rescan (fail-closed: miss, never
+/// mis-attribute).
 #[derive(Clone, Debug, PartialEq)]
 struct Fingerprint {
   dir_mtime_ms: u64,
   manifests: usize,
   newest_manifest_ms: u64,
+  compat_mtime_ms: u64,
 }
 
 fn file_mtime_ms(path: &Path) -> Option<u64> {
@@ -254,6 +293,7 @@ fn dir_fingerprint(apps_dir: &Path) -> Option<Fingerprint> {
   let dir_mtime_ms = file_mtime_ms(apps_dir)?;
   let mut manifests = 0;
   let mut newest_manifest_ms = 0;
+  let mut compat_mtime_ms = 0;
   if let Ok(entries) = std::fs::read_dir(apps_dir) {
     for entry in entries.flatten() {
       let name = entry.file_name();
@@ -263,6 +303,12 @@ fn dir_fingerprint(apps_dir: &Path) -> Option<Fingerprint> {
         if let Some(mtime) = file_mtime_ms(&entry.path()) {
           newest_manifest_ms = newest_manifest_ms.max(mtime);
         }
+      } else if name == "compatdata"
+        && let Some(mtime) = file_mtime_ms(&entry.path())
+      {
+        // Proton prefixes appearing with no manifest change (the
+        // never-written-acf case) still move this marker.
+        compat_mtime_ms = compat_mtime_ms.max(mtime);
       }
     }
   }
@@ -270,6 +316,7 @@ fn dir_fingerprint(apps_dir: &Path) -> Option<Fingerprint> {
     dir_mtime_ms,
     manifests,
     newest_manifest_ms,
+    compat_mtime_ms,
   })
 }
 
@@ -294,8 +341,8 @@ pub(crate) struct SteamLibraries {
   /// re-resolves the stored roots only, never the full source list.
   exclusive: bool,
   /// Ticks since last full root re-collection (mounts are re-probed
-  /// every 12th tick, ~60s at the default cadence — not every tick, the
-  /// `/proc` exe sweep is the most expensive discovery source).
+  /// every 30th tick — not every tick, the `/proc` exe sweep is the most
+  /// expensive discovery source).
   ticks: u64,
 }
 
@@ -363,7 +410,11 @@ impl SteamLibraries {
             for (prefix, appid) in dirs {
               libraries.dirs.entry(prefix).or_insert(appid);
             }
-            libraries.fingerprints.insert(key, live.unwrap());
+            // `cached_dirs` is `Some` only when `live` is (see above):
+            // keep the fingerprint without unwrapping the proof apart.
+            if let Some(live) = live {
+              libraries.fingerprints.insert(key, live);
+            }
           }
           None => {
             if libraries.fingerprints.contains_key(&key) {
@@ -508,8 +559,21 @@ impl SteamLibraries {
     let Ok(entries) = std::fs::read_dir(&apps_dir) else {
       return;
     };
+    // Entry-count cap: a stuffed `steamapps/` (junk numeric dirs) must
+    // not turn one rescan into millions of stats. Real libraries hold
+    // dozens of entries; the rest is skipped, never fatal.
+    const MAX_SCAN_ENTRIES: usize = 4096;
     let mut manifests = 0;
+    let mut seen = 0;
     for entry in entries.flatten() {
+      seen += 1;
+      if seen > MAX_SCAN_ENTRIES {
+        debug!(
+          "[Process Scanner] Steam library {} over entry cap, skipping tail",
+          library.display()
+        );
+        break;
+      }
       let name = entry.file_name();
       let name = name.to_string_lossy();
       // Proton prefix without a manifest (deleted/never-written acf):
@@ -725,6 +789,44 @@ fn path_steam_roots() -> Vec<PathBuf> {
   roots
 }
 
+/// Decode `/proc/mounts` octal escapes (`\040` space, `\012` newline,
+/// `\011` tab, `\134` backslash) in one pass: chained `replace` calls
+/// would corrupt an encoded backslash followed by digits (`\134040` is
+/// a literal `\040`, not a space).
+pub(crate) fn unescape_mount(field: &str) -> String {
+  let mut out = String::with_capacity(field.len());
+  let mut chars = field.chars().peekable();
+  while let Some(char) = chars.next() {
+    if char != '\\' {
+      out.push(char);
+      continue;
+    }
+    // Collect up to 3 octal digits without consuming the terminator.
+    let mut code = String::new();
+    while code.len() < 3 {
+      match chars.peek() {
+        Some('0'..='7') => {
+          if let Some(digit) = chars.next() {
+            code.push(digit);
+          }
+        }
+        _ => break,
+      }
+    }
+    if code.len() == 3
+      && let Ok(byte) = u8::from_str_radix(&code, 8)
+    {
+      out.push(byte as char);
+      continue;
+    }
+    // Not an escape (short run, non-octal, or >0xFF): emit literally;
+    // the peeked terminator is still queued for normal handling.
+    out.push('\\');
+    out.push_str(&code);
+  }
+  out
+}
+
 /// Partition-aware probing (Linux): every locally-mounted filesystem is
 /// checked for a handful of conventional library layouts
 /// (`<mnt>/SteamLibrary`, `<mnt>/Steam`, ...). Stats only, startup and
@@ -767,10 +869,11 @@ pub(crate) fn mount_library_roots_for(mounts: &str) -> Vec<PathBuf> {
       continue;
     }
     // Pseudo trees even on real fstypes: never libraries there.
+    // (Checked pre-unescape: escapes never introduce a leading `/`.)
     if mount.starts_with("/proc/") || mount.starts_with("/sys/") || mount.starts_with("/dev/") {
       continue;
     }
-    let mount = mount.replace("\\040", " ");
+    let mount = unescape_mount(mount);
     for layout in LAYOUTS {
       let candidate = if layout.is_empty() {
         PathBuf::from(&mount)
@@ -843,6 +946,7 @@ fn fingerprint_to_json(fingerprint: &Fingerprint) -> serde_json::Value {
     "dir_mtime_ms": fingerprint.dir_mtime_ms,
     "manifests": fingerprint.manifests,
     "newest_manifest_ms": fingerprint.newest_manifest_ms,
+    "compat_mtime_ms": fingerprint.compat_mtime_ms,
   })
 }
 
@@ -851,6 +955,13 @@ fn fingerprint_from_json(value: &serde_json::Value) -> Option<Fingerprint> {
     dir_mtime_ms: value.get("dir_mtime_ms")?.as_u64()?,
     manifests: usize::try_from(value.get("manifests")?.as_u64()?).ok()?,
     newest_manifest_ms: value.get("newest_manifest_ms")?.as_u64()?,
+    // Pre-compat caches lack the field: default 0 forces exactly one
+    // rescan for libraries that actually have compatdata (self-healing;
+    // libraries without it compare 0 == 0 and reuse).
+    compat_mtime_ms: value
+      .get("compat_mtime_ms")
+      .and_then(|v| v.as_u64())
+      .unwrap_or(0),
   })
 }
 
@@ -876,9 +987,20 @@ fn load_cache() -> HashMap<String, CachedLibrary> {
       ) else {
         continue;
       };
+      // Re-validate ownership on load: `save_cache` only writes
+      // well-formed prefixes, but a hand-edited cache could inject e.g.
+      // `"/"` and match every process until the fingerprint moves
+      // (a dirs-only poison never triggers a rescan by itself).
+      let library = Path::new(lib_path.as_str());
       let dirs = dirs
         .iter()
-        .filter_map(|(prefix, appid)| Some((prefix.clone(), appid.as_str()?.to_string())))
+        .filter_map(|(prefix, appid)| {
+          let appid = appid.as_str()?;
+          if appid.is_empty() || !library_owns_prefix(library, prefix) {
+            return None;
+          }
+          Some((prefix.clone(), appid.to_string()))
+        })
         .collect();
       cached.insert(lib_path.clone(), CachedLibrary { fingerprint, dirs });
     }
@@ -896,15 +1018,17 @@ fn save_cache(libraries: &SteamLibraries) {
     return;
   }
   // Invert dirs by owning library (see `library_owns_prefix`): one cache
-  // entry per library keeps validation per-library too.
+  // entry per library keeps validation per-library too. The key set is
+  // snapshotted once: re-cloning it per prefix would be quadratic.
   let mut by_library: HashMap<String, HashMap<String, String>> = HashMap::new();
   for lib_path in libraries.fingerprints.keys() {
     by_library.insert(lib_path.clone(), HashMap::new());
   }
+  let lib_paths: Vec<String> = by_library.keys().cloned().collect();
   for (prefix, appid) in &libraries.dirs {
-    for lib_path in by_library.keys().cloned().collect::<Vec<_>>() {
-      if library_owns_prefix(Path::new(&lib_path), prefix) {
-        if let Some(entry) = by_library.get_mut(&lib_path) {
+    for lib_path in &lib_paths {
+      if library_owns_prefix(Path::new(lib_path), prefix) {
+        if let Some(entry) = by_library.get_mut(lib_path) {
           entry.insert(prefix.clone(), appid.clone());
         }
         break;

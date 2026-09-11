@@ -40,6 +40,12 @@ pub(crate) struct ProcessDetectedEvent {
 
 /// Everything derived from one database generation, swapped atomically.
 ///
+/// The atomic unit is automata, index tables, lists and aux maps. The
+/// independent exclusions filter and Steam roots refresh alongside (two
+/// swaps, not one): a tick may briefly mix generations. Harmless by
+/// construction — exclusions only subtract, roots only add candidates —
+/// so folding them into the bundle would buy nothing.
+///
 /// Rationale: the scanner used to hold the automaton, the index table,
 /// the activity list and the aux maps under SEPARATE locks, replaced one
 /// at a time by the hourly refresh. A scan landing mid-swap then probed a
@@ -68,6 +74,30 @@ pub(crate) struct DetectablesBundle {
   custom_indexes: Vec<[usize; 2]>,
 }
 
+impl DetectablesBundle {
+  /// Blind-but-valid generation for catastrophic automaton build
+  /// failures (network-supplied DB exceeds builder limits): detection
+  /// misses everything instead of panicking the daemon.
+  fn empty() -> Self {
+    Self {
+      list: Vec::new(),
+      ac: build_ac_automaton(&[]).expect("[bug] empty automaton always builds"),
+      indexes: Vec::new(),
+      proton_ac: None,
+      proton_indexes: Vec::new(),
+      steam_map: HashMap::new(),
+      name_map: HashMap::new(),
+      custom: Vec::new(),
+      custom_ac: None,
+      custom_indexes: Vec::new(),
+    }
+  }
+}
+
+/// Memoized SteamAppId plus its invalidation sequence (see
+/// [`ProcessServer::cached_app_id`]): `(sequence, id)`.
+type AppIdMemo = (u64, Option<String>);
+
 #[derive(Clone)]
 pub(crate) struct ProcessServer {
   /// Current detection generation (see [`DetectablesBundle`]): cloned by
@@ -76,6 +106,9 @@ pub(crate) struct ProcessServer {
   /// either.
   detectables: Arc<Mutex<Arc<DetectablesBundle>>>,
   scanning: Arc<AtomicBool>,
+  /// Double-`start` guard: a second scan generation would orphan the
+  /// first loop's wake handle and double-emit EXEC hits.
+  started: Arc<AtomicBool>,
 
   pub event_sender: mpsc::Sender<ProcessDetectedEvent>,
 
@@ -93,7 +126,10 @@ pub(crate) struct ProcessServer {
   /// biggest per-process cost in the profiler). Invalidated by EXEC (the
   /// watcher drops the entry before reclassifying) and by death (swept
   /// every tick against the live pid set). Bounded by live process count.
-  appid_cache: Arc<Mutex<HashMap<u64, Option<String>>>>,
+  /// Each entry carries a sequence number: a `drop_appid` racing an
+  /// in-flight read bumps it, and the stale read is discarded instead of
+  /// pinning a pre-exec environ for the pid lifetime.
+  appid_cache: Arc<Mutex<HashMap<u64, AppIdMemo>>>,
   /// Scan thread handle for early wakeups (proc-events EXIT of a tracked
   /// game). Registered by the scan thread itself on startup.
   scan_wake: Arc<Mutex<Option<std::thread::Thread>>>,
@@ -156,8 +192,6 @@ impl Drop for ScanGuard {
   }
 }
 
-unsafe impl Sync for ProcessServer {}
-
 impl ProcessServer {
   // Eight discovery sources (DB, refresh, ignore-list, exclusions) thread
   // through here; bundling them would churn the public constructor for no
@@ -174,11 +208,18 @@ impl ProcessServer {
     exclusions_url: Option<String>,
   ) -> Self {
     log!("[Process Scanner] Building Aho-Corasick patterns for main detectable activities...");
-    let bundle = Arc::new(build_bundle(detectable, Vec::new()));
+    let bundle = Arc::new(build_bundle(detectable, Vec::new()).unwrap_or_else(|e| {
+      warn!(
+        "[Process Scanner] Bundled database failed to build ({}), starting blind",
+        e
+      );
+      DetectablesBundle::empty()
+    }));
     log!("[Process Scanner] Done!");
 
     let server = ProcessServer {
       scanning: Arc::new(AtomicBool::new(false)),
+      started: Arc::new(AtomicBool::new(false)),
       detectables: Arc::new(Mutex::new(bundle)),
       event_sender,
 
@@ -219,7 +260,16 @@ impl ProcessServer {
       .lock()
       .unwrap_or_else(|e| e.into_inner())
       .clone();
-    let next = Arc::new(build_bundle(current.list.clone(), custom));
+    let next = match build_bundle(current.list.clone(), custom) {
+      Ok(next) => Arc::new(next),
+      Err(e) => {
+        warn!(
+          "[Process Scanner] Refusing custom rebuild ({}), keeping current",
+          e
+        );
+        return;
+      }
+    };
     *self.detectables.lock().unwrap_or_else(|e| e.into_inner()) = next;
     log!("[Process Scanner] Done!");
     // Rebuilt automaton state is lean; the transient scratch is garbage.
@@ -245,7 +295,16 @@ impl ProcessServer {
       .unwrap_or_else(|e| e.into_inner())
       .custom
       .clone();
-    let next = Arc::new(build_bundle(detectable, custom));
+    let next = match build_bundle(detectable, custom) {
+      Ok(next) => Arc::new(next),
+      Err(e) => {
+        warn!(
+          "[Process Scanner] Refusing detectable database update ({}), keeping current",
+          e
+        );
+        return;
+      }
+    };
     *self.detectables.lock().unwrap_or_else(|e| e.into_inner()) = next;
     log!("[Process Scanner] Done!");
     // Fetch string, JSON DOM and trimmed copy are now garbage: hand the
@@ -299,7 +358,7 @@ impl ProcessServer {
     self
       .steam_libraries
       .lock()
-      .unwrap()
+      .unwrap_or_else(|e| e.into_inner())
       .match_prefix(normalized_path)
       .map(str::to_string)
   }
@@ -307,60 +366,86 @@ impl ProcessServer {
   /// SteamAppId for one pid, memoized: environ is kilobytes and never
   /// changes after exec, so re-reading it every 5s per process was pure
   /// waste (profiler: ~5KB of the ~5KB per-process cost). IO happens
-  /// outside the lock; EXEC invalidates via [`ProcessServer::drop_appid`].
+  /// outside the lock; EXEC invalidates via [`ProcessServer::drop_appid`],
+  /// whose sequence bump discards a racing stale read below.
   fn cached_app_id(&self, pid: u64) -> Option<String> {
-    if let Some(cached) = self
+    // Fast path: valid memo, cloned once straight into the return.
+    // A tombstone `(seq, None)` left by EXEC counts as a miss (fresh
+    // environ is read below) but keeps its sequence for staleness.
+    let memo = self
       .appid_cache
       .lock()
       .unwrap_or_else(|e| e.into_inner())
       .get(&pid)
-    {
-      return cached.clone();
-    }
+      .cloned();
+    let seq0 = match memo {
+      Some((_, Some(id))) => return Some(id),
+      Some((seq, None)) => seq,
+      None => 0,
+    };
     let id = read_steam_app_id(pid);
-    self
-      .appid_cache
-      .lock()
-      .unwrap_or_else(|e| e.into_inner())
-      .insert(pid, id.clone());
+    let mut cache = self.appid_cache.lock().unwrap_or_else(|e| e.into_inner());
+    // A racing EXEC invalidated this pid mid-read (sequence bumped) or
+    // the tick swept it: discard the stale environ instead of pinning
+    // it for the pid lifetime.
+    let current = cache.get(&pid).map(|(seq, _)| *seq);
+    if current == Some(seq0) || (current.is_none() && seq0 == 0) {
+      cache.insert(pid, (seq0, id.clone()));
+    }
     id
   }
 
   /// Drop one pid's memoized AppId (EXEC: same pid, new image, possibly
   /// new environ). Called by the proc-events watcher before reclassifying.
+  /// Bumps the sequence so an in-flight [`ProcessServer::cached_app_id`]
+  /// read for the old image is discarded, never stored.
   #[cfg(target_os = "linux")]
   pub(crate) fn drop_appid(&self, pid: u64) {
     self
       .appid_cache
       .lock()
       .unwrap_or_else(|e| e.into_inner())
-      .remove(&pid);
+      .entry(pid)
+      .and_modify(|entry| {
+        entry.0 = entry.0.wrapping_add(1);
+        entry.1 = None;
+      })
+      .or_insert((1, None));
   }
 
   /// Whether a tracked game's EXIT should wake the scan loop early.
-  /// Consumes the pid from the tracked set either way (dead is dead).
-  /// Untracked exits never wake (one HashSet lookup); tracked ones wake
-  /// at most once per second — Proton helpers die constantly, and every
-  /// one of them matches the game, so unwedged wakes would unpark the
-  /// loop several times per second (measured 0.76s effective cadence
-  /// instead of 5s during NFS).
+  /// Untracked exits never wake (one HashSet lookup, consumed either
+  /// way — dead is dead). Tracked ones wake at most once per second:
+  /// a recent EXIT stays tracked so a follow-up EXIT can still wake —
+  /// only an actual wake consumes the pid. Proton helpers die
+  /// constantly, and every one of them matches the game, so unwedged
+  /// wakes would unpark the loop several times per second (measured
+  /// 0.76s effective cadence instead of 5s during NFS).
   #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
   pub(crate) fn should_wake_on_exit(&self, pid: u64) -> bool {
     if !self
       .detected_pids
       .lock()
       .unwrap_or_else(|e| e.into_inner())
-      .remove(&pid)
+      .contains(&pid)
     {
       return false;
     }
-    self
+    let due = self
       .last_scan
       .lock()
       .unwrap_or_else(|e| e.into_inner())
       .elapsed()
       .as_secs()
-      >= 1
+      >= 1;
+    if due {
+      self
+        .detected_pids
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&pid);
+    }
+    due
   }
 
   /// Revalidate the Steam libraries (stats only unless something changed).
@@ -396,6 +481,12 @@ impl ProcessServer {
   }
 
   pub(crate) fn start(&self, scan_interval: Duration) {
+    // Double-start is a caller bug: ignore fail-safe instead of leaking
+    // a second scan/dispatch/watch generation.
+    if self.started.swap(true, std::sync::atomic::Ordering::AcqRel) {
+      warn!("[Process Scanner] Already started, ignoring duplicate start");
+      return;
+    }
     let wait_time = scan_interval;
     let clone = self.clone();
 
@@ -410,6 +501,9 @@ impl ProcessServer {
     // trip and zero parsing, so steady-state RSS never ratchets.
     if clone.enable_db_update && clone.db_url.is_some() {
       let db_clone = clone.clone();
+      // Hoisted once: `db_url` is immutable after `new()`, so the hourly
+      // thread never unwraps an `Option` per iteration.
+      let db_url = db_clone.db_url.clone().expect("[bug] db_url checked above");
       std::thread::spawn(move || {
         // Seeded from the startup fetch when available: the first check
         // is conditional like every other, instead of one guaranteed
@@ -426,8 +520,7 @@ impl ProcessServer {
         loop {
           std::thread::sleep(Duration::from_secs(3600));
           db_clone.refresh_exclusions();
-          let url = db_clone.db_url.clone().unwrap();
-          match fetch_detectable_etag(&url, etag.as_deref(), content_hash) {
+          match fetch_detectable_etag(&db_url, etag.as_deref(), content_hash) {
             Ok(FetchOutcome::Unchanged) => {
               log!(
                 "[Process Scanner] DB check: unchanged (etag {})",
@@ -501,6 +594,11 @@ impl ProcessServer {
         }
         // Track live game pids for the proc-events watcher: only THEIR
         // exits wake us early (a build storm's exits never cause a scan).
+        // Wholesale replace (not merge): a watcher insert racing this
+        // write can be dropped, but the next tick re-derives it from the
+        // live table while the game still runs — and a lost EXIT entry
+        // heals the same way. Bounded staleness (≤1 tick), no growth,
+        // no liveness probe per entry.
         *clone
           .detected_pids
           .lock()
@@ -680,6 +778,12 @@ impl ProcessServer {
   /// Single reversed-path AC probe (main DB, then custom overrides).
   /// Shared lookup half of the scan: direct-path and cwd-joined probes
   /// match identically through here.
+  ///
+  /// Test-only seam: production classifies through [`probe_variants`]
+  /// (see below), which probes every path variant against main before
+  /// any variant reaches custom, for strict precedence. Gated out of
+  /// normal builds so the single-path order cannot drift from it.
+  #[cfg(test)]
   pub(crate) fn ac_probe(
     &self,
     reversed_path: &str,
@@ -687,17 +791,34 @@ impl ProcessServer {
   ) -> Option<(Arc<DetectableActivity>, usize)> {
     // Same-bundle automaton + indexes: the ids this find() returns can
     // only index the table they were built with. No locks, no tearing.
-    if let Some(mat) = bundle.ac.find(reversed_path) {
-      let exe_index = bundle.indexes[mat.pattern().as_usize()];
-      return Some((bundle.list[exe_index[0]].clone(), exe_index[1]));
-    }
-    if let Some(custom_ac) = bundle.custom_ac.as_ref()
-      && let Some(mat) = custom_ac.find(reversed_path)
-    {
-      let exe_index = bundle.custom_indexes[mat.pattern().as_usize()];
-      return Some((bundle.custom[exe_index[0]].clone(), exe_index[1]));
-    }
-    None
+    self
+      .main_probe(reversed_path, bundle)
+      .or_else(|| self.custom_probe(reversed_path, bundle))
+  }
+
+  /// Main-DB half of [`ProcessServer::ac_probe`]: every path variant is
+  /// probed here before any variant reaches custom overrides, so a main
+  /// pattern always beats a custom one regardless of 64-bit stripping.
+  fn main_probe(
+    &self,
+    reversed_path: &str,
+    bundle: &DetectablesBundle,
+  ) -> Option<(Arc<DetectableActivity>, usize)> {
+    let mat = bundle.ac.find(reversed_path)?;
+    let exe_index = bundle.indexes[mat.pattern().as_usize()];
+    Some((bundle.list[exe_index[0]].clone(), exe_index[1]))
+  }
+
+  /// Custom-overrides half of [`ProcessServer::ac_probe`].
+  fn custom_probe(
+    &self,
+    reversed_path: &str,
+    bundle: &DetectablesBundle,
+  ) -> Option<(Arc<DetectableActivity>, usize)> {
+    let custom_ac = bundle.custom_ac.as_ref()?;
+    let mat = custom_ac.find(reversed_path)?;
+    let exe_index = bundle.custom_indexes[mat.pattern().as_usize()];
+    Some((bundle.custom[exe_index[0]].clone(), exe_index[1]))
   }
 
   /// Proton fallback probe (main DB `win32` entries on Linux): same shape
@@ -717,7 +838,11 @@ impl ProcessServer {
 
   /// Shared variant loop: try `path` plus its 64-bit-stripped variants
   /// against the native (`proton = false`) or Proton (`proton = true`)
-  /// automaton. First hit in variant order wins.
+  /// automaton. Precedence is per automaton, not per variant: every
+  /// variant is probed against main first, then every variant against
+  /// custom — so a main pattern always beats a custom one even when
+  /// only a stripped variant collides (e.g. main `wow.exe` vs custom
+  /// `wow64.exe`).
   fn probe_variants(
     &self,
     path: &str,
@@ -727,16 +852,22 @@ impl ProcessServer {
     proton: bool,
   ) -> Option<(Arc<DetectableActivity>, usize)> {
     let variant_count = path_variants_into(path, variant_bufs);
-    for variant in &variant_bufs[..variant_count] {
-      reversed_path.clear();
-      reversed_path.extend(variant.chars().rev());
-      let found = if proton {
-        self.proton_probe(reversed_path, bundle)
-      } else {
-        self.ac_probe(reversed_path, bundle)
-      };
-      if found.is_some() {
-        return found;
+    // Automaton passes outer, variants inner (strict precedence).
+    let passes: usize = if proton { 1 } else { 2 };
+    for pass in 0..passes {
+      for variant in &variant_bufs[..variant_count] {
+        reversed_path.clear();
+        reversed_path.extend(variant.chars().rev());
+        let found = if proton {
+          self.proton_probe(reversed_path, bundle)
+        } else if pass == 0 {
+          self.main_probe(reversed_path, bundle)
+        } else {
+          self.custom_probe(reversed_path, bundle)
+        };
+        if found.is_some() {
+          return found;
+        }
       }
     }
     None
@@ -856,6 +987,7 @@ impl ProcessServer {
           process.pid,
           &bundle.steam_map,
           &bundle.list,
+          &bundle.custom,
         ) {
           return Some(hit);
         }
@@ -890,6 +1022,7 @@ impl ProcessServer {
             process.pid,
             &bundle.steam_map,
             &bundle.list,
+            &bundle.custom,
           )
         {
           debug!(
@@ -1085,7 +1218,9 @@ fn spawn_proc_watcher(server: &ProcessServer) {
   });
   std::thread::spawn(move || {
     if let Err(err) = watch(tx) {
-      debug!("[Process Scanner] proc-events unavailable ({err}), polling only");
+      // Honest by design (and CHANGELOG-promised): this exact line is
+      // how operators diagnose sandboxing that blocks AF_NETLINK.
+      warn!("[Process Scanner] proc-events unavailable ({err}), polling only");
     }
   });
 }
@@ -1114,11 +1249,11 @@ pub(crate) fn read_exec(pid: u64) -> Option<Exec> {
   if cmdline.is_empty() {
     return None;
   }
-  cmdline.truncate(MAX_CMDLINE_BYTES as usize);
+  cmdline.truncate(usize::try_from(MAX_CMDLINE_BYTES).unwrap_or(usize::MAX));
   // Truncation may split a multibyte char: back off to the boundary
-  // instead of dropping the whole process (at most 3 bytes).
-  while !cmdline.is_empty() && std::str::from_utf8(&cmdline).is_err() {
-    cmdline.pop();
+  // in one step (never rescan: `valid_up_to` is the split point).
+  if let Err(err) = std::str::from_utf8(&cmdline) {
+    cmdline.truncate(err.valid_up_to());
   }
   let cmdline = String::from_utf8(cmdline).ok()?;
   let mut cmd_iter = cmdline.split('\0');
@@ -1216,7 +1351,7 @@ fn read_steam_app_id(pid: u64) -> Option<String> {
     .take(MAX_ENVIRON_BYTES + 1)
     .read_to_end(&mut env)
     .ok()?;
-  env.truncate(MAX_ENVIRON_BYTES as usize);
+  env.truncate(usize::try_from(MAX_ENVIRON_BYTES).unwrap_or(usize::MAX));
   for entry in env.split(|b| *b == 0) {
     if let Some(id) = entry.strip_prefix(b"SteamAppId=")
       && let Ok(id) = std::str::from_utf8(id)
@@ -1275,7 +1410,12 @@ pub(crate) fn app_id_from_args(arguments: Option<&str>) -> Option<&str> {
 /// processes: one tiny `stat` read per hit, never per scan.
 #[cfg(target_os = "linux")]
 pub(crate) fn is_suspended(pid: u64) -> bool {
-  std::fs::read_to_string(format!("/proc/{pid}/stat"))
+  // Capped like every other `/proc` read (`stat` is tiny, but the cap
+  // documents the rule has no exceptions).
+  use std::io::Read;
+  let mut stat = String::new();
+  std::fs::File::open(format!("/proc/{pid}/stat"))
+    .and_then(|file| file.take(8 * 1024).read_to_string(&mut stat).map(|_| stat))
     .ok()
     .and_then(|stat| parse_stat_state(&stat))
     .is_some_and(|state| state == 'T' || state == 't')
@@ -1300,9 +1440,14 @@ pub(crate) fn parse_stat_state(stat: &str) -> Option<char> {
     .and_then(|state| state.chars().next())
 }
 
+/// Lowercase-trim a name for map keys and lookups. ASCII-only by
+/// design: every lookup side lowercases ASCII too, and the AC automaton
+/// matches `ascii_case_insensitive` — one consistent rule for a
+/// Windows-centric database, instead of half the paths folding Unicode
+/// and the other half not.
 #[inline]
 fn normalize_name(name: &str) -> String {
-  name.trim().to_lowercase()
+  name.trim().to_ascii_lowercase()
 }
 
 /// Conservative gate for the exe-stem fallback: exact, multi-word names with
@@ -1461,21 +1606,42 @@ pub(crate) fn is_shortcut_id(app_id: &str) -> bool {
 
 /// Authoritative aux lookup: `SteamAppId` (store games with empty
 /// `executables`, legit Steam). Runs before every fuzzy heuristic — a
-/// store id beats path guessing.
+/// store id beats path guessing. Custom overrides participate as a
+/// linear fallback (they are user-sized, not DB-sized): a custom entry
+/// carrying only a steam distributor id matches here, since the map
+/// only indexes the main list. Canonical map hits always win.
 pub(crate) fn match_steam_id(
   steam_app_id: Option<&str>,
   pid: u64,
   steam_map: &HashMap<String, usize>,
   detectable_list: &[Arc<DetectableActivity>],
+  custom: &[Arc<DetectableActivity>],
 ) -> Option<Arc<DetectableActivity>> {
   let appid = steam_app_id?;
-  let &idx = steam_map.get(appid)?;
-  let obj = detectable_list.get(idx)?;
-  debug!(
-    "[Process Scanner] Steam match: {} (appid {})",
-    obj.name, appid
-  );
-  live_or_none(obj, pid)
+  if let Some(&idx) = steam_map.get(appid) {
+    let obj = detectable_list.get(idx)?;
+    debug!(
+      "[Process Scanner] Steam match: {} (appid {})",
+      obj.name, appid
+    );
+    return live_or_none(obj, pid);
+  }
+  // Custom override with a bare steam SKU (no executables to index).
+  for obj in custom {
+    let sku_match = obj.third_party_skus.as_ref().is_some_and(|skus| {
+      skus
+        .iter()
+        .any(|sku| sku.distributor == "steam" && sku.id.as_deref() == Some(appid))
+    });
+    if sku_match {
+      debug!(
+        "[Process Scanner] Steam match (custom): {} (appid {})",
+        obj.name, appid
+      );
+      return live_or_none(obj, pid);
+    }
+  }
+  None
 }
 /// Heuristic aux lookup: exact exe-stem == multi-word
 /// game name, then the install-folder walk. Runs after the Proton AC probe
@@ -1680,13 +1846,15 @@ fn read_cwd(_pid: u64) -> Option<String> {
   None
 }
 
-fn build_ac_patterns(detectables: &[Arc<DetectableActivity>]) -> (AhoCorasick, Vec<[usize; 2]>) {
+fn build_ac_patterns(
+  detectables: &[Arc<DetectableActivity>],
+) -> Result<(AhoCorasick, Vec<[usize; 2]>), aho_corasick::BuildError> {
   build_ac_patterns_with_os_filter(detectables, true)
 }
 
 fn build_ac_patterns_allow_all_os(
   detectables: &[Arc<DetectableActivity>],
-) -> (AhoCorasick, Vec<[usize; 2]>) {
+) -> Result<(AhoCorasick, Vec<[usize; 2]>), aho_corasick::BuildError> {
   build_ac_patterns_with_os_filter(detectables, false)
 }
 
@@ -1697,17 +1865,17 @@ fn build_ac_patterns_allow_all_os(
 fn build_bundle(
   detectable: Vec<Arc<DetectableActivity>>,
   custom: Vec<Arc<DetectableActivity>>,
-) -> DetectablesBundle {
-  let (ac, idx) = build_ac_patterns(&detectable);
-  let (proton_ac, proton_idx) = build_proton_ac_patterns(&detectable);
+) -> Result<DetectablesBundle, aho_corasick::BuildError> {
+  let (ac, idx) = build_ac_patterns(&detectable)?;
+  let (proton_ac, proton_idx) = build_proton_ac_patterns(&detectable)?;
   let (steam_map, name_map) = build_aux_maps(&detectable);
   let (custom_ac, custom_idx) = if custom.is_empty() {
     (None, Vec::new())
   } else {
-    let (ac, idx) = build_ac_patterns_allow_all_os(&custom);
+    let (ac, idx) = build_ac_patterns_allow_all_os(&custom)?;
     (Some(ac), idx)
   };
-  DetectablesBundle {
+  Ok(DetectablesBundle {
     list: detectable,
     ac,
     indexes: idx,
@@ -1718,13 +1886,13 @@ fn build_bundle(
     custom,
     custom_ac,
     custom_indexes: custom_idx,
-  }
+  })
 }
 
 fn build_ac_patterns_with_os_filter(
   detectables: &[Arc<DetectableActivity>],
   enforce_os: bool,
-) -> (AhoCorasick, Vec<[usize; 2]>) {
+) -> Result<(AhoCorasick, Vec<[usize; 2]>), aho_corasick::BuildError> {
   let mut exe_patterns: Vec<String> = Vec::new();
   let mut exe_indexes: Vec<[usize; 2]> = Vec::new();
 
@@ -1749,10 +1917,7 @@ fn build_ac_patterns_with_os_filter(
     }
   }
 
-  (
-    build_ac_automaton(&exe_patterns).expect("[bug] detectable patterns exceed automaton limits"),
-    exe_indexes,
-  )
+  Ok((build_ac_automaton(&exe_patterns)?, exe_indexes))
 }
 
 /// Build the automaton with ASCII case-insensitive matching: process
@@ -1789,11 +1954,11 @@ fn normalize_exe_pattern(name: &str) -> String {
 /// (plus empty indexes) elsewhere, so the probe is a cheap miss off-Linux.
 fn build_proton_ac_patterns(
   detectables: &[Arc<DetectableActivity>],
-) -> (Option<AhoCorasick>, Vec<[usize; 2]>) {
+) -> Result<(Option<AhoCorasick>, Vec<[usize; 2]>), aho_corasick::BuildError> {
   #[cfg(not(target_os = "linux"))]
   {
     let _ = detectables;
-    (None, Vec::new())
+    Ok((None, Vec::new()))
   }
   #[cfg(target_os = "linux")]
   {
@@ -1813,18 +1978,12 @@ fn build_proton_ac_patterns(
     }
 
     if exe_patterns.is_empty() {
-      return (None, Vec::new());
+      return Ok((None, Vec::new()));
     }
     log!(
       "[Process Scanner] Proton fallback: {} win32 patterns",
       exe_patterns.len()
     );
-    (
-      Some(
-        build_ac_automaton(&exe_patterns)
-          .expect("[bug] detectable patterns exceed automaton limits"),
-      ),
-      exe_indexes,
-    )
+    Ok((Some(build_ac_automaton(&exe_patterns)?), exe_indexes))
   }
 }

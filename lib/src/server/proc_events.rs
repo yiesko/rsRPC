@@ -167,6 +167,12 @@ fn subscribe() -> Result<i32, String> {
       );
     }
   }
+  // Explicit init for every meaningful field; padding stays zeroed
+  // (all-zero `sockaddr_nl` padding is the correct value). `nl_pad` is
+  // private in libc 0.2, so full struct-literal init is impossible.
+  // SAFETY: `Padding<u16>` has no validity invariant beyond its bytes,
+  // and `nl_family`/`nl_pid`/`nl_groups` are overwritten below before
+  // `bind` reads the struct.
   let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
   addr.nl_family = libc::AF_NETLINK as u16;
   addr.nl_pid = 0; // kernel picks our port id
@@ -292,16 +298,17 @@ fn self_test(fd: i32) -> bool {
     .iter()
     .find(|path| std::path::Path::new(path).exists());
   let Some(probe) = probe else {
-    // Nowhere to probe with: assume live, polling backstops us anyway.
-    return true;
+    // Nowhere to probe with: fall back to polling (safe direction) —
+    // claiming live without proof hid real outages before.
+    return false;
   };
   // The child must be spawned after our subscribe (its exec postdates
   // it) and reaped whatever happens next.
   let mut child = std::process::Command::new(probe).spawn().ok();
   let live = if child.is_some() {
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; 65536];
     let mut seen = false;
-    // Up to ~1s total (socket timeout bounds each recv): first valid
+    // Up to ~10s total (socket timeout bounds each recv): first valid
     // event proves delivery — it need not be ours, any exec on a live
     // desktop arrives within milliseconds.
     for _ in 0..10 {
@@ -327,7 +334,8 @@ fn self_test(fd: i32) -> bool {
     }
     seen
   } else {
-    true
+    // Spawn failed: unproven, fall back to polling (safe direction).
+    false
   };
   if let Some(mut child) = child.take() {
     let _ = child.wait();
@@ -349,7 +357,10 @@ pub(crate) fn watch(events: mpsc::Sender<ProcEvent>) -> Result<(), String> {
   log!("[Process Scanner] proc-events watcher live (netlink cn_proc)");
   // Back to blocking: the self-test's timeout was temporary.
   set_recv_timeout(fd, None);
-  let mut buf = [0u8; 4096];
+  // 64KiB datagrams: one netlink message is ~76B, so bursts of hundreds
+  // of EXECs under load (build storms) arrive intact instead of being
+  // truncated and dropped wholesale by the length guard below.
+  let mut buf = [0u8; 65536];
   loop {
     let received = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
     if received < 0 {
