@@ -58,7 +58,9 @@ fn load_dir_merges_sorted_and_skips_bad_files() {
 
 #[test]
 fn default_paths_honor_env() {
-  // Save, override, restore: env is process-global.
+  // Save, override, restore: env is process-global (serialized with the
+  // Steam cache test via crate::tests::lock_env).
+  let _guard = crate::tests::lock_env();
   let previous_file = std::env::var("RSRPC_OVERRIDES_FILE").ok();
   let previous_dir = std::env::var("RSRPC_OVERRIDES_DIR").ok();
   unsafe {

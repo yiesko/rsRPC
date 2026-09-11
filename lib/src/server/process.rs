@@ -73,7 +73,7 @@ pub struct ProcessServer {
   /// plus event-driven EXEC hits). Lets the proc-events watcher wake the
   /// scan loop the moment a TRACKED game exits — untracked exits never
   /// cause a scan.
-  detected_pids: Arc<Mutex<HashSet<u64>>>,
+  pub(crate) detected_pids: Arc<Mutex<HashSet<u64>>>,
   /// Memoized SteamAppId per pid: environ never changes after exec, so
   /// one read per process lifetime suffices (environ is kilobytes — the
   /// biggest per-process cost in the profiler). Invalidated by EXEC (the
@@ -83,6 +83,12 @@ pub struct ProcessServer {
   /// Scan thread handle for early wakeups (proc-events EXIT of a tracked
   /// game). Registered by the scan thread itself on startup.
   scan_wake: Arc<Mutex<Option<std::thread::Thread>>>,
+  /// Last scan-loop iteration start. EXIT wakes are debounced against it:
+  /// Proton games spawn/die short-lived helpers constantly, and every one
+  /// of them matches the game — without this, tracked exits unpark the
+  /// loop several times per second (measured 0.76s effective cadence
+  /// instead of 5s during NFS). Minimum 1s between early scans.
+  pub(crate) last_scan: Arc<Mutex<std::time::Instant>>,
   /// Discord detection exclusions (installer/crash-reporter basenames +
   /// regexes): excluded processes are dropped before any matching.
   /// Empty until [`ProcessServer::set_exclusions`] (startup fetch) or the
@@ -160,6 +166,7 @@ impl ProcessServer {
       detected_pids: Arc::new(Mutex::new(HashSet::new())),
       appid_cache: Arc::new(Mutex::new(HashMap::new())),
       scan_wake: Arc::new(Mutex::new(None)),
+      last_scan: Arc::new(Mutex::new(std::time::Instant::now())),
 
       // sysinfo System
       #[cfg(not(target_os = "linux"))]
@@ -241,6 +248,14 @@ impl ProcessServer {
     *self.exclusions.lock().unwrap() = exclusions;
   }
 
+  /// Replace the Steam libraries map. Test-only for now (hence the
+  /// gate): production builds it via discovery in [`ProcessServer::new`]
+  /// and refreshes it per scan tick.
+  #[cfg(test)]
+  pub fn set_steam_libraries(&self, libraries: SteamLibraries) {
+    *self.steam_libraries.lock().unwrap() = libraries;
+  }
+
   /// AppId whose Steam install dir prefixes `normalized_path` (already
   /// lowercased `/`-separated). Cloned out of the lock; tiny strings.
   pub(crate) fn steam_prefix_app_id(&self, normalized_path: &str) -> Option<String> {
@@ -269,6 +284,20 @@ impl ProcessServer {
   /// new environ). Called by the proc-events watcher before reclassifying.
   pub(crate) fn drop_appid(&self, pid: u64) {
     self.appid_cache.lock().unwrap().remove(&pid);
+  }
+
+  /// Whether a tracked game's EXIT should wake the scan loop early.
+  /// Consumes the pid from the tracked set either way (dead is dead).
+  /// Untracked exits never wake (one HashSet lookup); tracked ones wake
+  /// at most once per second — Proton helpers die constantly, and every
+  /// one of them matches the game, so unwedged wakes would unpark the
+  /// loop several times per second (measured 0.76s effective cadence
+  /// instead of 5s during NFS).
+  pub(crate) fn should_wake_on_exit(&self, pid: u64) -> bool {
+    if !self.detected_pids.lock().unwrap().remove(&pid) {
+      return false;
+    }
+    self.last_scan.lock().unwrap().elapsed().as_secs() >= 1
   }
 
   /// Revalidate the Steam libraries (stats only unless something changed).
@@ -380,6 +409,7 @@ impl ProcessServer {
       let mut idle_ticks: u32 = 0;
       // Run the process scan repeatedly (base cadence, stretched while idle)
       loop {
+        *clone.last_scan.lock().unwrap() = std::time::Instant::now();
         let mut detected = match clone.scan_for_processes() {
           Ok(detected) => detected,
           Err(err) => {
@@ -953,9 +983,9 @@ fn spawn_proc_watcher(server: &ProcessServer) {
           }
         }
         ProcEvent::Exit(pid) => {
-          // Only tracked games wake the scan: the rest of the system's
-          // exits (build storms included) cost one HashSet lookup.
-          if dispatch.detected_pids.lock().unwrap().remove(&pid)
+          // Only tracked games MAY wake the scan — decided in one place
+          // so the debounce is unit-testable (see below).
+          if dispatch.should_wake_on_exit(pid)
             && let Some(thread) = dispatch.scan_wake.lock().unwrap().as_ref()
           {
             thread.unpark();

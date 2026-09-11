@@ -221,6 +221,15 @@ pub struct SteamLibraries {
   dirs: HashMap<String, String>,
   /// Library path (string form) -> fingerprint at last scan.
   fingerprints: HashMap<String, Fingerprint>,
+  /// Roots this map was built from. Refresh re-resolves libraries from
+  /// THESE roots — never a fresh environment sweep — so an exclusive
+  /// source (`RSRPC_STEAM_ROOT`, injected layouts) is never diluted by
+  /// re-discovery. Fresh mounts are picked up by re-resolving (mounts
+  /// are probed per root via their folders files... see below).
+  roots: Vec<PathBuf>,
+  /// True when discovery was exclusive (explicit root override): refresh
+  /// re-resolves the stored roots only, never the full source list.
+  exclusive: bool,
   /// Ticks since last full root re-collection (mounts are re-probed
   /// every 12th tick, ~60s at the default cadence — not every tick, the
   /// `/proc` exe sweep is the most expensive discovery source).
@@ -228,6 +237,31 @@ pub struct SteamLibraries {
 }
 
 impl SteamLibraries {
+  /// Build from one explicit root, parsing unconditionally (custom
+  /// installs, tooling, tests). Empty when the root holds no Steam layout.
+  /// Prefer [`SteamLibraries::discover`] in production: it consults the
+  /// on-disk cache and every discovery source. Test-only for now (hence
+  /// the gate): production has no caller yet.
+  #[cfg(test)]
+  pub fn from_root(root: &Path) -> Self {
+    let mut libraries = Self {
+      roots: vec![root.to_path_buf()],
+      exclusive: true,
+      ..Default::default()
+    };
+    let (libs, folders_file) = root_libraries(root);
+    if let Some(file) = folders_file {
+      if let Ok(mtime) = std::fs::metadata(&file).and_then(|meta| meta.modified()) {
+        libraries.mtimes.insert(file.clone(), mtime);
+      }
+      libraries.watched.push(file);
+    }
+    for lib in libs {
+      libraries.scan_library(&lib);
+    }
+    libraries
+  }
+
   /// Full discovery: collect roots from every source, resolve them to
   /// libraries, reuse the on-disk cache wherever fingerprints still
   /// match, parse only what is new or changed.
@@ -236,7 +270,10 @@ impl SteamLibraries {
     let cached = load_cache();
     let mut scanned = 0;
     let mut reused = 0;
-    for root in collect_roots() {
+    let roots = collect_roots();
+    libraries.roots = roots.clone();
+    libraries.exclusive = custom_root().is_some();
+    for root in roots {
       let (libs, folders_file) = root_libraries(&root);
       if let Some(file) = folders_file {
         if let Ok(mtime) = std::fs::metadata(&file).and_then(|meta| meta.modified()) {
@@ -287,9 +324,10 @@ impl SteamLibraries {
 
   /// Revalidate once per scan tick: one stat per watched file plus one
   /// fingerprint per known library; only new or changed libraries pay
-  /// for manifest parsing. Vanished libraries are dropped. Every 12th
-  /// tick the roots themselves are re-collected (fresh mounts), since
-  /// the `/proc` exe sweep is too expensive for every tick.
+  /// for manifest parsing. Vanished libraries are dropped. Every 30th
+  /// tick the roots themselves are re-collected (fresh mounts): the
+  /// `/proc` exe sweep costs ~5ms, so not every tick — and installs
+  /// already trigger re-collection via the folders-file marker.
   #[hotpath::measure]
   pub(crate) fn refresh_if_stale(&mut self) {
     self.ticks += 1;
@@ -304,13 +342,22 @@ impl SteamLibraries {
     // marker moved or the mount-probe tick hit, else re-fingerprint the
     // known libraries.
     let mut libs: Vec<PathBuf>;
-    if folders_changed || self.ticks.is_multiple_of(12) {
+    if folders_changed || self.ticks.is_multiple_of(30) {
       if folders_changed {
         debug!("[Process Scanner] Steam folders changed, re-resolving libraries");
       }
+      // Re-resolve from the SAME source discovery used: an exclusive map
+      // (explicit override, injected layouts) re-resolves its stored
+      // roots only and is never diluted by re-discovery. Otherwise
+      // re-collect everything (new disks, new mounts) and remember it.
+      let roots = if self.exclusive {
+        self.roots.clone()
+      } else {
+        collect_roots()
+      };
       libs = Vec::new();
-      for root in collect_roots() {
-        let (root_libs, folders_file) = root_libraries(&root);
+      for root in &roots {
+        let (root_libs, folders_file) = root_libraries(root);
         if let Some(file) = folders_file {
           if let Ok(mtime) = std::fs::metadata(&file).and_then(|meta| meta.modified()) {
             self.mtimes.insert(file.clone(), mtime);
@@ -320,6 +367,9 @@ impl SteamLibraries {
           }
         }
         libs.extend(root_libs);
+      }
+      if !self.exclusive {
+        self.roots = roots;
       }
       libs.sort();
       libs.dedup();
@@ -474,14 +524,18 @@ fn root_libraries(root: &Path) -> (Vec<PathBuf>, Option<PathBuf>) {
   (libraries, Some(folders_file))
 }
 
+/// Explicit root override (`RSRPC_STEAM_ROOT` pointing at an existing
+/// directory): exclusive — nothing else is consulted.
+fn custom_root() -> Option<PathBuf> {
+  let custom = PathBuf::from(std::env::var(STEAM_ROOT_ENV).ok()?);
+  custom.is_dir().then_some(custom)
+}
+
 /// Every candidate root, duplicates removed: explicit override (exclusive),
 /// user list, running processes, PATH, mounted partitions, home fallbacks.
 fn collect_roots() -> Vec<PathBuf> {
-  if let Ok(custom) = std::env::var(STEAM_ROOT_ENV) {
-    let custom = PathBuf::from(custom);
-    if custom.is_dir() {
-      return vec![custom];
-    }
+  if let Some(custom) = custom_root() {
+    return vec![custom];
   }
   let mut candidates = Vec::new();
   if let Ok(extra) = std::env::var(STEAM_LIBRARIES_ENV) {

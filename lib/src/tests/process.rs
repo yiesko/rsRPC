@@ -797,6 +797,26 @@ fn ac_matches_mixed_case_without_lowercasing() {
 }
 
 #[test]
+fn exit_wake_fires_once_per_second_per_tracked_pid() {
+  use std::time::{Duration, Instant};
+
+  let db = vec![proton_entry("123", "Vdf Game", None, Some("12345"))];
+  let server = proton_server(db);
+
+  // Untracked pid: never wakes, nothing consumed.
+  assert!(!server.should_wake_on_exit(111));
+
+  // Tracked pid, last scan 2s ago: wakes once, pid consumed...
+  server.detected_pids.lock().unwrap().insert(222);
+  *server.last_scan.lock().unwrap() = Instant::now() - Duration::from_secs(2);
+  assert!(server.should_wake_on_exit(222));
+  // ...and the same exit right after does not wake again.
+  server.detected_pids.lock().unwrap().insert(222);
+  *server.last_scan.lock().unwrap() = Instant::now();
+  assert!(!server.should_wake_on_exit(222));
+}
+
+#[test]
 fn idle_wait_stretches_and_caps() {
   use std::time::Duration;
 
@@ -940,106 +960,59 @@ fn fake_steam_root(tag: &str, manifests: &[(&str, &str)]) -> std::path::PathBuf 
   root
 }
 
-/// Hermetic fake cache dir, unique per test (sharing one across tests
-/// flakes through cache-file races, even serialized ones).
-fn fake_cache_dir(tag: &str) -> std::path::PathBuf {
-  std::env::temp_dir().join(format!("rsrpc-cache-{}-{tag}", std::process::id()))
-}
-
-/// Serializes the tests that borrow process-global env (`RSRPC_STEAM_ROOT`,
-/// `XDG_CACHE_HOME`): each fake root is a unique temp dir, but the
-/// variables themselves are shared, so exactly one of these tests runs at
-/// a time. Restores every variable afterwards.
-static STEAM_ENV_LOCK: Mutex<()> = Mutex::new(());
-
-/// Run `f` with the Steam env pointed at fake dirs; restore afterwards.
-/// Poison-proof: a panicking holder must not wedge the rest of the suite.
-fn with_steam_env(
-  root: Option<&std::path::Path>,
-  cache: Option<&std::path::Path>,
-  f: impl FnOnce(),
-) {
-  let _guard = STEAM_ENV_LOCK
-    .lock()
-    .unwrap_or_else(|poisoned| poisoned.into_inner());
-  let previous_root = std::env::var("RSRPC_STEAM_ROOT").ok();
-  let previous_cache = std::env::var("XDG_CACHE_HOME").ok();
-  unsafe {
-    match root {
-      Some(root) => std::env::set_var("RSRPC_STEAM_ROOT", root),
-      None => std::env::remove_var("RSRPC_STEAM_ROOT"),
-    }
-    match cache {
-      Some(cache) => std::env::set_var("XDG_CACHE_HOME", cache),
-      None => std::env::remove_var("XDG_CACHE_HOME"),
-    }
-  }
-  f();
-  unsafe {
-    match previous_root {
-      Some(value) => std::env::set_var("RSRPC_STEAM_ROOT", value),
-      None => std::env::remove_var("RSRPC_STEAM_ROOT"),
-    }
-    match previous_cache {
-      Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
-      None => std::env::remove_var("XDG_CACHE_HOME"),
-    }
-  }
-}
-
 #[test]
 fn steam_libraries_match_prefix_and_refresh() {
   use std::time::SystemTime;
 
-  let root = fake_steam_root("prefix", &[("12345", "Vdf Game")]);
-  let cache = fake_cache_dir("prefix");
-  with_steam_env(Some(&root), Some(&cache), || {
-    let db = vec![proton_entry("123", "Vdf Game", None, Some("12345"))];
-    let server = proton_server(db);
-    let prefix = format!(
-      "{}/steamapps/common/vdf game/",
-      root.to_string_lossy().to_lowercase()
-    );
-    // Case-insensitive prefix hit (query arrives lowercased from scanner).
-    assert_eq!(
-      server.steam_prefix_app_id(&format!("{prefix}game.exe")),
-      Some("12345".to_string())
-    );
-    // Outside every install dir: no match.
-    assert!(server.steam_prefix_app_id("/usr/bin/fish").is_none());
+  use crate::server::steam::SteamLibraries;
 
-    // Rewrite the manifest under a new name with a bumped folders mtime:
-    // the next staleness check rebuilds instead of serving the old prefix.
-    std::fs::write(
-      root.join("steamapps/appmanifest_12345.acf"),
-      "\"AppState\"\n{\n\"appid\"\t\t\"12345\"\n\"installdir\"\t\t\"Renamed Game\"\n}",
-    )
+  // Direct injection (no env): hermetic by construction, no races possible.
+  let root = fake_steam_root("prefix", &[("12345", "Vdf Game")]);
+  let db = vec![proton_entry("123", "Vdf Game", None, Some("12345"))];
+  let server = proton_server(db);
+  server.set_steam_libraries(SteamLibraries::from_root(&root));
+  let prefix = format!(
+    "{}/steamapps/common/vdf game/",
+    root.to_string_lossy().to_lowercase()
+  );
+  // Case-insensitive prefix hit (query arrives lowercased from scanner).
+  assert_eq!(
+    server.steam_prefix_app_id(&format!("{prefix}game.exe")),
+    Some("12345".to_string())
+  );
+  // Outside every install dir: no match.
+  assert!(server.steam_prefix_app_id("/usr/bin/fish").is_none());
+
+  // Rewrite the manifest under a new name with a bumped folders mtime:
+  // the next staleness check rebuilds instead of serving the old prefix.
+  std::fs::write(
+    root.join("steamapps/appmanifest_12345.acf"),
+    "\"AppState\"\n{\n\"appid\"\t\t\"12345\"\n\"installdir\"\t\t\"Renamed Game\"\n}",
+  )
+  .unwrap();
+  let folders = root.join("steamapps/libraryfolders.vdf");
+  let future = SystemTime::now() + std::time::Duration::from_secs(60);
+  std::fs::File::options()
+    .write(true)
+    .open(&folders)
+    .unwrap()
+    .set_modified(future)
     .unwrap();
-    let folders = root.join("steamapps/libraryfolders.vdf");
-    let future = SystemTime::now() + std::time::Duration::from_secs(60);
-    std::fs::File::options()
-      .write(true)
-      .open(&folders)
-      .unwrap()
-      .set_modified(future)
-      .unwrap();
-    server.refresh_steam_libraries();
-    assert!(
-      server
-        .steam_prefix_app_id(&format!("{prefix}game.exe"))
-        .is_none()
-    );
-    let renamed = format!(
-      "{}/steamapps/common/renamed game/",
-      root.to_string_lossy().to_lowercase()
-    );
-    assert_eq!(
-      server.steam_prefix_app_id(&format!("{renamed}game.exe")),
-      Some("12345".to_string())
-    );
-  });
+  server.refresh_steam_libraries();
+  assert!(
+    server
+      .steam_prefix_app_id(&format!("{prefix}game.exe"))
+      .is_none()
+  );
+  let renamed = format!(
+    "{}/steamapps/common/renamed game/",
+    root.to_string_lossy().to_lowercase()
+  );
+  assert_eq!(
+    server.steam_prefix_app_id(&format!("{renamed}game.exe")),
+    Some("12345".to_string())
+  );
   let _ = std::fs::remove_dir_all(&root);
-  let _ = std::fs::remove_dir_all(&cache);
 }
 
 #[test]
@@ -1050,38 +1023,35 @@ fn match_process_prefers_vdf_over_folder() {
   // says AppId 777777 ("Steam Other"). With no launcher AppId, the
   // library wins over guessing.
   let root = fake_steam_root("precedence", &[("777777", "Meccha Chameleon")]);
-  let cache = fake_cache_dir("precedence");
-  with_steam_env(Some(&root), Some(&cache), || {
-    let db = vec![
-      proton_entry("888", "Meccha Chameleon", None, None),
-      proton_entry("999", "Steam Other", None, Some("777777")),
-    ];
-    let server = proton_server(db.clone());
-    let mut variant_bufs: [String; 5] = Default::default();
-    let mut reversed_path = String::with_capacity(256);
-    let mut obs_open = false;
+  let db = vec![
+    proton_entry("888", "Meccha Chameleon", None, None),
+    proton_entry("999", "Steam Other", None, Some("777777")),
+  ];
+  let server = proton_server(db.clone());
+  server.set_steam_libraries(crate::server::steam::SteamLibraries::from_root(&root));
+  let mut variant_bufs: [String; 5] = Default::default();
+  let mut reversed_path = String::with_capacity(256);
+  let mut obs_open = false;
 
-    let install_path = format!(
-      "{}/steamapps/common/meccha chameleon/game.exe",
-      root.to_string_lossy().to_lowercase()
-    );
-    let hit = server
-      .match_process(
-        &Exec {
-          pid: u64::MAX,
-          path: install_path,
-          arguments: None,
-        },
-        &db,
-        &mut variant_bufs,
-        &mut reversed_path,
-        &mut obs_open,
-      )
-      .expect("steam library must match");
-    assert_eq!(hit.id, "999");
-  });
+  let install_path = format!(
+    "{}/steamapps/common/meccha chameleon/game.exe",
+    root.to_string_lossy().to_lowercase()
+  );
+  let hit = server
+    .match_process(
+      &Exec {
+        pid: u64::MAX,
+        path: install_path,
+        arguments: None,
+      },
+      &db,
+      &mut variant_bufs,
+      &mut reversed_path,
+      &mut obs_open,
+    )
+    .expect("steam library must match");
+  assert_eq!(hit.id, "999");
   let _ = std::fs::remove_dir_all(&root);
-  let _ = std::fs::remove_dir_all(&cache);
 }
 
 #[test]
@@ -1095,58 +1065,55 @@ fn match_process_shortcut_id_prefers_name() {
   // A small unknown id (real game missing from the DB) keeps the
   // library-first order instead.
   let root = fake_steam_root("shortcut", &[("777777", "Meccha Chameleon")]);
-  let cache = fake_cache_dir("shortcut");
-  with_steam_env(Some(&root), Some(&cache), || {
-    let db = vec![
-      proton_entry("888", "Meccha Chameleon", None, None),
-      proton_entry("999", "Steam Other", None, Some("777777")),
-    ];
-    let server = proton_server(db.clone());
-    let mut variant_bufs: [String; 5] = Default::default();
-    let mut reversed_path = String::with_capacity(256);
-    let mut obs_open = false;
-    let classify = |arguments: Option<String>,
-                    variant_bufs: &mut [String; 5],
-                    reversed_path: &mut String,
-                    obs_open: &mut bool| {
-      server.match_process(
-        &Exec {
-          pid: u64::MAX,
-          path: format!(
-            "{}/steamapps/common/meccha chameleon/game.exe",
-            root.to_string_lossy().to_lowercase()
-          ),
-          arguments,
-        },
-        &db,
-        variant_bufs,
-        reversed_path,
-        obs_open,
-      )
-    };
-
-    // Shortcut-range id, unknown to the DB: folder ("888") wins.
-    let hit = classify(
-      Some("reaper SteamLaunch AppId=2999999999 -- /games/other".to_string()),
-      &mut variant_bufs,
-      &mut reversed_path,
-      &mut obs_open,
+  let db = vec![
+    proton_entry("888", "Meccha Chameleon", None, None),
+    proton_entry("999", "Steam Other", None, Some("777777")),
+  ];
+  let server = proton_server(db.clone());
+  server.set_steam_libraries(crate::server::steam::SteamLibraries::from_root(&root));
+  let mut variant_bufs: [String; 5] = Default::default();
+  let mut reversed_path = String::with_capacity(256);
+  let mut obs_open = false;
+  let classify = |arguments: Option<String>,
+                  variant_bufs: &mut [String; 5],
+                  reversed_path: &mut String,
+                  obs_open: &mut bool| {
+    server.match_process(
+      &Exec {
+        pid: u64::MAX,
+        path: format!(
+          "{}/steamapps/common/meccha chameleon/game.exe",
+          root.to_string_lossy().to_lowercase()
+        ),
+        arguments,
+      },
+      &db,
+      variant_bufs,
+      reversed_path,
+      obs_open,
     )
-    .expect("folder must match for shortcut ids");
-    assert_eq!(hit.id, "888");
+  };
 
-    // Small unknown id (real game not in the DB yet): library ("999").
-    let hit = classify(
-      Some("reaper SteamLaunch AppId=9876543 -- /games/other".to_string()),
-      &mut variant_bufs,
-      &mut reversed_path,
-      &mut obs_open,
-    )
-    .expect("library must match for small unknown ids");
-    assert_eq!(hit.id, "999");
-  });
+  // Shortcut-range id, unknown to the DB: folder ("888") wins.
+  let hit = classify(
+    Some("reaper SteamLaunch AppId=2999999999 -- /games/other".to_string()),
+    &mut variant_bufs,
+    &mut reversed_path,
+    &mut obs_open,
+  )
+  .expect("folder must match for shortcut ids");
+  assert_eq!(hit.id, "888");
+
+  // Small unknown id (real game not in the DB yet): library ("999").
+  let hit = classify(
+    Some("reaper SteamLaunch AppId=9876543 -- /games/other".to_string()),
+    &mut variant_bufs,
+    &mut reversed_path,
+    &mut obs_open,
+  )
+  .expect("library must match for small unknown ids");
+  assert_eq!(hit.id, "999");
   let _ = std::fs::remove_dir_all(&root);
-  let _ = std::fs::remove_dir_all(&cache);
 }
 
 #[test]
@@ -1181,35 +1148,52 @@ fn mount_roots_detect_partition_layouts() {
 fn steam_cache_roundtrip_and_corrupt_fallback() {
   use crate::server::steam::SteamLibraries;
 
+  // Sole test borrowing process-global env (serialized with the
+  // overrides test via crate::tests::lock_env).
+  let _guard = crate::tests::lock_env();
   let root = fake_steam_root("cache", &[("12345", "Vdf Game")]);
-  let cache = fake_cache_dir("cache");
+  let cache = std::env::temp_dir().join(format!("rsrpc-cache-{}", std::process::id()));
   let _ = std::fs::remove_dir_all(&cache);
-  with_steam_env(Some(&root), Some(&cache), || {
-    // First discovery parses and persists the cache.
-    let libraries = SteamLibraries::discover();
-    assert_eq!(
-      libraries.match_prefix(&format!(
-        "{}/steamapps/common/vdf game/game.exe",
-        root.to_string_lossy().to_lowercase()
-      )),
-      Some("12345")
-    );
-    let cache_file = cache.join("rsrpc/steam-libraries.json");
-    let body = std::fs::read_to_string(&cache_file).expect("cache must be written");
-    assert!(body.contains("\"version\":1"));
-    assert!(body.contains("12345"));
+  let previous_root = std::env::var("RSRPC_STEAM_ROOT").ok();
+  let previous_cache = std::env::var("XDG_CACHE_HOME").ok();
+  unsafe {
+    std::env::set_var("RSRPC_STEAM_ROOT", &root);
+    std::env::set_var("XDG_CACHE_HOME", &cache);
+  }
+  // First discovery parses and persists the cache.
+  let libraries = SteamLibraries::discover();
+  assert_eq!(
+    libraries.match_prefix(&format!(
+      "{}/steamapps/common/vdf game/game.exe",
+      root.to_string_lossy().to_lowercase()
+    )),
+    Some("12345")
+  );
+  let cache_file = cache.join("rsrpc/steam-libraries.json");
+  let body = std::fs::read_to_string(&cache_file).expect("cache must be written");
+  assert!(body.contains("\"version\":1"));
+  assert!(body.contains("12345"));
 
-    // Corrupt cache degrades to a full parse, never an error.
-    std::fs::write(&cache_file, "{not json").unwrap();
-    let libraries = SteamLibraries::discover();
-    assert_eq!(
-      libraries.match_prefix(&format!(
-        "{}/steamapps/common/vdf game/game.exe",
-        root.to_string_lossy().to_lowercase()
-      )),
-      Some("12345")
-    );
-  });
+  // Corrupt cache degrades to a full parse, never an error.
+  std::fs::write(&cache_file, "{not json").unwrap();
+  let libraries = SteamLibraries::discover();
+  assert_eq!(
+    libraries.match_prefix(&format!(
+      "{}/steamapps/common/vdf game/game.exe",
+      root.to_string_lossy().to_lowercase()
+    )),
+    Some("12345")
+  );
+  unsafe {
+    match previous_root {
+      Some(value) => std::env::set_var("RSRPC_STEAM_ROOT", value),
+      None => std::env::remove_var("RSRPC_STEAM_ROOT"),
+    }
+    match previous_cache {
+      Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
+      None => std::env::remove_var("XDG_CACHE_HOME"),
+    }
+  }
   let _ = std::fs::remove_dir_all(&root);
   let _ = std::fs::remove_dir_all(&cache);
 }
