@@ -147,6 +147,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   then a de-dotted twin map (`undotted_names`, canonical-first ties) is
   consulted — exact matches always win. Punctuation forbidden in Windows
   filenames (`: ? " < > | * / \`) already folds in `normalize_name`.
+- Observability without debug builds: boot logs the database source and
+  entry count (`fetched-direct/trimmed/bundled-fallback`, `file`,
+  `bundled`, `empty`); the scan loop logs first sightings per game id
+  per boot at INFO (bounded, same cadence as bridge publishes). A silent
+  daemon is now distinguishable from a blind scanner.
+- Native-presence capture: a peer that connects but never handshakes
+  (bailed SDK probe, crashed launcher) logs one INFO line instead of
+  debug-only, so clients the bridge never identifies leave a trace.
 
 ## [0.32.2] - 2026-09-09
 

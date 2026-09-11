@@ -136,10 +136,20 @@ pub(crate) fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut Stream) {
     match buffer.by_ref().take(4).read_exact(&mut packet_type) {
       Ok(_) => (),
       Err(err) => {
-        debug!(
-          "[IPC] Error reading packet type: {}, socket likely closed",
-          err
-        );
+        // A peer that never handshaked (SDK probe that bailed, port
+        // scanner, crashed launcher) is worth one INFO line: it is the
+        // only trace of clients the bridge never identifies, e.g. a
+        // native SDK rejecting our handshake observations. Graceful
+        // closes arrive as Close frames (logged separately); post-
+        // handshake abrupt closes stay in debug (routine: Alt+F4, kills).
+        if !ipc.handshake() {
+          log!("[IPC] Client disconnected before handshake: {}", err);
+        } else {
+          debug!(
+            "[IPC] Error reading packet type: {}, socket likely closed",
+            err
+          );
+        }
 
         // Send empty activity
         send_empty(ipc.event_sender(), current_pid)
