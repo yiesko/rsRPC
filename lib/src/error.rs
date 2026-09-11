@@ -13,8 +13,13 @@ pub type Result<T> = std::result::Result<T, RsrpcError>;
 #[derive(Debug, Error)]
 pub enum RsrpcError {
   /// Caller-supplied JSON (database, overrides) failed to parse.
-  #[error("invalid JSON provided to RPCServer: {0}")]
-  InvalidJson(String),
+  /// Keeps the serde error as `source` (line/column/classification)
+  /// instead of only its `Display` text.
+  #[error("invalid JSON provided to RPCServer: {source}")]
+  InvalidJson {
+    #[source]
+    source: serde_json::Error,
+  },
 
   /// Database file missing or unreadable.
   #[error("rpcserver could not find file {0:?}: {1}", path, source)]
@@ -43,4 +48,24 @@ pub enum RsrpcError {
   /// HTTP fetch failures (database, exclusions).
   #[error(transparent)]
   Http(#[from] ureq::Error),
+
+  /// IPC socket/pipe bind failed on every candidate index (Discord,
+  /// arRPC or another rsRPC already holds them all).
+  #[error("ipc bind failed after {attempts} attempts")]
+  IpcBind {
+    attempts: u8,
+    #[source]
+    source: std::io::Error,
+  },
+
+  /// WebSocket bridge bind failed on every candidate port. Keeps the
+  /// last `io::Error` so callers can match `AddrInUse` vs permission
+  /// vs other failures.
+  #[error("websocket bind failed on ports {start}-{end}: all in use")]
+  WsBind {
+    start: u16,
+    end: u16,
+    #[source]
+    source: std::io::Error,
+  },
 }

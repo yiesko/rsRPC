@@ -91,6 +91,23 @@ pub(crate) struct HandoffState {
 /// re-arms them (self-healing).
 pub(crate) const MAX_HANDOFF_ENTRIES: usize = 64;
 
+/// Track a generic publication for its later clear, bounded like the
+/// handoff tables above (purge dead pids first, then evict arbitrarily).
+/// Evicting a live entry only drops its future clear — the next scan
+/// re-arms it (self-healing).
+fn track_process_publication(map: &mut HashMap<crate::AppId, u64>, app_id: crate::AppId, pid: u64) {
+  if map.len() >= MAX_HANDOFF_ENTRIES {
+    map.retain(|_, known| is_process_alive(*known));
+  }
+  map.insert(app_id, pid);
+  while map.len() > MAX_HANDOFF_ENTRIES {
+    let Some(victim) = map.keys().next().cloned() else {
+      break;
+    };
+    map.remove(&victim);
+  }
+}
+
 impl HandoffState {
   pub(crate) fn note_publish(&mut self, app_id: &str, pid: u64) {
     if self.live_ipc.len() >= MAX_HANDOFF_ENTRIES {
@@ -203,11 +220,20 @@ pub(crate) fn generic_payload(game: &ScannedGame) -> commands::CachedActivity {
       flags: 0,
     },
     pid: game.pid,
-    socket_id: crate::SocketId::from(game.id.clone()),
+    socket_id: crate::SocketId::from(&game.id),
   };
+  // Same fixed-shape guarantee as `empty_cached` (String/int only):
+  // encode failure is a future-field bug, logged loudly instead of
+  // broadcasting an empty presence frame.
   commands::CachedActivity {
-    json: serde_json::to_string(&payload_struct).unwrap_or_default(),
-    msgpack: rmp_serde::to_vec_named(&payload_struct).unwrap_or_default(),
+    json: serde_json::to_string(&payload_struct).unwrap_or_else(|err| {
+      debug!("[Client Connector] Generic payload encode failed: {}", err);
+      String::new()
+    }),
+    msgpack: rmp_serde::to_vec_named(&payload_struct).unwrap_or_else(|err| {
+      debug!("[Client Connector] Generic payload encode failed: {}", err);
+      Vec::new()
+    }),
   }
 }
 
@@ -258,6 +284,13 @@ pub(crate) struct ClientConnector {
 }
 
 impl ClientConnector {
+  /// Bind both bridge protocols (JSON + MessagePack), each on its port
+  /// range.
+  ///
+  /// # Errors
+  ///
+  /// Returns the launch error when every candidate port is taken (both
+  /// ranges are exhausted): the caller surfaces it instead of exiting.
   pub(crate) fn new(
     port_start: u16,
     port_end: u16,
@@ -324,18 +357,29 @@ impl ClientConnector {
   }
 
   pub(crate) fn start(&mut self) {
+    // Double-start is a caller bug: the taken server below marks it.
+    // Ignore fail-safe instead of panicking on the takes.
+    if self
+      .json_server
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .is_none()
+    {
+      warn!("[Client Connector] Already started, ignoring duplicate start");
+      return;
+    }
     let json_server = self
       .json_server
       .lock()
-      .unwrap()
+      .unwrap_or_else(|e| e.into_inner())
       .take()
-      .expect("Client connector already started");
+      .expect("[bug] json server checked above");
     let msgpack_server = self
       .msgpack_server
       .lock()
-      .unwrap()
+      .unwrap_or_else(|e| e.into_inner())
       .take()
-      .expect("Client connector already started");
+      .expect("[bug] msgpack server taken with json server");
 
     let json_clients = self.json_clients.clone();
     let msgpack_clients = self.msgpack_clients.clone();
@@ -372,19 +416,19 @@ impl ClientConnector {
       .lock()
       .unwrap_or_else(|e| e.into_inner())
       .take()
-      .unwrap();
+      .expect("[bug] receivers taken with servers");
     let proc_event_rec = self
       .proc_event_rec
       .lock()
       .unwrap_or_else(|e| e.into_inner())
       .take()
-      .unwrap();
+      .expect("[bug] receivers taken with servers");
     let ws_event_rec = self
       .ws_event_rec
       .lock()
       .unwrap_or_else(|e| e.into_inner())
       .take()
-      .unwrap();
+      .expect("[bug] receivers taken with servers");
 
     let ipc_clone = self.clone();
     let proc_clone = self.clone();
@@ -557,7 +601,7 @@ impl ClientConnector {
             let cached = connector
               .last_activities
               .lock()
-              .unwrap()
+              .unwrap_or_else(|e| e.into_inner())
               .get(&crate::SocketId::from(pid.to_string()))
               .and_then(|(cached, _)| serde_json::from_str::<Value>(&cached.json).ok())
               .and_then(|body| body.get("activity").cloned());
@@ -689,7 +733,7 @@ impl ClientConnector {
       connector
         .handoff
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .note_scan(Some(game.clone()));
 
       // IPC-wins handoff: a live SDK presence owns this slot — withdraw
@@ -710,8 +754,8 @@ impl ClientConnector {
           .remove(&game.id)
         {
           connector.broadcast_activity(
-            commands::empty_cached(pid, crate::SocketId::from(game.id.clone())),
-            crate::SocketId::from(game.id.clone()),
+            commands::empty_cached(pid, crate::SocketId::from(&game.id)),
+            crate::SocketId::from(&game.id),
           );
           debug!(
             "[Client Connector] Yielding {} to live IPC presence",
@@ -731,7 +775,7 @@ impl ClientConnector {
       if connector
         .last_process
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .contains_key(&game.id)
       {
         debug!(
@@ -741,11 +785,14 @@ impl ClientConnector {
         continue;
       }
 
-      connector
-        .last_process
-        .lock()
-        .unwrap()
-        .insert(game.id.clone(), proc_activity.pid.unwrap_or_default());
+      track_process_publication(
+        &mut connector
+          .last_process
+          .lock()
+          .unwrap_or_else(|e| e.into_inner()),
+        game.id.clone(),
+        proc_activity.pid.unwrap_or_default(),
+      );
 
       debug!(
         "[Client Connector] Publishing generic presence for activity: {}",
@@ -753,10 +800,7 @@ impl ClientConnector {
       );
 
       // Same bytes as the handoff resume path (one construction site).
-      connector.broadcast_activity(
-        generic_payload(&game),
-        crate::SocketId::from(game.id.clone()),
-      );
+      connector.broadcast_activity(generic_payload(&game), crate::SocketId::from(&game.id));
     }
   }
 
@@ -764,19 +808,16 @@ impl ClientConnector {
   /// cleared (handoff back). The scanner only emits on *changes*, so
   /// without this the slot would stay dark until the next game switch.
   fn resume_generic(&self, game: &ScannedGame) {
-    self
-      .last_process
-      .lock()
-      .unwrap()
-      .insert(game.id.clone(), game.pid);
+    track_process_publication(
+      &mut self.last_process.lock().unwrap_or_else(|e| e.into_inner()),
+      game.id.clone(),
+      game.pid,
+    );
     debug!(
       "[Client Connector] Resuming generic presence for {} ({})",
       game.name, game.id
     );
-    self.broadcast_activity(
-      generic_payload(game),
-      crate::SocketId::from(game.id.clone()),
-    );
+    self.broadcast_activity(generic_payload(game), crate::SocketId::from(&game.id));
   }
 
   /// Broadcast an activity payload to all connected clients, updating the
@@ -815,7 +856,7 @@ impl ClientConnector {
     let payloads: Vec<commands::CachedActivity> = self
       .last_activities
       .lock()
-      .unwrap()
+      .unwrap_or_else(|e| e.into_inner())
       .values()
       .map(|(payload, _)| payload.clone())
       .collect();
@@ -920,15 +961,34 @@ impl ClientConnector {
 
     // Serialize once per encoding, not once per client: clones are
     // orders of magnitude cheaper than re-serializing the same frame.
+    // A frame that cannot encode is dropped loudly (not silently).
     let json_payload = if json_clients.is_empty() {
       None
     } else {
-      serde_json::to_string(cmd).ok()
+      match serde_json::to_string(cmd) {
+        Ok(payload) => Some(payload),
+        Err(err) => {
+          debug!(
+            "[Client Connector] Dropping unserializable fan-out frame: {}",
+            err
+          );
+          None
+        }
+      }
     };
     let msgpack_payload = if msgpack_clients.is_empty() {
       None
     } else {
-      rmp_serde::to_vec_named(cmd).ok()
+      match rmp_serde::to_vec_named(cmd) {
+        Ok(payload) => Some(payload),
+        Err(err) => {
+          debug!(
+            "[Client Connector] Dropping unserializable fan-out frame: {}",
+            err
+          );
+          None
+        }
+      }
     };
     if let Some(payload) = json_payload {
       for responder in json_clients.values() {
@@ -952,7 +1012,7 @@ pub(crate) fn take_process_clear(connector: &ClientConnector) -> Vec<(u64, crate
   let mut outstanding: Vec<(u64, crate::AppId)> = connector
     .last_process
     .lock()
-    .unwrap()
+    .unwrap_or_else(|e| e.into_inner())
     .drain()
     .map(|(socket_id, pid)| (pid, socket_id))
     .collect();
@@ -1035,7 +1095,7 @@ pub(crate) fn state_activities(
     let body: Value = serde_json::from_str(&payload.json).unwrap_or(Value::Null);
     let activity = body.get("activity");
     StateActivity {
-      socket_id: socket_id.0.clone(),
+      socket_id: socket_id.to_string(),
       name: activity
         .and_then(|item| item.get("name"))
         .and_then(Value::as_str)
@@ -1100,7 +1160,7 @@ fn launch_in_range(
   }
 
   Err(crate::error::RsrpcError::Message(format!(
-    "[Client Connector] Failed to launch {name} on ports {start}-{end}: all in use"
+    "bridge {name} launch failed on ports {start}-{end}: all in use"
   )))
 }
 

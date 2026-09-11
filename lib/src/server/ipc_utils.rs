@@ -31,7 +31,7 @@ pub(crate) trait IpcFacilitator {
   /// The current shared identity (for `GET_USER`).
   fn current_user(&self) -> crate::user::RpcUser;
 
-  fn recreate_socket(&mut self);
+  fn recreate_socket(&mut self) -> crate::error::Result<()>;
 
   fn start(&mut self);
 
@@ -245,7 +245,9 @@ pub(crate) fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut Stream) {
               PacketType::Frame,
               &commands::rpc_error("", &Value::Null, 4005, "Invalid encoding"),
             );
-            let _ = stream.write_all(&resp);
+            if let Err(err) = stream.write_all(&resp) {
+              debug!("[IPC] Peer gone, dropping reply: {}", err);
+            }
             continue;
           }
         };
@@ -280,7 +282,9 @@ pub(crate) fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut Stream) {
               PacketType::Frame,
               &commands::user_response(&activity_cmd, matched.then_some(&user)),
             );
-            let _ = stream.write_all(&resp);
+            if let Err(err) = stream.write_all(&resp) {
+              debug!("[IPC] Peer gone, dropping reply: {}", err);
+            }
           }
           "CONNECTIONS_CALLBACK" => {
             // Explicitly unsupported, like arRPC: answer the error the
@@ -294,7 +298,9 @@ pub(crate) fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut Stream) {
                 "CONNECTIONS_CALLBACK is not supported",
               ),
             );
-            let _ = stream.write_all(&resp);
+            if let Err(err) = stream.write_all(&resp) {
+              debug!("[IPC] Peer gone, dropping reply: {}", err);
+            }
           }
           "INVITE_BROWSER" | "GUILD_TEMPLATE_BROWSER" | "GIFT_CODE_BROWSER" | "DEEP_LINK" => {
             // Known secondary commands are forwarded to bridge clients and
@@ -304,7 +310,9 @@ pub(crate) fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut Stream) {
               warn!("[IPC] Event receiver gone, dropping command");
             }
             let resp = encode(PacketType::Frame, &commands::generic_ack(&activity_cmd));
-            let _ = stream.write_all(&resp);
+            if let Err(err) = stream.write_all(&resp) {
+              debug!("[IPC] Peer gone, dropping reply: {}", err);
+            }
           }
           other => {
             // Known-but-unbacked commands (voice, guilds, OAuth...) get
@@ -319,7 +327,9 @@ pub(crate) fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut Stream) {
               PacketType::Frame,
               &commands::rpc_error(&activity_cmd.cmd, &activity_cmd.nonce, code, message),
             );
-            let _ = stream.write_all(&resp);
+            if let Err(err) = stream.write_all(&resp) {
+              debug!("[IPC] Peer gone, dropping reply: {}", err);
+            }
           }
         }
       }
@@ -351,7 +361,9 @@ pub(crate) fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut Stream) {
         ipc.set_client_id("".to_string());
         ipc.set_pid(0);
 
-        ipc.recreate_socket();
+        ipc
+          .recreate_socket()
+          .unwrap_or_else(|e| warn!("[IPC] Error recreating socket: {}", e));
 
         break;
       }

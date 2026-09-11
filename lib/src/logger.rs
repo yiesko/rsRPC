@@ -29,6 +29,19 @@ pub(crate) fn parse_level(name: &str) -> Option<Level> {
   }
 }
 
+/// Boolish env values (`1/true/yes/on`, case-insensitive): mirrors the
+/// CLI `BoolishValueParser` so `RSRPC_DEBUG=true` also works for direct
+/// library users (previously only the literal `"1"` counted).
+pub(crate) fn env_bool(name: &str) -> bool {
+  matches!(
+    std::env::var(name)
+      .unwrap_or_default()
+      .trim()
+      .to_ascii_lowercase()
+      .as_str(),
+    "1" | "true" | "yes" | "on"
+  )
+}
 /// Configured minimum severity. `RSRPC_LOG_LEVEL` names it (default
 /// `info`); `RSRPC_DEBUG=1` (or `--debug`) forces `debug`, whichever is
 /// chattier. Read once; daemon log level never changes at runtime.
@@ -38,7 +51,7 @@ fn threshold() -> Level {
       .ok()
       .and_then(|name| parse_level(&name))
       .unwrap_or(Level::Info);
-    if std::env::var("RSRPC_DEBUG").unwrap_or_else(|_| "0".to_string()) == "1" {
+    if env_bool("RSRPC_DEBUG") {
       level = std::cmp::min(level, Level::Debug);
     }
     LEVEL.store(level as u8, Ordering::Relaxed);
@@ -56,7 +69,7 @@ fn threshold() -> Level {
 /// allocation (previously every call formatted eagerly).
 pub fn enabled() -> bool {
   LOGS_INIT.call_once(|| {
-    if std::env::var("RSRPC_LOGS_ENABLED").unwrap_or_else(|_| "0".to_string()) == "1" {
+    if env_bool("RSRPC_LOGS_ENABLED") {
       LOGS_ENABLED.store(true, Ordering::Relaxed);
     }
   });

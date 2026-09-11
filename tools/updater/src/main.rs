@@ -34,17 +34,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .limit(64 * 1024 * 1024)
     .read_to_string()?;
 
-  let games: Vec<serde_json::Value> = serde_json::from_str(&body)?;
-  println!(
-    "Loaded {} games, trimming to the fields rsrpc uses...",
-    games.len()
-  );
-
   // Single source of truth: the same trim the scanner, the CLI fallback
   // and the hourly refresh use (see `rsrpc::detection::trim_detectable`).
   // A hand-rolled copy here drifted before (aliases were silently dropped
   // from the bundled snapshot); never duplicate it again.
   let output = rsrpc::detection::trim_detectable(&body)?;
+  // Count from the trimmed (small) output, not the full body: one small
+  // transient DOM instead of two (the full-body DOM just for a log line).
+  let games: usize = serde_json::from_str::<Vec<serde_json::Value>>(&output)
+    .map(|games| games.len())
+    .unwrap_or(0);
+  println!("Trimmed to {games} games, writing snapshot...");
   let path = output_path();
   if let Some(parent) = path.parent() {
     std::fs::create_dir_all(parent)?;

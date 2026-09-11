@@ -38,16 +38,35 @@ pub fn load_file(path: &Path) -> Result<Vec<DetectableActivity>, String> {
 }
 
 /// Load every `*.json` file in `dir`, sorted by file name. Missing dir =
-/// empty; corrupt files are skipped with a warning, never fatal.
+/// empty; corrupt files are skipped with a warning, never fatal. A
+/// mid-iteration IO error is warned (not silent); extensions match
+/// case-insensitively (`.JSON` counts).
 pub fn load_dir(dir: &Path) -> Vec<DetectableActivity> {
   let Ok(entries) = std::fs::read_dir(dir) else {
     return Vec::new();
   };
-  let mut files: Vec<PathBuf> = entries
-    .flatten()
-    .map(|entry| entry.path())
-    .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
-    .collect();
+  let mut files: Vec<PathBuf> = Vec::new();
+  for entry in entries {
+    let entry = match entry {
+      Ok(entry) => entry,
+      Err(err) => {
+        warn!(
+          "[overrides] Skipping unreadable entry in {}: {}",
+          dir.display(),
+          err
+        );
+        continue;
+      }
+    };
+    let path = entry.path();
+    let is_json = path
+      .extension()
+      .and_then(|ext| ext.to_str())
+      .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+    if is_json {
+      files.push(path);
+    }
+  }
   files.sort();
   let mut overrides = Vec::new();
   for file in files {

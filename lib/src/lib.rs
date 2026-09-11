@@ -38,7 +38,9 @@ pub type ProcessCallback = dyn FnMut(ProcessScanState) + Send + Sync;
 pub struct AppId(pub String);
 
 /// Bridge socket id: identifies one client connection slot. See [`AppId`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+  Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct SocketId(pub String);
 
 impl std::fmt::Display for AppId {
@@ -109,6 +111,27 @@ impl From<&str> for SocketId {
 impl From<AppId> for SocketId {
   fn from(id: AppId) -> Self {
     Self(id.0)
+  }
+}
+
+/// Borrow an app id as its socket without touching the inner string.
+impl From<&AppId> for SocketId {
+  fn from(id: &AppId) -> Self {
+    Self(id.0.clone())
+  }
+}
+
+/// Unwrap back to the wire string (Display also works for formatting).
+impl From<AppId> for String {
+  fn from(id: AppId) -> Self {
+    id.0
+  }
+}
+
+/// Unwrap back to the wire string (Display also works for formatting).
+impl From<SocketId> for String {
+  fn from(id: SocketId) -> Self {
+    id.0
   }
 }
 
@@ -230,7 +253,7 @@ impl RPCServer {
     // Parse as DetectableActivity vector; invalid JSON is a caller error,
     // propagated (never panics: this is a library constructor).
     let detectable: Vec<DetectableActivity> = serde_json::from_str(detectable.as_ref())
-      .map_err(|err: serde_json::Error| crate::error::RsrpcError::InvalidJson(err.to_string()))?;
+      .map_err(|err: serde_json::Error| crate::error::RsrpcError::InvalidJson { source: err })?;
 
     let detectable: Vec<Arc<DetectableActivity>> = detectable.into_iter().map(Arc::new).collect();
 
@@ -303,6 +326,22 @@ impl RPCServer {
     if !self.staged_overrides.is_empty() {
       server.append_detectables(self.staged_overrides.clone());
     }
+    // Exclusions parity with the daemon: with hourly DB updates on, the
+    // daemon filters installers/crash-reporters — fetch the same set
+    // best-effort (fail-open) so diagnostics match what running publishes.
+    // Without `enable_db_update` the daemon never fetches either (empty
+    // set), so skipping here is parity, not a gap.
+    if self.config.enable_db_update
+      && let Some(url) = self.config.exclusions_url.clone()
+    {
+      match server::process::fetch_exclusions(&url) {
+        Ok(exclusions) => server.set_exclusions(exclusions),
+        Err(err) => debug!(
+          "[RPC Server] Exclusions fetch failed, diagnostics unfiltered: {}",
+          err
+        ),
+      }
+    }
 
     let mut found = server.scan_for_processes()?;
     // One-shot path: build the set once (the daemon builds it once at startup).
@@ -326,11 +365,16 @@ impl RPCServer {
   /// Like [`detect_once`](RPCServer::detect_once), call this before
   /// [`start`](RPCServer::start): startup moves the database to the
   /// scanner, leaving this side empty.
-  pub fn database_summary(&self) -> Result<Vec<DetectableSummary>, String> {
+  ///
+  /// # Errors
+  ///
+  /// Returns [`RsrpcError::Poisoned`](crate::error::RsrpcError::Poisoned)
+  /// when the database lock was poisoned by a previous panic.
+  pub fn database_summary(&self) -> crate::error::Result<Vec<DetectableSummary>> {
     let detectable = self
       .detectable
       .lock()
-      .map_err(|err| format!("detectable lock poisoned: {err}"))?;
+      .map_err(|err| crate::error::RsrpcError::Poisoned("detectable", err.to_string()))?;
     Ok(
       detectable
         .iter()
@@ -437,8 +481,11 @@ impl RPCServer {
   ///
   /// # Errors
   ///
-  /// Returns [`RsrpcError`](crate::error::RsrpcError) when no bridge or
-  /// websocket port in the configured ranges can be bound (all in use).
+  /// Returns [`RsrpcError`](crate::error::RsrpcError) when no bridge,
+  /// websocket or IPC socket in the configured ranges can be bound
+  /// ([`RsrpcError::IpcBind`](crate::error::RsrpcError::IpcBind) /
+  /// [`RsrpcError::WsBind`](crate::error::RsrpcError::WsBind) keep the
+  /// last `io::Error` as source), or a poisoned internal lock is met.
   /// No process is killed: the caller (e.g. `cli/src/main.rs`) decides
   /// whether to exit. Never panics.
   pub fn start(&mut self) -> crate::error::Result<()> {
@@ -451,7 +498,7 @@ impl RPCServer {
 
     // Bind the edge connectors first: their bound addresses feed the
     // bridge's state snapshot.
-    let ipc_connector = IpcConnector::new(ipc_event_sender, user.clone());
+    let ipc_connector = IpcConnector::new(ipc_event_sender, user.clone())?;
     let ws_connector = WebsocketConnector::new(
       ws_event_sender,
       self.config.ws_port_start,
@@ -527,7 +574,7 @@ impl RPCServer {
       connectors
         .process_server
         .lock()
-        .unwrap()
+        .map_err(|e| crate::error::RsrpcError::Poisoned("process_server", e.to_string()))?
         .start(std::time::Duration::from_secs(config.scan_interval_secs));
     }
     // Staged overrides (loaded before start): hand them to the live
@@ -538,7 +585,7 @@ impl RPCServer {
       connectors
         .process_server
         .lock()
-        .unwrap()
+        .map_err(|e| crate::error::RsrpcError::Poisoned("process_server", e.to_string()))?
         .append_detectables(staged);
     }
 

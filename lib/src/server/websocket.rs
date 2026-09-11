@@ -30,6 +30,14 @@ pub(crate) struct WebsocketConnector {
 }
 
 impl WebsocketConnector {
+  /// Bind the WebSocket bridge on the first free port in
+  /// `ws_port_start..=ws_port_end` (loopback only).
+  ///
+  /// # Errors
+  ///
+  /// Returns [`RsrpcError::WsBind`](crate::error::RsrpcError::WsBind)
+  /// (keeping the last `io::Error` as source) when no port in the range
+  /// could be bound.
   pub(crate) fn new(
     event_sender: mpsc::Sender<ActivityCmd>,
     ws_port_start: u16,
@@ -38,6 +46,7 @@ impl WebsocketConnector {
   ) -> crate::error::Result<Self> {
     // Try starting websocket server on the configured range, bound to
     // loopback only (games always connect to 127.0.0.1).
+    let mut last_err: Option<std::io::Error> = None;
     for port in ws_port_start..=ws_port_end {
       let listener = match std::net::TcpListener::bind(("127.0.0.1", port)) {
         Ok(listener) => listener,
@@ -52,6 +61,7 @@ impl WebsocketConnector {
               port, err
             );
           }
+          last_err = Some(err);
           continue;
         }
       };
@@ -77,18 +87,38 @@ impl WebsocketConnector {
     }
 
     error!("[Websocket] Failed to start server on any port");
-    Err(crate::error::RsrpcError::Message(format!(
-      "failed to start websocket server on ports {ws_port_start}-{ws_port_end}: all in use"
-    )))
+    match last_err {
+      Some(source) => Err(crate::error::RsrpcError::WsBind {
+        start: ws_port_start,
+        end: ws_port_end,
+        source,
+      }),
+      // Empty range (or only launch_from_listener failures): no bind
+      // error to keep — same text as before, lowercase, no log prefix.
+      None => Err(crate::error::RsrpcError::Message(format!(
+        "failed to start websocket server on ports {ws_port_start}-{ws_port_end}: all in use"
+      ))),
+    }
   }
 
   pub(crate) fn start(&mut self, set_activity: bool, secondary_events: bool) {
+    // Double-start is a caller bug: the taken server below marks it.
+    // Ignore fail-safe instead of panicking on the take.
+    if self
+      .server
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .is_none()
+    {
+      warn!("[Websocket] Already started, ignoring duplicate start");
+      return;
+    }
     let server = self
       .server
       .lock()
-      .unwrap()
+      .unwrap_or_else(|e| e.into_inner())
       .take()
-      .expect("Websocket server already started");
+      .expect("[bug] server checked above");
     let clients = self.clients.clone();
     let event_sender = self.event_sender.clone();
     let user = self.user.clone();
@@ -296,8 +326,16 @@ fn handle_browser_command(
     return;
   }
 
-  // Respond
-  responder.send(Message::Text(serde_json::to_string(&response).unwrap()));
+  // Respond (client-supplied `data` may hold non-finite floats, which
+  // JSON cannot encode: drop loudly instead of panicking the poll loop).
+  let Ok(response) = serde_json::to_string(&response) else {
+    warn!(
+      "[Websocket] Dropping unserializable response for {}",
+      event.cmd
+    );
+    return;
+  };
+  responder.send(Message::Text(response));
 }
 
 fn handle_deep_link(event: &ActivityCmd, responder: &Responder) {
@@ -310,7 +348,11 @@ fn handle_deep_link(event: &ActivityCmd, responder: &Responder) {
     nonce: event.nonce.clone(),
   };
 
-  responder.send(Message::Text(serde_json::to_string(&response).unwrap()));
+  let Ok(response) = serde_json::to_string(&response) else {
+    warn!("[Websocket] Dropping unserializable deep-link response");
+    return;
+  };
+  responder.send(Message::Text(response));
 }
 
 fn handle_connections_callback(event: &ActivityCmd, responder: &Responder) {
@@ -326,7 +368,13 @@ fn handle_connections_callback(event: &ActivityCmd, responder: &Responder) {
     nonce: event.nonce.clone(),
   };
 
-  responder.send(Message::Text(serde_json::to_string(&response).unwrap()));
+  // `data` here is locally built (no client floats): encode failure
+  // would be a coding bug, but the poll loop must not die on it.
+  let Ok(response) = serde_json::to_string(&response) else {
+    warn!("[Websocket] Dropping unserializable connections response");
+    return;
+  };
+  responder.send(Message::Text(response));
 }
 
 fn handle_set_activity(

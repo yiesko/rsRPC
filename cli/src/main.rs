@@ -72,11 +72,19 @@ struct Args {
   ignore_ids: Option<String>,
   /// Run a single process scan, print detected games and exit (staged
   /// overrides and ignore-list apply, like the daemon would publish)
-  #[arg(long, env = "RSRPC_LIST_DETECTED")]
+  #[arg(
+    long,
+    env = "RSRPC_LIST_DETECTED",
+    value_parser = clap::builder::BoolishValueParser::new()
+  )]
   list_detected: bool,
   /// Print a database summary (entry/executable counts + first entries)
   /// and exit. Runs before any scan, on the same held database.
-  #[arg(long, env = "RSRPC_LIST_DATABASE")]
+  #[arg(
+    long,
+    env = "RSRPC_LIST_DATABASE",
+    value_parser = clap::builder::BoolishValueParser::new()
+  )]
   list_database: bool,
 }
 
@@ -112,7 +120,20 @@ fn server_from_fetched(
   } else {
     detectable
   };
-  Ok(rsrpc::RPCServer::from_json_str(body, config)?)
+  // A fetched-but-garbage body (CDN HTML, truncation) must not kill
+  // boot: same offline fallback as a failed fetch (mirrors refresh,
+  // which keeps the old DB on parse errors).
+  let fallback_config = config.clone();
+  match rsrpc::RPCServer::from_json_str(body, config) {
+    Ok(server) => Ok(server),
+    Err(err) => {
+      eprintln!(
+        "[rsrpc] Fetched DB unparseable ({}), using offline bundled snapshot",
+        err
+      );
+      Ok(rsrpc::RPCServer::from_bundled(fallback_config)?)
+    }
+  }
 }
 
 /// Split a comma-separated id list (`--ignore-ids`): trims, drops blanks.

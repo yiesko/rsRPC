@@ -6,6 +6,7 @@ use serde_with::skip_serializing_none;
 
 use crate::SocketId;
 use crate::cmd::{ActivityCmd, ActivityPayload};
+use crate::debug;
 
 #[skip_serializing_none]
 #[derive(Serialize)]
@@ -58,12 +59,20 @@ pub fn empty_cached(pid: u64, socket_id: SocketId) -> CachedActivity {
   let payload = ActivityPayload {
     activity: None,
     pid: Some(pid),
-    socket_id: Some(socket_id.0.clone()),
+    socket_id: Some(socket_id.to_string()),
   };
 
+  // Fixed-shape struct (String/int/bool/Option only, no floats or
+  // non-string map keys): serialization cannot fail by construction.
+  // The loud fallback below exists so a future field addition that
+  // breaks that invariant shows up in logs instead of silently
+  // broadcasting an empty frame.
   CachedActivity {
     json: empty_activity(pid, socket_id),
-    msgpack: rmp_serde::to_vec_named(&payload).unwrap_or_default(),
+    msgpack: rmp_serde::to_vec_named(&payload).unwrap_or_else(|err| {
+      debug!("[Client Connector] Clear payload encode failed: {}", err);
+      Vec::new()
+    }),
   }
 }
 

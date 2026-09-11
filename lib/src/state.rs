@@ -101,7 +101,10 @@ fn slot_reusable(path: &Path, now_secs: u64) -> bool {
   match timestamp_ms {
     // Fresh snapshot: owned by a live daemon.
     Some(timestamp_ms) => {
-      let age_secs = now_secs.saturating_sub((timestamp_ms / 1000).max(0) as u64);
+      // Non-negative by construction (`.max(0)` above): the `try_from`
+      // documents the narrowing instead of a silent `as` cast.
+      let age_secs =
+        now_secs.saturating_sub(u64::try_from((timestamp_ms / 1000).max(0)).unwrap_or(0));
       age_secs > STATE_STALE_SECS
     }
     // No timestamp: not ours, reusable.

@@ -69,10 +69,11 @@ impl IpcFacilitator for IpcConnector {
     self.user.lock().unwrap_or_else(|e| e.into_inner()).clone()
   }
 
-  fn recreate_socket(&mut self) {
-    let (socket, socket_path) = Self::create_socket(None);
+  fn recreate_socket(&mut self) -> crate::error::Result<()> {
+    let (socket, socket_path) = Self::create_socket(0)?;
     *self.socket.lock().unwrap_or_else(|e| e.into_inner()) = socket;
     self.socket_path = socket_path;
+    Ok(())
   }
 
   /**
@@ -113,9 +114,12 @@ impl IpcConnector {
   /**
    * Create a socket and return a new IpcConnector
    */
-  pub(crate) fn new(event_sender: mpsc::Sender<ActivityCmd>, user: Arc<Mutex<RpcUser>>) -> Self {
-    let (socket, socket_path) = Self::create_socket(None);
-    Self {
+  pub(crate) fn new(
+    event_sender: mpsc::Sender<ActivityCmd>,
+    user: Arc<Mutex<RpcUser>>,
+  ) -> crate::error::Result<Self> {
+    let (socket, socket_path) = Self::create_socket(0)?;
+    Ok(Self {
       socket: Arc::new(Mutex::new(socket)),
       socket_path,
       did_handshake: false,
@@ -124,7 +128,7 @@ impl IpcConnector {
       nonce: "".to_string(),
       user,
       event_sender,
-    }
+    })
   }
 
   /// Named-pipe path of the bound socket (for the state snapshot).
@@ -132,18 +136,15 @@ impl IpcConnector {
     self.socket_path.clone()
   }
 
-  fn create_socket(tries: Option<u8>) -> (Listener, String) {
+  fn create_socket(tries: u8) -> crate::error::Result<(Listener, String)> {
     // Define the path to the named pipe
     let pipe_path = r"\\.\pipe\discord-ipc";
 
-    // Append tried number to name if applicable
-    let pipe_path = match tries {
-      Some(tries) => format!("{}-{}", pipe_path, tries),
-      None => format!("{}-{}", pipe_path, 0),
-    };
+    // Append tried number to name
+    let pipe_path = format!("{pipe_path}-{tries}");
 
     let listener = ListenerOptions::new()
-      .name(pipe_path.clone().to_fs_name::<NamedPipe>().unwrap())
+      .name(pipe_path.clone().to_fs_name::<NamedPipe>()?)
       .security_descriptor(SecurityDescriptor::default());
 
     let socket = match listener.create_sync() {
@@ -151,16 +152,18 @@ impl IpcConnector {
       Err(err) => {
         log!("[IPC] Failed to create IPC socket: {}", err);
 
-        if tries.unwrap_or(0) < 9 {
-          return Self::create_socket(Some(tries.unwrap_or(0) + 1));
-        } else {
-          panic!("[IPC] Failed to create socket: {}", err);
+        if tries < 9 {
+          return Self::create_socket(tries + 1);
         }
+        return Err(crate::error::RsrpcError::IpcBind {
+          attempts: tries + 1,
+          source: err,
+        });
       }
     };
 
     log!("[IPC] Created IPC socket: {}", pipe_path);
 
-    (socket, pipe_path)
+    Ok((socket, pipe_path))
   }
 }
