@@ -131,7 +131,7 @@ fn clear_activity_payload_is_null() {
 }
 
 #[test]
-fn set_activity_response_has_arrpc_shape() {
+fn set_activity_response_echoes_activity_intact() {
   let mut cmd = parse_cmd(SET_ACTIVITY_WITH_BUTTONS);
   cmd.fix();
 
@@ -141,7 +141,9 @@ fn set_activity_response_has_arrpc_shape() {
   assert_eq!(value["cmd"], "SET_ACTIVITY");
   assert!(value["evt"].is_null());
   assert_eq!(value["nonce"], "n1");
-  assert_eq!(value["data"]["name"], "");
+  // Official echo semantics: the reply carries the activity back as sent
+  // (name/type preserved), not rewritten.
+  assert_eq!(value["data"]["name"], "Test");
   assert_eq!(value["data"]["type"], 0);
   assert_eq!(
     value["data"]["buttons"],

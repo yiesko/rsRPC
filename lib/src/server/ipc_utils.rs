@@ -430,8 +430,8 @@ fn handle_set_activity(
   // "IPC will echo back every command you send as a response.
   //  Use this as a lock-step feature to avoid flooding messages.
   //  Can be used to validate messages such as the Presence or Subscribes."
-  // Echo arRPC-style, with data.name: "", data.type: 0 etc. so RPC
-  // libraries (e.g. pypresence) don't break on the response.
+  // Echo the activity back intact (official echo semantics): the
+  // lock-step guarantee is the reply itself, not a rewritten body.
   activity_cmd.fix();
   let response = commands::set_activity_response(activity_cmd).unwrap_or(raw.to_string());
   let resp = encode(PacketType::Frame, &response);

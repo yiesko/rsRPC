@@ -1,6 +1,7 @@
 use std::{
   collections::HashMap,
   sync::{Arc, Mutex},
+  time::{Duration, Instant},
 };
 
 use serde_json::Value;
@@ -26,6 +27,12 @@ pub(crate) const MAX_CACHED_ACTIVITIES: usize = 50;
 /// How often cached activities are rebroadcast so bridge clients that
 /// missed a frame converge (arRPC refreshes every 30s).
 pub(crate) const BRIDGE_REFRESH_INTERVAL_SECS: u64 = 30;
+/// Flood-guard window for `SET_ACTIVITY` duplicates (see
+/// [`commands::RecentActivities`]): conservative 5s — healthy SDK
+/// heartbeats re-send every 15s+, so only spin-loops collapse.
+pub(crate) const SET_ACTIVITY_DEDUP_WINDOW_SECS: u64 = 5;
+/// Cap for the dedup table (far above co-running games; bounds input).
+pub(crate) const MAX_RECENT_ACTIVITIES: usize = 128;
 
 /// Which wire protocol a connected bridge client speaks.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -277,6 +284,9 @@ pub(crate) struct ClientConnector {
   pub last_process: Arc<Mutex<HashMap<crate::AppId, u64>>>,
   /// IPC-wins handoff state (see [`HandoffState`]).
   handoff: Arc<Mutex<HandoffState>>,
+  /// Flood guard for `SET_ACTIVITY` duplicates, shared by the event loop
+  /// (short critical sections, no I/O under the lock).
+  recent: Arc<Mutex<commands::RecentActivities>>,
 
   pub ipc_event_rec: Arc<Mutex<Option<std::sync::mpsc::Receiver<ActivityCmd>>>>,
   pub proc_event_rec: Arc<Mutex<Option<std::sync::mpsc::Receiver<ProcessDetectedEvent>>>>,
@@ -342,6 +352,10 @@ impl ClientConnector {
 
       last_process: Arc::new(Mutex::new(HashMap::new())),
       handoff: Arc::new(Mutex::new(HandoffState::default())),
+      recent: Arc::new(Mutex::new(commands::RecentActivities::new(
+        Duration::from_secs(SET_ACTIVITY_DEDUP_WINDOW_SECS),
+        MAX_RECENT_ACTIVITIES,
+      ))),
 
       ipc_event_rec: Arc::new(Mutex::new(Some(ipc_event_rec))),
       proc_event_rec: Arc::new(Mutex::new(Some(proc_event_rec))),
@@ -578,6 +592,26 @@ impl ClientConnector {
         Some(payload) => {
           let args = cmd.args.as_ref();
           let pid = args.and_then(|args| args.pid).unwrap_or_default();
+          // Flood guard: byte-identical republishes inside the window are
+          // dropped here — after the game got its echo upstream, before
+          // any broadcast, cache write or log line. Any changed byte, and
+          // every clear, passes and re-arms the slot.
+          let fingerprint = args
+            .and_then(|args| args.activity.as_ref())
+            .and_then(|activity| serde_json::to_vec(activity).ok());
+          let app_key = cmd.application_id.as_deref().unwrap_or("");
+          if connector
+            .recent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .should_drop(app_key, pid, fingerprint.as_deref(), Instant::now())
+          {
+            debug!(
+              "[Client Connector] Dropping duplicate SET_ACTIVITY (app {}, pid {})",
+              app_key, pid
+            );
+            continue;
+          }
           let activity = args.and_then(|args| args.activity.as_ref());
           // IPC-wins handoff: a live SDK presence takes over this app slot
           // from generic detection (last publisher wins across companions).

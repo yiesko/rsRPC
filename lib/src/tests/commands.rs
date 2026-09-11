@@ -1,9 +1,11 @@
+use std::time::{Duration, Instant};
+
 use serde_json::Value;
 
 use crate::cmd::ActivityCmd;
 use crate::commands::{
-  cached_activity, current_user_update, generic_ack, rpc_error, subscribe_ack, unsupported_command,
-  user_response,
+  RecentActivities, cached_activity, current_user_update, generic_ack, rpc_error,
+  set_activity_response, subscribe_ack, unsupported_command, user_response,
 };
 use crate::user::RpcUser;
 
@@ -151,4 +153,81 @@ fn rich_activity_roundtrips_every_field_through_cached_activity() {
     serde_json::json!([2, 4])
   );
   assert_eq!(decoded["activity"]["mystery_field_xyz"], "must-survive");
+}
+
+#[test]
+fn set_activity_response_echoes_activity_intact() {
+  // A non-Playing activity: the echo must preserve name/type/details
+  // (official echo semantics) instead of rewriting them.
+  let mut cmd = parse_cmd(
+    r#"{"cmd":"SET_ACTIVITY","nonce":"echo-1","args":{"pid":777,"activity":{
+      "name":"My Game","type":2,"details":"AFK"}}}"#,
+  );
+  cmd.application_id = Some("123".to_string());
+
+  let reply: Value =
+    serde_json::from_str(&set_activity_response(&cmd).expect("response")).expect("valid json");
+
+  assert_eq!(reply["cmd"], "SET_ACTIVITY");
+  assert_eq!(reply["data"]["name"], "My Game");
+  assert_eq!(reply["data"]["type"], 2);
+  assert_eq!(reply["data"]["details"], "AFK");
+  assert_eq!(reply["data"]["application_id"], "123");
+  assert_eq!(reply["nonce"], "echo-1");
+}
+
+#[test]
+fn set_activity_response_clear_carries_null_data() {
+  let mut cmd =
+    parse_cmd(r#"{"cmd":"SET_ACTIVITY","nonce":"clear-1","args":{"pid":777,"activity":null}}"#);
+  cmd.application_id = Some("123".to_string());
+
+  let reply: Value =
+    serde_json::from_str(&set_activity_response(&cmd).expect("response")).expect("valid json");
+
+  assert_eq!(reply["cmd"], "SET_ACTIVITY");
+  assert!(reply["data"].is_null());
+  assert_eq!(reply["nonce"], "clear-1");
+}
+
+#[test]
+fn dedup_drops_exact_duplicate_inside_window() {
+  let mut recent = RecentActivities::new(Duration::from_secs(5), 8);
+  let t0 = Instant::now();
+
+  assert!(!recent.should_drop("app", 1, Some(b"{}"), t0));
+  assert!(recent.should_drop("app", 1, Some(b"{}"), t0 + Duration::from_secs(1)));
+  // ...but the same bytes from another pid/app are a different slot.
+  assert!(!recent.should_drop("app", 2, Some(b"{}"), t0 + Duration::from_secs(1)));
+  assert!(!recent.should_drop("other", 1, Some(b"{}"), t0 + Duration::from_secs(1)));
+}
+
+#[test]
+fn dedup_passes_changes_clears_and_expiry() {
+  let mut recent = RecentActivities::new(Duration::from_secs(5), 8);
+  let t0 = Instant::now();
+
+  assert!(!recent.should_drop("app", 1, Some(b"a"), t0));
+  // Any changed byte passes and becomes the new reference.
+  assert!(!recent.should_drop("app", 1, Some(b"b"), t0 + Duration::from_secs(1)));
+  assert!(recent.should_drop("app", 1, Some(b"b"), t0 + Duration::from_secs(2)));
+  // A clear always passes and re-arms the slot: the pre-clear payload
+  // passes again right after it.
+  assert!(!recent.should_drop("app", 1, None, t0 + Duration::from_secs(3)));
+  assert!(!recent.should_drop("app", 1, Some(b"b"), t0 + Duration::from_secs(3)));
+  // Past the window, even identical bytes pass.
+  assert!(!recent.should_drop("app", 1, Some(b"b"), t0 + Duration::from_secs(9)));
+}
+
+#[test]
+fn dedup_table_stays_bounded() {
+  let mut recent = RecentActivities::new(Duration::from_secs(5), 4);
+  let t0 = Instant::now();
+
+  for pid in 0..20u64 {
+    recent.should_drop("app", pid, Some(b"x"), t0);
+  }
+
+  assert!(recent.len() <= 4);
+  assert!(!recent.is_empty());
 }

@@ -7,7 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `SET_ACTIVITY` replies now echo the activity intact (official echo
+  semantics): `name`/`type` (Playing/Listening/Watching/Competing) and
+  every other field survive the round-trip instead of being rewritten to
+  `""`/`0`. The lock-step guarantee stays — a reply is always sent.
+- `SET_ACTIVITY` flood guard: byte-identical republishes from one
+  `(application_id, pid)` inside 5s are collapsed before broadcast
+  (changed bytes and clears always pass; clears re-arm the slot), so a
+  spinning SDK can no longer fan out to bridge consumers at full rate.
+
 ### Changed
+- Documented the `SUBSCRIBE` blind-ACK scope: only `READY`, `ERROR` and
+  `CURRENT_USER_UPDATE` are ever dispatched; voice/guild/message/invite/
+  relationship/entitlement subscriptions are ACKed and then silent (they
+  need the real Discord client).
 - **Breaking:** fallible APIs now return `rsrpc::error::RsrpcError`
   (`thiserror`) instead of boxed errors; `ClientConnector::new`,
   `WebsocketConnector::new` and `RPCServer::start` return `Result`
