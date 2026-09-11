@@ -173,6 +173,29 @@ jobs:
           sha256sum rsrpc-cli-x86_64-unknown-linux-gnu rsrpc-cli-aarch64-unknown-linux-gnu rsrpc*.zip > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      - name: Sign OTA manifest
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -e
+          # The OTA client verifies this signature against the pubkey
+          # embedded in cli/src/update.rs before trusting any hash: without
+          # it, staged binaries never execute. Missing secret fails the
+          # release loudly instead of shipping unsigned.
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "::error::MINISIGN_SECRET_KEY is not set; refusing to ship an unsigned release"
+            exit 1
+          fi
+          curl -sL -o /tmp/minisign.tgz https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-linux.tar.gz
+          mkdir -p /tmp/minisign && tar -xzf /tmp/minisign.tgz -C /tmp/minisign
+          MS=/tmp/minisign/minisign-linux/x86_64/minisign
+          printf '%s' "$MINISIGN_SECRET_KEY" > /tmp/ota.sec
+          chmod 600 /tmp/ota.sec
+          "$MS" -S -s /tmp/ota.sec -m SHA256SUMS.txt -t "rsrpc release ${{ github.ref_name }}"
+          shred -u /tmp/ota.sec || rm -f /tmp/ota.sec
+          # Self-check with the embedded pubkey before publishing.
+          "$MS" -V -P RWT97nYjybg6X/Q35LBD/thrjkAmYmEHbRm8TQjvpJeLO2kNONgb4ibw -m SHA256SUMS.txt
+
       - name: Changelog
         run: |
           PREV_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || true)
@@ -197,6 +220,7 @@ jobs:
             rsrpc-cli-x86_64-unknown-linux-gnu
             rsrpc-cli-aarch64-unknown-linux-gnu
             SHA256SUMS.txt
+            SHA256SUMS.txt.minisig
           token: ${{ secrets.GITHUB_TOKEN }}
           # Release name is the tag name
           name: ${{ github.ref_name }} - ${{ github.sha }}

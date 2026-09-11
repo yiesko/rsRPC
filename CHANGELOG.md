@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- OTA manifest signatures (minisign): releases now publish
+  `SHA256SUMS.txt.minisig`, and staging requires a valid signature from
+  the embedded release key before any hash is trusted (fail-closed;
+  legacy non-prehashed signatures rejected). CI signs with
+  `MINISIGN_SECRET_KEY` and self-verifies before publishing; the secret
+  key lives only in GitHub Secrets plus an offline backup.
 - Self-update (OTA) for `rsrpc-cli` (Linux x86_64 + ARM64): `--check-update`
   (exit 2 when a newer release exists), `--update [--yes]` (downloads,
   SHA256-verifies against the release manifest, stages under

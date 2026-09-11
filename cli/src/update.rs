@@ -30,6 +30,15 @@ use std::os::unix::fs::PermissionsExt;
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/yiesko/rsRPC/releases/latest";
 /// Checksum manifest asset name inside a release.
 const CHECKSUMS_ASSET: &str = "SHA256SUMS.txt";
+/// Detached minisign signature of [`CHECKSUMS_ASSET`].
+const CHECKSUMS_SIG_ASSET: &str = "SHA256SUMS.txt.minisig";
+/// Embedded release-signing public key (minisign format, key id
+/// 5F3AB8C92376EEFD). The matching secret key lives only in GitHub
+/// Secrets (`MINISIGN_SECRET_KEY`) plus the holder's offline backup —
+/// never in this repo — so a compromised GitHub account/token alone
+/// cannot ship a trusted binary: staged payloads only execute after this
+/// key verifies the manifest signature.
+const UPDATE_PUBKEY: &str = "RWT97nYjybg6X/Q35LBD/thrjkAmYmEHbRm8TQjvpJeLO2kNONgb4ibw";
 /// Staged (downloaded, verified, not yet applied) binary file name.
 const STAGED_FILE: &str = "rsrpc-cli.staged";
 /// OTA state file name (JSON).
@@ -151,6 +160,28 @@ pub fn parse_checksums(text: &str) -> HashMap<String, String> {
 #[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
   format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Verify a detached minisign signature over `payload` with `pubkey_b64`
+/// (strict: legacy non-prehashed signatures are rejected).
+///
+/// # Errors
+///
+/// Returns the error when the key/signature does not parse or the
+/// signature is invalid.
+pub fn verify_signature(
+  pubkey_b64: &str,
+  payload: &[u8],
+  sig_text: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+  let key = minisign_verify::PublicKey::from_base64(pubkey_b64)
+    .map_err(|err| format!("bad update signing key: {err}"))?;
+  let signature = minisign_verify::Signature::decode(sig_text)
+    .map_err(|err| format!("bad update signature: {err}"))?;
+  key
+    .verify(payload, &signature, false)
+    .map_err(|err| format!("update signature invalid: {err}"))?;
+  Ok(())
 }
 
 /// Why an update was refused before any network/download happened.
@@ -330,6 +361,10 @@ pub enum CheckOutcome {
     /// [`stage`] refuses to proceed without it (unverified binaries
     /// never execute).
     checksums_url: Option<String>,
+    /// `SHA256SUMS.txt.minisig` download URL: the manifest signature
+    /// verified against [`UPDATE_PUBKEY`] before any hash is trusted.
+    /// [`stage`] refuses to proceed without it.
+    checksums_sig_url: Option<String>,
   },
   /// Newer releases may exist, but none ships this target triple.
   UnsupportedTarget { current: Version, triple: String },
@@ -374,6 +409,8 @@ pub fn check() -> Result<CheckOutcome, Box<dyn std::error::Error>> {
   let asset_name = format!("rsrpc-cli-{triple}");
   let asset = select_asset(&release, &asset_name).cloned();
   let checksums_url = select_asset(&release, CHECKSUMS_ASSET).map(|asset| asset.url.clone());
+  let checksums_sig_url =
+    select_asset(&release, CHECKSUMS_SIG_ASSET).map(|asset| asset.url.clone());
   match asset {
     Some(asset) => Ok(CheckOutcome::Available {
       current,
@@ -382,6 +419,7 @@ pub fn check() -> Result<CheckOutcome, Box<dyn std::error::Error>> {
       asset_name: asset.name,
       asset_url: asset.url,
       checksums_url,
+      checksums_sig_url,
     }),
     None => Ok(CheckOutcome::UnsupportedTarget {
       current,
@@ -421,6 +459,7 @@ pub fn stage(
     asset_name,
     asset_url,
     checksums_url,
+    checksums_sig_url,
     ..
   } = available
   else {
@@ -438,7 +477,22 @@ pub fn stage(
     .ok_or_else(|| -> Box<dyn std::error::Error> {
       "release has no SHA256SUMS.txt: refusing unverified binary".into()
     })?;
+  let checksums_sig_url =
+    checksums_sig_url
+      .as_deref()
+      .ok_or_else(|| -> Box<dyn std::error::Error> {
+        "release has no SHA256SUMS.txt.minisig: refusing unsigned binary".into()
+      })?;
   let manifest = download(checksums_url, META_DOWNLOAD_LIMIT)?;
+  let manifest_sig = download(checksums_sig_url, META_DOWNLOAD_LIMIT)?;
+  // Signature first: no hash from this manifest is trusted until the
+  // embedded release key vouches for it.
+  let manifest_sig =
+    String::from_utf8(manifest_sig).map_err(|err| format!("bad SHA256SUMS.txt.minisig: {err}"))?;
+  if let Err(err) = verify_signature(UPDATE_PUBKEY, &manifest, &manifest_sig) {
+    let _ = std::fs::remove_file(&staged);
+    return Err(err);
+  }
   let manifest = String::from_utf8(manifest).map_err(|err| format!("bad SHA256SUMS.txt: {err}"))?;
   let expected = parse_checksums(&manifest)
     .remove(asset_name.as_str())
@@ -825,6 +879,54 @@ mod tests {
     assert_eq!(
       sha256_hex(b"abc"),
       "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+  }
+
+  /// Throwaway test keypair (secret destroyed after signing the fixture
+  /// below with the official minisign CLI — modern prehashed format, the
+  /// same flags CI uses).
+  const TEST_PUBKEY: &str = "RWTTN7gN0OW7+aDqRGjfeCOvh0eG6CRWOV+28hf/0KrAhStOWvstnZyj";
+  const TEST_MANIFEST: &str = "deadbeef  rsrpc-cli-x86_64-unknown-linux-gnu\n";
+  const TEST_MANIFEST_SIG: &str = "untrusted comment: signature from minisign secret key\n\
+    RUTTN7gN0OW7+RWfZYlU0Na0KzxWp8NCOB1jICVjohNcwSOq8FRVGi8gkRg/aOCJh0ZadUWiNobX3FZvJLzPNHDDOmM4+MXWfwQ=\n\
+    trusted comment: rsrpc test fixture\n\
+    FXtne+7W3eoXDYvCw2T5QfBz8WB51H2aY97qU8Atm208bRF77hdMmwilf/2xnAACD1cZCmbvQQ+tr5YX6Lg8Cg==\n";
+
+  #[test]
+  fn embedded_release_key_parses() {
+    // Guards against transcription typos in UPDATE_PUBKEY: if the
+    // embedded key does not even parse, every future stage() fails.
+    assert!(minisign_verify::PublicKey::from_base64(UPDATE_PUBKEY).is_ok());
+  }
+
+  #[test]
+  fn valid_manifest_signature_verifies() {
+    assert!(verify_signature(TEST_PUBKEY, TEST_MANIFEST.as_bytes(), TEST_MANIFEST_SIG).is_ok());
+  }
+
+  #[test]
+  fn tampered_manifest_fails_signature() {
+    let tampered = TEST_MANIFEST.replace("deadbeef", "badcafe0");
+    assert!(verify_signature(TEST_PUBKEY, tampered.as_bytes(), TEST_MANIFEST_SIG).is_err());
+  }
+
+  #[test]
+  fn signature_from_another_key_fails() {
+    // The production key must reject the test fixture (key-id mismatch):
+    // signatures are bound to their key, not just well-formed.
+    assert!(verify_signature(UPDATE_PUBKEY, TEST_MANIFEST.as_bytes(), TEST_MANIFEST_SIG).is_err());
+  }
+
+  #[test]
+  fn garbage_signature_fails() {
+    assert!(verify_signature(TEST_PUBKEY, TEST_MANIFEST.as_bytes(), "nope").is_err());
+    assert!(
+      verify_signature(
+        TEST_PUBKEY,
+        TEST_MANIFEST.as_bytes(),
+        "untrusted comment: x\n!!!!\ntrusted comment: y\n!!!!\n"
+      )
+      .is_err()
     );
   }
 

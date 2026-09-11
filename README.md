@@ -114,7 +114,8 @@ Severities, chattiest first: `DEBUG` (per-tick internals, needs `--debug`/`RSRPC
 
 ### Self-update (OTA)
 
-* `--check-update` reports newer releases (exit 2 when one is available); `--update` downloads, SHA256-verifies against the release `SHA256SUMS.txt`, and stages the binary under `~/.cache/rsrpc/ota/` (`$RSRPC_OTA_DIR` overrides).
+* `--check-update` reports newer releases (exit 2 when one is available); `--update` downloads, verifies, and stages the binary under `~/.cache/rsrpc/ota/` (`$RSRPC_OTA_DIR` overrides).
+* Verification is two-layer and fail-closed: the release `SHA256SUMS.txt` must carry a valid minisign signature from the key embedded in the binary (secret lives only in GitHub Secrets + offline backup), and only then is the binary hash checked against it. Unsigned or tampered releases are refused before anything executes.
 * The staged binary applies on the next start: it is re-verified, atomically swapped in (previous image kept as `.prev` for `--rollback`), and the process re-executes — on Linux in the same PID, invisible to systemd.
 * The daemon checks once a day in the background and only logs availability, unless `--auto-update`/`RSRPC_AUTO_UPDATE=1` opts into background staging (applying still waits for the next start; the daemon never restarts itself).
 * Self-update refuses dev builds (`target/`), `cargo install` copies (`~/.cargo/bin`), oddly named binaries, and read-only install dirs with a plain message. MVP covers Linux x86_64 + ARM64 (other targets report "no published builds").
