@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.1] - 2026-09-11
+
 ### Added
 - OTA manifest signatures (minisign): releases now publish
   `SHA256SUMS.txt.minisig`, and staging requires a valid signature from
@@ -51,7 +53,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `is_suppressed`; over-`pub` items narrowed to `pub(crate)`.
   Error messages are lowercase; public constructors document `# Errors`.
 
-### Added
 - Proton-aware detection: `win32` executables from the main database are
   now indexed in a fallback automaton on Linux. Wine/Proton games whose
   Steam AppId is unreadable match by path instead of staying invisible.
@@ -119,7 +120,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   detection or early wake — EXEC still delivers starts instantly).
   Steady state: ~0.4% CPU, ~57MB RSS; per-process classify 54µs → 23µs.
 
-### Fixed
 - Total detection blindness from size-checking `/proc` files: they
   report `st_size 0` despite having content, so the check skipped every
   process (only IPC-driven cards kept showing). Removed the checks, kept
@@ -350,7 +350,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Stuck presence after game close.
 
-[Unreleased]: https://github.com/yiesko/rsRPC/compare/v0.32.2...HEAD
+[Unreleased]: https://github.com/yiesko/rsRPC/compare/v0.33.1...HEAD
+[0.33.1]: https://github.com/yiesko/rsRPC/releases/tag/v0.33.1
 [0.32.2]: https://github.com/yiesko/rsRPC/releases/tag/v0.32.2
 [0.32.1]: https://github.com/yiesko/rsRPC/releases/tag/v0.32.1
 [0.32.0]: https://github.com/yiesko/rsRPC/releases/tag/v0.32.0
