@@ -202,6 +202,12 @@ pub struct Activity {
   pub assets: Option<Assets>,
   pub secrets: Option<Secrets>,
   pub metadata: Option<Metadata>,
+  /// Forward-compatibility: fields this bridge does not model yet (new
+  /// official keys, game-specific extras) round-trip untouched instead
+  /// of being dropped on parse — a strict client must see what the game
+  /// sent, byte-equivalent modulo key order.
+  #[serde(flatten, default)]
+  pub extra: HashMap<String, Value>,
 }
 
 impl Activity {

@@ -2,7 +2,8 @@ use serde_json::Value;
 
 use crate::cmd::ActivityCmd;
 use crate::commands::{
-  current_user_update, generic_ack, rpc_error, subscribe_ack, unsupported_command, user_response,
+  cached_activity, current_user_update, generic_ack, rpc_error, subscribe_ack, unsupported_command,
+  user_response,
 };
 use crate::user::RpcUser;
 
@@ -107,4 +108,47 @@ fn unsupported_commands_map_to_official_codes() {
   assert!(unsupported_command("SET_ACTIVITY").is_none());
   assert!(unsupported_command("GET_USER").is_none());
   assert!(unsupported_command("FROBNICATE").is_none());
+}
+
+#[test]
+fn rich_activity_roundtrips_every_field_through_cached_activity() {
+  // Full-rich SET_ACTIVITY as a real game SDK sends it (details, state,
+  // timestamps, assets, party, secrets, buttons, flags, emoji, display
+  // type, plus one unknown future key): the bridge payload must carry
+  // every one of them to consumers, byte-equivalent modulo key order.
+  let mut cmd = parse_cmd(
+    r#"{"cmd":"SET_ACTIVITY","nonce":"rich-1","args":{"pid":424242,"activity":{
+      "name":"Rook R.E.P.O. Detail","type":0,"details":"Battle Creek",
+      "state":"In Competitive Match","timestamps":{"start":1789148307000},
+      "assets":{"large_image":"canary-large","large_text":"Canary","small_image":"ptb-small","small_text":"PTB"},
+      "party":{"id":"party_aac0ffee","size":[2,4],"privacy":1},
+      "secrets":{"join":"L33tJoin","spectate":"L33tSpec","match":"L33tMatch"},
+      "buttons":[{"label":"Play","url":"https://example.com/play"}],
+      "instance":true,"flags":1,"status_display_type":1,
+      "emoji":{"name":" 잠수","id":"123","animated":false},
+      "mystery_field_xyz":"must-survive"}}}"#,
+  );
+  let payload = cached_activity(&mut cmd).expect("rich activity encodes");
+  let body: Value = serde_json::from_str(&payload.json).expect("valid json");
+  let activity = &body["activity"];
+  assert_eq!(activity["details"], "Battle Creek");
+  assert_eq!(activity["state"], "In Competitive Match");
+  assert_eq!(activity["timestamps"]["start"], 1789148307000i64);
+  assert_eq!(activity["assets"]["large_image"], "canary-large");
+  assert_eq!(activity["party"]["size"], serde_json::json!([2, 4]));
+  assert_eq!(activity["party"]["privacy"], 1);
+  assert_eq!(activity["secrets"]["join"], "L33tJoin");
+  assert_eq!(activity["secrets"]["spectate"], "L33tSpec");
+  assert_eq!(activity["secrets"]["match"], "L33tMatch");
+  assert_eq!(activity["buttons"], serde_json::json!(["Play"]));
+  assert_eq!(activity["instance"], true);
+  assert_eq!(activity["status_display_type"], 1);
+  assert_eq!(activity["mystery_field_xyz"], "must-survive");
+  // Same bytes on the MessagePack leg.
+  let decoded: Value = rmp_serde::from_slice(&payload.msgpack).expect("valid msgpack");
+  assert_eq!(
+    decoded["activity"]["party"]["size"],
+    serde_json::json!([2, 4])
+  );
+  assert_eq!(decoded["activity"]["mystery_field_xyz"], "must-survive");
 }

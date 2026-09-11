@@ -155,6 +155,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Native-presence capture: a peer that connects but never handshakes
   (bailed SDK probe, crashed launcher) logs one INFO line instead of
   debug-only, so clients the bridge never identifies leave a trace.
+- Rich presence fidelity: `SET_ACTIVITY` frames round-trip every modeled
+  field (details/state, timestamps, assets+urls, party+privacy, secrets,
+  buttons, flags, emoji, display type) on both JSON and MessagePack legs,
+  and unmodeled future keys survive via a flattened catch-all instead of
+  being dropped on parse — verified live against the daemon and pinned by
+  a round-trip test.
 
 ## [0.32.2] - 2026-09-09
 
