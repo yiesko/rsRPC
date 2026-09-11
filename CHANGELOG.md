@@ -87,6 +87,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   detection or early wake — EXEC still delivers starts instantly).
   Steady state: ~0.4% CPU, ~57MB RSS; per-process classify 54µs → 23µs.
 
+### Fixed
+- Total detection blindness from size-checking `/proc` files: they
+  report `st_size 0` despite having content, so the check skipped every
+  process (only IPC-driven cards kept showing). Removed the checks, kept
+  the byte caps; regression-tested against our own pid.
+- EXIT-wake storm: tracked short-lived Proton helpers unparked the scan
+  loop several times per second (0.76s effective cadence during NFS).
+  Wakes are debounced to at most one per second now.
+- Exclusive sources diluted on refresh: `RSRPC_STEAM_ROOT` (and injected
+  layouts) were merged with re-discovered roots on every folders change.
+  Refresh re-resolves from the same source discovery used.
+- `RSRPC_DEBUG=1` (and friends) rejected by clap bool parsing, crashing
+  the daemon at startup: all env-backed bool flags accept
+  `1/0/true/false/yes/no/on/off` now.
+- Dead re-entrancy guard (`scanning` checked but never set): real RAII
+  guard, acquired atomically and released on every exit path.
+
 ## [0.32.2] - 2026-09-09
 
 ### Fixed

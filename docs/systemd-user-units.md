@@ -67,7 +67,18 @@ are given). Booleans accept `1`/`true`.
 | `RSRPC_DB_URL` | unset | Fetch DB from this URL at startup |
 | `RSRPC_ENABLE_DB_UPDATE` | unset | `1` = hourly background DB refresh (falls back to the official URL) |
 | `RSRPC_OVERRIDES_FILE` | unset | `overrides.json` path (else `$XDG_CONFIG_HOME/rsrpc/overrides.json`, else `~/.config/rsrpc/overrides.json`) |
+| `RSRPC_OVERRIDES_DIR` | unset | `overrides.d/` path (else `$XDG_CONFIG_HOME/rsrpc/overrides.d`, else `~/.config/rsrpc/overrides.d`); every `*.json` inside merges in |
+| `RSRPC_EXCLUSIONS_URL` | unset | Discord detection exclusions source (defaults to the official endpoint with `--enable-db-update`) |
+| `RSRPC_STEAM_ROOT` | unset | Exclusive Steam root override (nothing else is consulted) |
+| `RSRPC_STEAM_LIBRARIES` | unset | Extra Steam library roots, `:`-separated, merged with auto-discovery |
 | `RSRPC_IGNORE_IDS` | unset | Comma-separated app IDs the scanner never publishes (full silence; forwarded client frames still pass) |
+
+> Bool flags accept `1/0/true/false/yes/no/on/off` (so `RSRPC_DEBUG=1` and friends work).
+>
+> Sandboxing note: if the unit restricts address families
+> (`RestrictAddressFamilies`), add `AF_NETLINK` to the list — otherwise the
+> event-driven process watcher cannot subscribe and the scanner silently
+> stays on polling (diagnose via the missing `watcher live` line).
 
 ### Identity (`READY` user)
 

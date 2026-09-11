@@ -10,7 +10,7 @@
 
 # Features
 
-* Process detection (with 64-bit path normalization like arrpc/pog5-rsrpc, plus Steam AppId, conservative exe-stem fallback and install-folder fallback for DB entries with empty `executables` — e.g. Hydra/non-Steam layouts; bare-exe launches are retried against the process cwd; SIGSTOP'd processes count as absent)
+* Process detection: Aho-Corasick over reversed paths (case-insensitive, with 64-bit variants like arrpc/pog5-rsrpc); a `win32` fallback automaton for Proton/Wine games whose store id is unreadable; Steam AppId via `/proc/<pid>/environ` (plus `AppId=` cmdline fallback and install-dir lookup from Steam's own `libraryfolders.vdf`/`appmanifest` files, with non-Steam shortcut ids detected by range); conservative exe-stem/folder fallback for DB entries with empty `executables` (e.g. Hydra/non-Steam layouts, multi-word names only); alternative titles (`aliases`) indexed too; Discord exclusion list honored (installers/crash reporters never match); bare-exe launches retried against the process cwd; SIGSTOP'd processes count as absent; event-driven `EXEC`/`EXIT` fast path (netlink `cn_proc`) with polling backstop and idle backoff
 * IPC/Socket-based RPC detection
 * Websocket-based RPC detection (loopback only)
 * Bridge that forwards game activities to web clients via both a **JSON** port (`1337`) and a **MessagePack** port (`1338`)
@@ -21,10 +21,10 @@
 * Clickable-asset URL fields (`details_url`, `state_url`, `large_url`, `small_url`) preserved through the bridge
 * Bundled offline detectable snapshot with optional automatic database refresh (fetch the detectable list every hour, like pog5-rsrpc)
 * `plugin/rsrpc.js` - optional Vencord plugin / userscript / Node client that receives activity from the bridge (not embedded in the Rust binary)
-* Custom overrides via `overrides.json` (added on the fly, bypass the OS filter so win32 entries work under Proton/Wine)
+* Custom overrides via `overrides.json` and/or `overrides.d/*.json` (arrays or single objects; added on the fly, bypass the OS filter so win32 entries work under Proton/Wine)
 * Adding new processes on the fly
 * Manually triggering scans
-* Single-shot diagnostics via `--list-detected` and `--list-database`
+* Single-shot diagnostics via `--list-detected` (staged overrides + ignore-list apply, exactly what running would publish) and `--list-database`
 * IPC-wins handoff: generic process detection shows immediately, yields
   to live game-SDK presence, and resumes when it clears (see below)
 
@@ -55,29 +55,40 @@
                                    moves forward on collision with the JSON port)
       --ws-port-start <PORT>      First websocket port for games (default: 6463)
       --ws-port-end <PORT>        Last websocket port for games, inclusive (default: 6472)
-      --scan-interval-secs <SECS> Process scan interval in seconds (default: 5)
+      --scan-interval-secs <SECS> Process scan base cadence in seconds (default: 5;
+                                    idle stretches ×2 per empty tick up to 30s)
       --db-url <URL>              Fetch the detectable list from this URL
-                                  (with --enable-db-update and no --db-url,
-                                  defaults to https://discord.com/api/v9/applications/detectable)
+                                   (with --enable-db-update and no --db-url,
+                                   defaults to https://discord.com/api/v9/applications/detectable)
       --enable-db-update          Refresh the detectable list every hour
-      --overrides-file <FILE>     Path to a JSON array of DetectableActivity
-                                  used as custom overrides (default: $RSRPC_OVERRIDES_FILE,
-                                  $XDG_CONFIG_HOME/rsrpc/overrides.json,
-                                  ~/.config/rsrpc/overrides.json)
+      --exclusions-url <URL>      Discord detection exclusions source
+                                   (defaults to the official endpoint with
+                                   --enable-db-update; same hourly refresh)
+      --overrides-file <FILE>     Path to a JSON array (or single object) of
+                                   DetectableActivity used as custom overrides
+                                   (default: $RSRPC_OVERRIDES_FILE,
+                                   $XDG_CONFIG_HOME/rsrpc/overrides.json,
+                                   ~/.config/rsrpc/overrides.json)
+      --overrides-dir <DIR>       Directory of override files (`*.json`, each
+                                   an array or a single DetectableActivity),
+                                   merged with --overrides-file (default:
+                                   $RSRPC_OVERRIDES_DIR,
+                                   $XDG_CONFIG_HOME/rsrpc/overrides.d,
+                                   ~/.config/rsrpc/overrides.d)
       --ignore-ids <IDS>          Comma-separated application IDs the process
                                    scanner never publishes (full silence for
                                    those slots). Scan-only by design:
                                    forwarded client frames always pass.
                                    `$RSRPC_IGNORE_IDS`
       --list-detected             Run a single process scan, print detected
-                                   games and exit (main DB only; custom
-                                   overrides require a running server)
+                                   games and exit (staged overrides and
+                                   ignore-list apply, like the daemon)
       --list-database             Print a database summary (entry/executable
                                    counts + first entries) and exit
   -D, --debug                     Print the resolved configuration
 ```
 
-Every option also has a corresponding environment variable (e.g. `RSRPC_BRIDGE_PORT`, `RSRPC_MSGPACK_PORT`, `RSRPC_OVERRIDES_FILE`, `RSRPC_LIST_DETECTED`, `RSRPC_DEBUG`).
+Every option also has a corresponding environment variable (e.g. `RSRPC_BRIDGE_PORT`, `RSRPC_MSGPACK_PORT`, `RSRPC_OVERRIDES_FILE`, `RSRPC_OVERRIDES_DIR`, `RSRPC_EXCLUSIONS_URL`, `RSRPC_STEAM_ROOT`, `RSRPC_STEAM_LIBRARIES`, `RSRPC_LIST_DETECTED`, `RSRPC_DEBUG`). Bool flags accept `1/0/true/false/yes/no/on/off`.
 
 ### Logging
 
@@ -86,22 +97,23 @@ Severities, chattiest first: `DEBUG` (per-tick internals, needs `--debug`/`RSRPC
 ### Detectable database (offline snapshot & refresh)
 
 * Without flags the CLI uses the bundled snapshot (`lib/resources/detectable.json`, embedded via `detection::BUNDLED_DETECTABLE`), so it works offline.
-* `--db-url <URL>` fetches and trims the list at startup (keeps only `id/name/hook`, `executables{name,is_launcher,os,arguments}` and `third_party_skus{distributor,id}`), with fallback to the bundled snapshot on failure.
+* `--db-url <URL>` fetches and trims the list at startup (keeps only `id/name/hook/aliases`, `executables{name,is_launcher,os,arguments}` and `third_party_skus{distributor,id}`), with fallback to the bundled snapshot on failure.
 * `--enable-db-update` keeps refreshing that list every hour in the background. Without `--db-url` it defaults to `https://discord.com/api/v9/applications/detectable`.
 * Regenerate the snapshot with: `cargo run --manifest-path tools/updater/Cargo.toml` (writes `lib/resources/detectable.json`).
 
 ### Process detection notes
 
-* Executable matching uses Aho-Corasick over reversed paths with `64`/`.x64`/`x64`/`_64` variants (e.g. `wow64.exe` matches `wow.exe`).
-* Entries with empty `executables` are still matched via Steam AppId (Linux reads `SteamAppId` from `/proc/<pid>/environ`) or via an exact exe-stem == multi-word game-name fallback (e.g. `how to fish.exe` → `How to Fish`; single-word names like `fish` never match).
-* The main DB is filtered by executable OS (`win32`/`darwin`/`linux`); custom overrides from `overrides.json`/`append_detectables` bypass that filter so win32-only entries are detected under Proton/Wine, and always win over the main DB.
+* Executable matching uses case-insensitive Aho-Corasick over reversed paths with `64`/`.x64`/`x64`/`_64` variants (e.g. `wow64.exe` matches `wow.exe`), plus a `win32` fallback automaton on Linux for Proton/Wine games.
+* Entries with empty `executables` are still matched via Steam AppId (Linux reads `SteamAppId` from `/proc/<pid>/environ`, falling back to `AppId=` on the command line and to install-dir lookup from Steam's `libraryfolders.vdf`/`appmanifest` files; shortcut-range ids assigned by Steam itself to non-Steam shortcuts order name-before-location instead) or via an exact exe-stem == multi-word game-name fallback (e.g. `how to fish.exe` → `How to Fish`; single-word names like `fish` never match). Alternative titles (`aliases`) join the same fallback.
+* Discord's detection exclusions (installer/crash-reporter names + patterns, refreshed hourly with `--enable-db-update`) never match.
+* The main DB is filtered by executable OS (`win32`/`darwin`/`linux`, except the Proton fallback above); custom overrides from `overrides.json`/`overrides.d`/`append_detectables` bypass that filter so win32-only entries are detected under Proton/Wine, and always win over the main DB.
 * Entries with empty `executables` are additionally matched by install-folder name (e.g. `.../Meccha Chameleon/...` → `MECCHA CHAMELEON`; multi-word names only, so generic folders never hit).
 * Launches with a bare exe name (no directories in argv[0], common under Proton) are retried joined with the process cwd.
 * Suspended (`SIGSTOP'd`) processes count as absent (a frozen frame is not gameplay); they are republished on resume.
 
-### Custom overrides (`overrides.json`)
+### Custom overrides (`overrides.json`, `overrides.d/`)
 
-File contains a JSON array of `DetectableActivity` objects. Resolution order: `--overrides-file` > `$RSRPC_OVERRIDES_FILE` > `$XDG_CONFIG_HOME/rsrpc/overrides.json` > `~/.config/rsrpc/overrides.json`. Missing file means no overrides. Loaded after `start()` via `append_detectables`.
+Files contain a JSON array (or a single object) of `DetectableActivity` objects. File resolution order: `--overrides-file` > `$RSRPC_OVERRIDES_FILE` > `$XDG_CONFIG_HOME/rsrpc/overrides.json` > `~/.config/rsrpc/overrides.json`; directory resolution: `--overrides-dir` > `$RSRPC_OVERRIDES_DIR` > `$XDG_CONFIG_HOME/rsrpc/overrides.d` > `~/.config/rsrpc/overrides.d`. Missing paths mean no overrides; corrupt directory files are skipped with a warning. Loaded before any branch (staged pre-start, applied to the live scanner on `start()` and to `--list-detected`).
 
 ### Diagnostics
 
@@ -110,7 +122,7 @@ File contains a JSON array of `DetectableActivity` objects. Resolution order: `-
 # How to Fish (id 4001890) pid 1234
 ```
 
-Uses the main DB only; `overrides.json` diagnostics require a running server.
+Shows exactly what the daemon would publish: staged overrides and the ignore-list apply (previously main-DB-only).
 
 ### IPC-wins handoff (generic ↔ companion)
 
@@ -210,7 +222,8 @@ server.start();
 ```rust
 use rsrpc::DetectedGame;
 
-// Single scan without threads (main DB only; returns id/name/pid).
+// Single scan without threads (staged overrides + ignore-list apply,
+// returns id/name/pid).
 let games: Vec<DetectedGame> = server.detect_once()?;
 
 // Database summary without threads (entry/executable counts + names).
