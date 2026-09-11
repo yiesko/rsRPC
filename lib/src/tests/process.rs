@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use crate::detection::{DetectableActivity, ThirdPartySku};
 use crate::server::process::{
   build_aux_maps, exe_stem, match_name_or_folder, match_steam_id, name_matchable, normalize_name,
+  undotted_names,
 };
 
 fn activity(id: &str, name: &str, steam_id: Option<&str>) -> Arc<DetectableActivity> {
@@ -207,12 +208,19 @@ fn aux_match_prefers_steam_then_name() {
     "/home/user/games/how to fish/how to fish.exe",
     456,
     &name_map,
+    &undotted_names(&name_map),
     &db,
   );
   assert_eq!(hit.unwrap().id, "1");
 
   // Generic shell must never match
-  let miss = match_name_or_folder("/usr/bin/fish", 789, &name_map, &db);
+  let miss = match_name_or_folder(
+    "/usr/bin/fish",
+    789,
+    &name_map,
+    &undotted_names(&name_map),
+    &db,
+  );
   assert!(miss.is_none());
 }
 
@@ -230,6 +238,7 @@ fn aux_match_falls_back_to_install_folder() {
     "/home/user/games/meccha chameleon/meccha chameleon/chameleon/binaries/win64/penguinhotel-win64-shipping.exe",
     201,
     &name_map,
+    &undotted_names(&name_map),
     &db,
   );
   assert_eq!(hit.unwrap().id, "2");
@@ -242,6 +251,7 @@ fn aux_match_falls_back_to_install_folder() {
     "/home/user/steamapps/common/meccha chameleon/game.exe",
     202,
     &name_map,
+    &undotted_names(&name_map),
     &db,
   );
   assert_eq!(folder_says.unwrap().id, "2");
@@ -251,6 +261,7 @@ fn aux_match_falls_back_to_install_folder() {
     "/home/user/games/some game/binaries/win64/game-win64-shipping.exe",
     203,
     &name_map,
+    &undotted_names(&name_map),
     &db,
   );
   assert!(miss.is_none());
@@ -261,6 +272,7 @@ fn aux_match_falls_back_to_install_folder() {
     "/home/user/.local/share/games/how to fish/v1.2.3/how to fish.bin",
     204,
     &name_map,
+    &undotted_names(&name_map),
     &db,
   );
   assert_eq!(hit.unwrap().id, "1");
@@ -769,9 +781,91 @@ fn aliases_indexed_and_gated() {
     "/games/playerunknown's battlegrounds/tslgame.exe",
     11,
     &name_map,
+    &undotted_names(&name_map),
     &db,
   );
   assert_eq!(hit.unwrap().id, "1");
+}
+
+#[test]
+fn undotted_names_cover_dotted_titles_only() {
+  let db = vec![
+    activity("1", "How to Fish", Some("4001890")),
+    proton_entry("2", "Rook R.E.P.O. Detail", None, None),
+  ];
+  let (_, name_map) = build_aux_maps(&db);
+  let nodot = undotted_names(&name_map);
+  // Dotted title present de-dotted (dots become spaces, runs collapse);
+  // dotless titles absent.
+  assert_eq!(nodot.get("rook r e p o detail"), Some(&1));
+  assert!(!nodot.contains_key("how to fish"));
+  // Canonical-first ties: a later duplicate cannot shadow.
+  let db2 = vec![
+    proton_entry("1", "Rook R.E.P.O. Detail", None, None),
+    proton_entry("2", "Rook R E P O Detail", None, None),
+  ];
+  let (_, name_map2) = build_aux_maps(&db2);
+  assert_eq!(
+    undotted_names(&name_map2).get("rook r e p o detail"),
+    Some(&0)
+  );
+}
+
+#[test]
+fn dotted_title_folder_matches_as_last_tier() {
+  use crate::server::process::Exec;
+
+  // On-disk folder keeps the dots (`R.E.P.O.`); the exact walk skips
+  // dotted components as versions, so only the de-dotted tier can hit.
+  // Exe stem is single-word (gated by design): the folder carries it.
+  let db = vec![proton_entry(
+    "7",
+    "Rook R.E.P.O. Detail",
+    None,
+    Some("7654321"),
+  )];
+  let server = proton_server(db);
+  let bundle = server.bundle();
+  let mut variant_bufs: [String; 5] = Default::default();
+  let mut reversed_path = String::with_capacity(256);
+  let mut obs_open = false;
+  let hit = server
+    .match_process(
+      &Exec {
+        pid: u64::MAX,
+        path: "/games/Rook R.E.P.O. Detail/game.bin".to_string(),
+        arguments: None,
+      },
+      &bundle,
+      &mut variant_bufs,
+      &mut reversed_path,
+      &mut obs_open,
+    )
+    .expect("de-dotted folder must match the dotted title");
+  assert_eq!(hit.id, "7");
+
+  // Exact matches still win: a version-looking folder never shadows a
+  // real exact folder hit for another entry.
+  let db = vec![
+    proton_entry("1", "How to Fish", None, None),
+    proton_entry("2", "Rook R.E.P.O. Detail", None, None),
+  ];
+  let server = proton_server(db);
+  let bundle = server.bundle();
+  let hit = server
+    .match_process(
+      &Exec {
+        pid: u64::MAX,
+        path: "/games/how to fish/v1.2.3/how to fish.bin".to_string(),
+        arguments: None,
+      },
+      &bundle,
+      &mut variant_bufs,
+      &mut reversed_path,
+      &mut obs_open,
+    )
+    .expect("exact folder still matches");
+  assert_eq!(hit.id, "1");
 }
 
 #[test]

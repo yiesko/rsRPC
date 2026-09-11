@@ -69,6 +69,11 @@ pub(crate) struct DetectablesBundle {
   /// Normalized game name -> activity index, for the conservative exe-stem
   /// fallback (exact, multi-word names only, e.g. `how to fish`).
   name_map: HashMap<String, usize>,
+  /// De-dotted twin of `name_map` above (only keys containing dots):
+  /// last-tier fallback for dotted title folders (`R.E.P.O.`,
+  /// `Q.U.B.E.`), which the exact walk skips as versions. Built by
+  /// [`undotted_names`], same canonical-first ties.
+  name_map_nodot: HashMap<String, usize>,
   custom: Vec<Arc<DetectableActivity>>,
   custom_ac: Option<AhoCorasick>,
   custom_indexes: Vec<[usize; 2]>,
@@ -87,6 +92,7 @@ impl DetectablesBundle {
       proton_indexes: Vec::new(),
       steam_map: HashMap::new(),
       name_map: HashMap::new(),
+      name_map_nodot: HashMap::new(),
       custom: Vec::new(),
       custom_ac: None,
       custom_indexes: Vec::new(),
@@ -1000,8 +1006,13 @@ impl ProcessServer {
         // location (Steam's ground truth) still beats name guessing.
         let non_steam = app_id.as_deref().is_some_and(is_shortcut_id);
         if non_steam
-          && let Some(hit) =
-            match_name_or_folder(&lowered, process.pid, &bundle.name_map, &bundle.list)
+          && let Some(hit) = match_name_or_folder(
+            &lowered,
+            process.pid,
+            &bundle.name_map,
+            &bundle.name_map_nodot,
+            &bundle.list,
+          )
         {
           return Some(hit);
         }
@@ -1036,7 +1047,13 @@ impl ProcessServer {
         if non_steam {
           return None;
         }
-        return match_name_or_folder(&lowered, process.pid, &bundle.name_map, &bundle.list);
+        return match_name_or_folder(
+          &lowered,
+          process.pid,
+          &bundle.name_map,
+          &bundle.name_map_nodot,
+          &bundle.list,
+        );
       }
     };
 
@@ -1549,6 +1566,33 @@ pub(crate) fn build_aux_maps(
   (steam_map, name_map)
 }
 
+/// De-dotted form for the folder-walk fallback tier: dots become
+/// spaces (runs collapsed), so `R.E.P.O. Ghost Haul` compares equal on
+/// the map-key side and the on-disk folder side alike.
+fn dedot(name: &str) -> String {
+  name
+    .replace('.', " ")
+    .split_whitespace()
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
+/// De-dotted twin of the name map, for the folder-walk fallback (see
+/// [`match_name_or_folder`]): only keys that actually contain dots, so
+/// the extra table stays tiny. Built in canonical order (lowest index
+/// wins ties), exactly like the main map.
+pub(crate) fn undotted_names(name_map: &HashMap<String, usize>) -> HashMap<String, usize> {
+  let mut ordered: Vec<(&String, &usize)> = name_map.iter().collect();
+  ordered.sort_by_key(|(_, index)| *index);
+  let mut nodot = HashMap::new();
+  for (key, index) in ordered {
+    if key.contains('.') {
+      nodot.entry(dedot(key)).or_insert(*index);
+    }
+  }
+  nodot
+}
+
 /// Drop matches on suspended processes (see [`is_suspended`]): a SIGSTOP'd
 /// game shows a frozen frame at best — it is not being played. Single
 /// choke point for every aux hit (appid/stem/folder), mirroring the scan
@@ -1664,6 +1708,7 @@ pub(crate) fn match_name_or_folder(
   process_path: &str,
   pid: u64,
   name_map: &HashMap<String, usize>,
+  name_map_nodot: &HashMap<String, usize>,
   detectable_list: &[Arc<DetectableActivity>],
 ) -> Option<Arc<DetectableActivity>> {
   let stem = exe_stem(process_path);
@@ -1696,6 +1741,28 @@ pub(crate) fn match_name_or_folder(
     {
       debug!(
         "[Process Scanner] Folder match: {} (folder `{}`)",
+        obj.name, folder
+      );
+      return live_or_none(obj, pid);
+    }
+  }
+
+  // Last tier: dotted titles (`R.E.P.O.`, `Q.U.B.E.`, `Mr. Bomber`).
+  // Version/hidden-dir components can never match (single-word or short
+  // after de-dotting, still gated) — but a dotted title folder can, so
+  // compare de-dotted against the de-dotted twin map. Strictly after the
+  // exact pass above, so exact matches always win.
+  for component in process_path.rsplit('/').skip(1) {
+    if !component.contains('.') {
+      continue;
+    }
+    let folder = normalize_name(&dedot(component));
+    if name_matchable(&folder)
+      && let Some(&idx) = name_map_nodot.get(&folder)
+      && let Some(obj) = detectable_list.get(idx)
+    {
+      debug!(
+        "[Process Scanner] Folder match (de-dotted): {} (folder `{}`)",
         obj.name, folder
       );
       return live_or_none(obj, pid);
@@ -1883,6 +1950,7 @@ fn build_bundle(
   let (ac, idx) = build_ac_patterns(&detectable)?;
   let (proton_ac, proton_idx) = build_proton_ac_patterns(&detectable)?;
   let (steam_map, name_map) = build_aux_maps(&detectable);
+  let name_map_nodot = undotted_names(&name_map);
   let (custom_ac, custom_idx) = if custom.is_empty() {
     (None, Vec::new())
   } else {
@@ -1897,6 +1965,7 @@ fn build_bundle(
     proton_indexes: proton_idx,
     steam_map,
     name_map,
+    name_map_nodot,
     custom,
     custom_ac,
     custom_indexes: custom_idx,

@@ -142,6 +142,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dead-peer IPC replies log at debug; `last_process` bounded like the
   handoff tables; remaining bool flags (`--list-detected`,
   `--list-database`) and the logger accept boolish values.
+- Dotted titles match their folders as a last tier (`R.E.P.O.`, `Q.U.B.E.`,
+  `Mr. Bomber`): the exact walk still skips dotted components as versions,
+  then a de-dotted twin map (`undotted_names`, canonical-first ties) is
+  consulted — exact matches always win. Punctuation forbidden in Windows
+  filenames (`: ? " < > | * / \`) already folds in `normalize_name`.
 
 ## [0.32.2] - 2026-09-09
 
