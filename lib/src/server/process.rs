@@ -22,19 +22,19 @@ pub struct ProcessScanState {
 }
 
 #[derive(Default)]
-pub struct ProcessEventListeners {
+pub(crate) struct ProcessEventListeners {
   pub on_process_scan_complete: Option<Arc<Mutex<ProcessCallback>>>,
 }
 
 #[derive(Clone)]
-pub struct Exec {
+pub(crate) struct Exec {
   pub(crate) pid: u64,
   pub(crate) path: String,
   pub(crate) arguments: Option<String>,
 }
 
 #[derive(Clone)]
-pub struct ProcessDetectedEvent {
+pub(crate) struct ProcessDetectedEvent {
   pub activity: Arc<DetectableActivity>,
 }
 
@@ -69,7 +69,7 @@ pub(crate) struct DetectablesBundle {
 }
 
 #[derive(Clone)]
-pub struct ProcessServer {
+pub(crate) struct ProcessServer {
   /// Current detection generation (see [`DetectablesBundle`]): cloned by
   /// readers, swapped whole by writers. Custom overrides live in the same
   /// bundle, so user appends can never tear against the main patterns
@@ -135,7 +135,7 @@ impl ProcessServer {
   // through here; bundling them would churn the public constructor for no
   // runtime gain.
   #[allow(clippy::too_many_arguments)]
-  pub fn new(
+  pub(crate) fn new(
     detectable: Vec<Arc<DetectableActivity>>,
     event_sender: mpsc::Sender<ProcessDetectedEvent>,
     event_listeners: ProcessEventListeners,
@@ -198,11 +198,9 @@ impl ProcessServer {
     release_parse_arenas();
   }
 
-  /**
-   * Replace the main detectable games database at runtime (used by the
-   * periodic refresh), rebuilding the whole bundle and swapping it in
-   * one pointer write.
-   */
+  /// Replace the main detectable games database at runtime (used by the
+  /// periodic refresh), rebuilding the whole bundle and swapping it in
+  /// one pointer write.
   fn update_main_detectables(&self, detectable: Vec<DetectableActivity>) {
     // Never swap in an empty database (outage returning `[]`, corrupt
     // fetch): it would build a failing automaton and blind detection.
@@ -227,7 +225,7 @@ impl ProcessServer {
     release_parse_arenas();
   }
 
-  pub fn append_detectables(&self, detectable: Vec<DetectableActivity>) {
+  pub(crate) fn append_detectables(&self, detectable: Vec<DetectableActivity>) {
     // Append to the custom list, since that's what is actually scanned
     let mut custom = self
       .detectables
@@ -239,7 +237,7 @@ impl ProcessServer {
     self.rebuild_custom(custom);
   }
 
-  pub fn remove_detectable_by_name(&self, name: &str) {
+  pub(crate) fn remove_detectable_by_name(&self, name: &str) {
     let mut custom = self
       .detectables
       .lock()
@@ -252,7 +250,7 @@ impl ProcessServer {
 
   /// Replace the exclusions set (startup fetch, tests). The hourly refresh
   /// thread overwrites it on the same cadence when `exclusions_url` is set.
-  pub fn set_exclusions(&self, exclusions: Exclusions) {
+  pub(crate) fn set_exclusions(&self, exclusions: Exclusions) {
     *self.exclusions.lock().unwrap_or_else(|e| e.into_inner()) = exclusions;
   }
 
@@ -260,7 +258,7 @@ impl ProcessServer {
   /// gate): production builds it via discovery in [`ProcessServer::new`]
   /// and refreshes it per scan tick.
   #[cfg(test)]
-  pub fn set_steam_libraries(&self, libraries: SteamLibraries) {
+  pub(crate) fn set_steam_libraries(&self, libraries: SteamLibraries) {
     *self
       .steam_libraries
       .lock()
@@ -367,7 +365,7 @@ impl ProcessServer {
     }
   }
 
-  pub fn start(&self, scan_interval: Duration) {
+  pub(crate) fn start(&self, scan_interval: Duration) {
     let wait_time = scan_interval;
     let clone = self.clone();
 
@@ -568,7 +566,7 @@ impl ProcessServer {
   }
 
   #[cfg(not(target_os = "linux"))]
-  pub fn process_list(&self) -> Result<Vec<Exec>, Box<dyn std::error::Error>> {
+  pub(crate) fn process_list(&self) -> crate::error::Result<Vec<Exec>> {
     use std::path::Path;
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
 
@@ -600,7 +598,7 @@ impl ProcessServer {
   }
 
   #[cfg(target_os = "linux")]
-  pub fn process_list() -> Result<Vec<Exec>, Box<dyn std::error::Error>> {
+  pub(crate) fn process_list() -> crate::error::Result<Vec<Exec>> {
     use std::fs;
 
     let proc_list = fs::read_dir("/proc")?.filter(|e| {
@@ -882,9 +880,7 @@ impl ProcessServer {
   }
 
   #[hotpath::measure]
-  pub fn scan_for_processes(
-    &self,
-  ) -> Result<Vec<Arc<DetectableActivity>>, Box<dyn std::error::Error>> {
+  pub(crate) fn scan_for_processes(&self) -> crate::error::Result<Vec<Arc<DetectableActivity>>> {
     #[cfg(not(target_os = "linux"))]
     let processes = self.process_list()?;
     #[cfg(target_os = "linux")]
@@ -894,7 +890,9 @@ impl ProcessServer {
 
     if self.scanning.load(std::sync::atomic::Ordering::Relaxed) {
       debug!("[Process Scanner] Scanning already in progress");
-      return Err("Scanning already in progress".into());
+      return Err(crate::error::RsrpcError::Message(
+        "Scanning already in progress".to_string(),
+      ));
     }
 
     let mut obs_open = false;
@@ -905,7 +903,7 @@ impl ProcessServer {
     let bundle = self
       .detectables
       .lock()
-      .map_err(|e| format!("detectables lock poisoned: {e}"))?
+      .map_err(|e| crate::error::RsrpcError::Poisoned("detectables", e.to_string()))?
       .clone();
 
     // Steam generation marker: one stat per watched libraryfolders.vdf;
@@ -920,7 +918,7 @@ impl ProcessServer {
     self
       .appid_cache
       .lock()
-      .map_err(|e| format!("appid_cache lock poisoned: {e}"))?
+      .map_err(|e| crate::error::RsrpcError::Poisoned("appid_cache", e.to_string()))?
       .retain(|pid, _| live.contains(pid));
 
     let mut reversed_path = String::with_capacity(256);
@@ -944,16 +942,16 @@ impl ProcessServer {
     let callback = self
       .event_listeners
       .lock()
-      .map_err(|e| format!("event_listeners lock poisoned: {e}"))?
+      .map_err(|e| crate::error::RsrpcError::Poisoned("event_listeners", e.to_string()))?
       .on_process_scan_complete
       .clone();
 
     if let Some(callback) = callback.as_ref() {
       callback
         .lock()
-        .map_err(|e| format!("process callback lock poisoned: {e}"))?(ProcessScanState {
-        obs_open,
-      });
+        .map_err(|e| crate::error::RsrpcError::Poisoned("process callback", e.to_string()))?(
+        ProcessScanState { obs_open },
+      );
     }
 
     detected_list.shrink_to_fit();
@@ -1524,13 +1522,11 @@ pub(crate) fn body_hash(body: &str) -> u64 {
   hasher.finish()
 }
 
-/**
- * Fetch Discord's detection exclusions (installer/crash-reporter names +
- * regex patterns). Tiny payload (a few KB): plain GET with a 1 MiB cap, no
- * ETag dance — the hourly cadence dominates the cost, and parsing is
- * `tolerant by design` (see [`parse_exclusions`]).
- */
-pub(crate) fn fetch_exclusions(url: &str) -> Result<Exclusions, Box<dyn std::error::Error>> {
+/// Fetch Discord's detection exclusions (installer/crash-reporter names +
+/// regex patterns). Tiny payload (a few KB): plain GET with a 1 MiB cap, no
+/// ETag dance — the hourly cadence dominates the cost, and parsing is
+/// `tolerant by design` (see [`parse_exclusions`]).
+pub(crate) fn fetch_exclusions(url: &str) -> crate::error::Result<Exclusions> {
   let body = crate::http_agent(std::time::Duration::from_secs(30))
     .get(url)
     .call()?
@@ -1541,17 +1537,15 @@ pub(crate) fn fetch_exclusions(url: &str) -> Result<Exclusions, Box<dyn std::err
   Ok(parse_exclusions(&body))
 }
 
-/**
- * Fetch the detectable games database, skipping the download when it has
- * not changed since `etag` (Discord answers `304`, `ETag` + `max-age=3600`
- * line up with the hourly cadence). A 304 costs one header round trip and
- * zero parsing, so idle hours leave RSS untouched.
- */
+/// Fetch the detectable games database, skipping the download when it has
+/// not changed since `etag` (Discord answers `304`, `ETag` + `max-age=3600`
+/// line up with the hourly cadence). A 304 costs one header round trip and
+/// zero parsing, so idle hours leave RSS untouched.
 pub(crate) fn fetch_detectable_etag(
   url: &str,
   etag: Option<&str>,
   known_hash: Option<u64>,
-) -> Result<FetchOutcome, Box<dyn std::error::Error>> {
+) -> crate::error::Result<FetchOutcome> {
   let mut request = crate::http_agent(std::time::Duration::from_secs(30)).get(url);
   if let Some(tag) = etag {
     request = request.header("If-None-Match", tag);
@@ -1605,15 +1599,13 @@ pub(crate) fn fetch_detectable_etag(
   })
 }
 
-/**
- * Generate matching variants of a process path, removing 64-bit markers
- * (parity with arrpc/pog5-rsrpc). E.g. `/games/wow64.exe` produces
- * `/games/wow.exe` which matches a `wow.exe` database entry.
- *
- * Writes into caller-owned buffers and returns how many are filled, so the
- * per-process scan allocates nothing at steady state (buffers are reused
- * across processes and scans; only marker hits allocate one temp string).
- */
+/// Generate matching variants of a process path, removing 64-bit markers
+/// (parity with arrpc/pog5-rsrpc). E.g. `/games/wow64.exe` produces
+/// `/games/wow.exe` which matches a `wow.exe` database entry.
+///
+/// Writes into caller-owned buffers and returns how many are filled, so the
+/// per-process scan allocates nothing at steady state (buffers are reused
+/// across processes and scans; only marker hits allocate one temp string).
 pub(crate) fn path_variants_into(path: &str, out: &mut [String; 5]) -> usize {
   out[0].clear();
   out[0].push_str(path);

@@ -140,6 +140,7 @@ fn parse_vdf(tokens: &[String]) -> HashMap<String, Vdf> {
 }
 
 /// Parse a whole VDF document into nested maps.
+#[must_use]
 pub(crate) fn parse_vdf_str(input: &str) -> HashMap<String, Vdf> {
   let tokens = tokenize(input);
   // Token-count cap: a 4MB file of quote pairs could otherwise build a
@@ -174,6 +175,7 @@ fn read_limited(path: &Path, limit: u64) -> Result<String, std::io::Error> {
 
 /// Library paths from a parsed `libraryfolders.vdf`: new format nests them
 /// under `"path"`, legacy format stores the path directly as the value.
+#[must_use]
 pub(crate) fn library_paths(doc: &HashMap<String, Vdf>) -> Vec<String> {
   let folders = doc
     .get("libraryfolders")
@@ -273,7 +275,7 @@ fn dir_fingerprint(apps_dir: &Path) -> Option<Fingerprint> {
 
 /// Install-dir -> AppId over every known Steam library.
 #[derive(Clone, Debug, Default)]
-pub struct SteamLibraries {
+pub(crate) struct SteamLibraries {
   /// `libraryfolders.vdf` files whose mtime gates a refresh.
   watched: Vec<PathBuf>,
   /// Last-seen mtimes of the watched files.
@@ -304,7 +306,7 @@ impl SteamLibraries {
   /// on-disk cache and every discovery source. Test-only for now (hence
   /// the gate): production has no caller yet.
   #[cfg(test)]
-  pub fn from_root(root: &Path) -> Self {
+  pub(crate) fn from_root(root: &Path) -> Self {
     let mut libraries = Self {
       roots: vec![root.to_path_buf()],
       exclusive: true,
@@ -730,6 +732,7 @@ fn path_steam_roots() -> Vec<PathBuf> {
 /// itself no longer lists (moved drives, copied folders, other users).
 /// Pure over a mounts-table string for testability; the live table comes
 /// from `/proc/mounts`.
+#[must_use]
 pub(crate) fn mount_library_roots_for(mounts: &str) -> Vec<PathBuf> {
   const SKIP_TYPES: &[&str] = &[
     "proc",

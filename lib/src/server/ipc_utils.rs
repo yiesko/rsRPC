@@ -11,7 +11,7 @@ use crate::{
   commands, debug, log, warn,
 };
 
-pub trait IpcFacilitator {
+pub(crate) trait IpcFacilitator {
   fn handshake(&self) -> bool;
   fn set_handshake(&mut self, handshake: bool);
 
@@ -39,7 +39,7 @@ pub trait IpcFacilitator {
 }
 
 #[derive(Debug)]
-pub enum PacketType {
+pub(crate) enum PacketType {
   Handshake,
   Frame,
   Close,
@@ -49,13 +49,13 @@ pub enum PacketType {
 
 /// Maximum IPC frame payload in bytes, matching arRPC/Discord (1 MiB).
 /// Larger frames are refused with a `1003` close instead of being read.
-pub const MAX_IPC_PAYLOAD: u32 = 1024 * 1024;
+pub(crate) const MAX_IPC_PAYLOAD: u32 = 1024 * 1024;
 
 impl PacketType {
   /// `None` for out-of-range types: the caller must refuse those with a
   /// `1003 Unsupported` close (arRPC parity) instead of misreading them
   /// as frames.
-  pub fn try_from_u32(value: u32) -> Option<Self> {
+  pub(crate) fn try_from_u32(value: u32) -> Option<Self> {
     match value {
       0 => Some(PacketType::Handshake),
       1 => Some(PacketType::Frame),
@@ -68,12 +68,12 @@ impl PacketType {
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
-pub struct Handshake {
+pub(crate) struct Handshake {
   pub v: u32,
   pub client_id: String,
 }
 
-pub fn encode(r_type: PacketType, data: &str) -> Vec<u8> {
+pub(crate) fn encode(r_type: PacketType, data: &str) -> Vec<u8> {
   let mut buffer: Vec<u8> = Vec::with_capacity(8 + data.len());
 
   // Write the packet type
@@ -89,7 +89,7 @@ pub fn encode(r_type: PacketType, data: &str) -> Vec<u8> {
 }
 
 /// Encode a `Close` frame carrying a Discord-style `{code, message}` body.
-pub fn close_frame(code: u16, message: &str) -> Vec<u8> {
+pub(crate) fn close_frame(code: u16, message: &str) -> Vec<u8> {
   encode(
     PacketType::Close,
     &serde_json::json!({ "code": code, "message": message }).to_string(),
@@ -102,7 +102,7 @@ fn send_close(stream: &mut Stream, code: u16, message: &str) {
 }
 
 #[allow(clippy::result_large_err)]
-pub fn send_empty(
+pub(crate) fn send_empty(
   event_sender: &mut mpsc::Sender<ActivityCmd>,
   pid: u64,
 ) -> Result<(), mpsc::SendError<ActivityCmd>> {
@@ -123,7 +123,7 @@ pub fn send_empty(
   event_sender.send(activity)
 }
 
-pub fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut Stream) {
+pub(crate) fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut Stream) {
   loop {
     let current_pid = ipc.pid();
     // Read into buffer
@@ -278,7 +278,7 @@ pub fn handle_stream(ipc: &mut dyn IpcFacilitator, stream: &mut Stream) {
             let matched = wanted.is_none_or(|id| *id == user.id);
             let resp = encode(
               PacketType::Frame,
-              &commands::get_user_response(&activity_cmd, matched.then_some(&user)),
+              &commands::user_response(&activity_cmd, matched.then_some(&user)),
             );
             let _ = stream.write_all(&resp);
           }

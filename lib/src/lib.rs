@@ -16,6 +16,7 @@ use user::RpcUser;
 pub mod cmd;
 pub mod commands;
 pub mod detection;
+pub mod error;
 mod logger;
 pub mod overrides;
 mod server;
@@ -27,6 +28,89 @@ pub mod user;
 mod tests;
 
 pub type ProcessCallback = dyn FnMut(ProcessScanState) + Send + Sync;
+
+/// Discord application id: identifies a game/activity slot. Newtyped so
+/// socket ids, pids and raw strings can never mix at compile time; same
+/// wire format as the inner string.
+#[derive(
+  Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct AppId(pub String);
+
+/// Bridge socket id: identifies one client connection slot. See [`AppId`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct SocketId(pub String);
+
+impl std::fmt::Display for AppId {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    self.0.fmt(f)
+  }
+}
+
+impl std::fmt::Display for SocketId {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    self.0.fmt(f)
+  }
+}
+
+impl AsRef<str> for AppId {
+  fn as_ref(&self) -> &str {
+    &self.0
+  }
+}
+
+/// Borrow as `str` so `HashMap<AppId, _>` lookups accept `&str` without
+/// allocating an owned key on the hot path.
+impl std::borrow::Borrow<str> for AppId {
+  fn borrow(&self) -> &str {
+    &self.0
+  }
+}
+
+/// Same as [`AppId`]: socket maps accept `&str` lookups directly.
+impl std::borrow::Borrow<str> for SocketId {
+  fn borrow(&self) -> &str {
+    &self.0
+  }
+}
+
+impl AsRef<str> for SocketId {
+  fn as_ref(&self) -> &str {
+    &self.0
+  }
+}
+
+impl From<String> for AppId {
+  fn from(id: String) -> Self {
+    Self(id)
+  }
+}
+
+impl From<&str> for AppId {
+  fn from(id: &str) -> Self {
+    Self(id.to_string())
+  }
+}
+
+impl From<String> for SocketId {
+  fn from(id: String) -> Self {
+    Self(id)
+  }
+}
+
+impl From<&str> for SocketId {
+  fn from(id: &str) -> Self {
+    Self(id.to_string())
+  }
+}
+
+/// An app slot doubles as its own socket on the generic (scanner-driven)
+/// path: move the id across instead of cloning it.
+impl From<AppId> for SocketId {
+  fn from(id: AppId) -> Self {
+    Self(id.0)
+  }
+}
 
 /// HTTP agent for Discord fetches (database, exclusions) with a global
 /// timeout: without it, a blackholed endpoint hangs the hourly refresh
@@ -110,7 +194,7 @@ impl Default for RPCConfig {
 }
 
 #[derive(Clone)]
-pub struct Connectors {
+pub(crate) struct Connectors {
   process_server: Arc<Mutex<ProcessServer>>,
   client_connector: Arc<Mutex<ClientConnector>>,
   ipc_connector: Arc<Mutex<IpcConnector>>,
@@ -135,14 +219,18 @@ pub struct RPCServer {
 }
 
 impl RPCServer {
+  /// # Errors
+  ///
+  /// Returns [`RsrpcError::InvalidJson`](crate::error::RsrpcError::InvalidJson)
+  /// when the database is not a JSON array of detectable activities.
   pub fn from_json_str(
     detectable: impl AsRef<str>,
     config: RPCConfig,
-  ) -> Result<Self, Box<dyn std::error::Error>> {
+  ) -> crate::error::Result<Self> {
     // Parse as DetectableActivity vector; invalid JSON is a caller error,
     // propagated (never panics: this is a library constructor).
     let detectable: Vec<DetectableActivity> = serde_json::from_str(detectable.as_ref())
-      .map_err(|err| format!("invalid JSON provided to RPCServer: {err}"))?;
+      .map_err(|err: serde_json::Error| crate::error::RsrpcError::InvalidJson(err.to_string()))?;
 
     let detectable: Vec<Arc<DetectableActivity>> = detectable.into_iter().map(Arc::new).collect();
 
@@ -159,40 +247,50 @@ impl RPCServer {
     })
   }
 
-  /**
-   * Create a new RPCServer and read the detectable games list from file.
-   */
-  pub fn from_file(file: PathBuf, config: RPCConfig) -> Result<Self, Box<dyn std::error::Error>> {
+  /// Create a new RPCServer and read the detectable games list from file.
+  /// # Errors
+  ///
+  /// Returns [`RsrpcError::UnreadableFile`](crate::error::RsrpcError::UnreadableFile)
+  /// when the file is missing or unreadable, or `InvalidJson` when it does
+  /// not parse.
+  pub fn from_file(file: PathBuf, config: RPCConfig) -> crate::error::Result<Self> {
     // Read the detectable games list from file.
-    let detectable = std::fs::read_to_string(&file)
-      .map_err(|err| format!("rpcserver could not find file {:?}: {err}", file.display()))?;
+    let detectable =
+      std::fs::read_to_string(&file).map_err(|err| crate::error::RsrpcError::UnreadableFile {
+        path: file.clone(),
+        source: err,
+      })?;
 
     Self::from_json_str(detectable.as_str(), config)
   }
 
-  /**
-   * Create a new RPCServer using the bundled snapshot of Discord's detectable
-   * games database. This works fully offline.
-   */
-  pub fn from_bundled(config: RPCConfig) -> Result<Self, Box<dyn std::error::Error>> {
+  /// Create a new RPCServer using the bundled snapshot of Discord's detectable
+  /// games database. This works fully offline.
+  /// # Errors
+  ///
+  /// Essentially infallible (the snapshot is validated at release time);
+  /// bubbles `InvalidJson` only if the embedded data is corrupt.
+  pub fn from_bundled(config: RPCConfig) -> crate::error::Result<Self> {
     Self::from_json_str(detection::BUNDLED_DETECTABLE, config)
   }
 
-  /**
-   * Run a single process scan without starting any threads/connectors.
-   * Used by `--list-detected` diagnostics. Reads the database held by
-   * this server (call before [`start`](RPCServer::start): startup moves
-   * the database to the scanner, leaving this side empty), applies staged
-   * overrides and the ignore-list exactly like the daemon would — what
-   * you see here is what running would publish.
-   */
-  pub fn detect_once(&self) -> Result<Vec<DetectedGame>, Box<dyn std::error::Error>> {
+  /// Run a single process scan without starting any threads/connectors.
+  /// Used by `--list-detected` diagnostics. Reads the database held by
+  /// this server (call before [`start`](RPCServer::start): startup moves
+  /// the database to the scanner, leaving this side empty), applies staged
+  /// overrides and the ignore-list exactly like the daemon would — what
+  /// you see here is what running would publish.
+  /// # Errors
+  ///
+  /// Propagates scan failures (`/proc` unreadable) and poisoned internal
+  /// locks as [`RsrpcError`](crate::error::RsrpcError) variants.
+  pub fn detect_once(&self) -> crate::error::Result<Vec<DetectedGame>> {
     let (tx, _rx) = mpsc::channel();
     let server = ProcessServer::new(
       self
         .detectable
         .lock()
-        .map_err(|e| format!("detectable lock poisoned: {e}"))?
+        .map_err(|e| crate::error::RsrpcError::Poisoned("detectable", e.to_string()))?
         .to_vec(),
       tx,
       ProcessEventListeners::default(),
@@ -224,12 +322,10 @@ impl RPCServer {
     )
   }
 
-  /**
-   * Summarize the held database (entry count, executable count, names).
-   * Like [`detect_once`](RPCServer::detect_once), call this before
-   * [`start`](RPCServer::start): startup moves the database to the
-   * scanner, leaving this side empty.
-   */
+  /// Summarize the held database (entry count, executable count, names).
+  /// Like [`detect_once`](RPCServer::detect_once), call this before
+  /// [`start`](RPCServer::start): startup moves the database to the
+  /// scanner, leaving this side empty.
   pub fn database_summary(&self) -> Result<Vec<DetectableSummary>, String> {
     let detectable = self
       .detectable
@@ -247,12 +343,10 @@ impl RPCServer {
     )
   }
 
-  /**
-   * Add new detectable processes on-the-fly. Before [`start`](RPCServer::start)
-   * this stages them (applied to the live scanner on start AND to
-   * [`detect_once`](RPCServer::detect_once)); after `start()` it applies
-   * them to the running scanner directly, as before.
-   */
+  /// Add new detectable processes on-the-fly. Before [`start`](RPCServer::start)
+  /// this stages them (applied to the live scanner on start AND to
+  /// [`detect_once`](RPCServer::detect_once)); after `start()` it applies
+  /// them to the running scanner directly, as before.
   pub fn append_detectables(&mut self, detectable: Vec<DetectableActivity>) {
     if self.connectors.is_none() {
       log!(
@@ -263,51 +357,54 @@ impl RPCServer {
       return;
     }
 
-    self
-      .connectors
-      .as_mut()
-      .unwrap()
+    let Some(connectors) = self.connectors.as_mut() else {
+      // Unreachable in practice (checked above): kept so a future
+      // refactor removing the guard fails safe instead of panicking.
+      log!("[RPC Server] Cannot append detectables, connectors are not initialized");
+      return;
+    };
+    connectors
       .process_server
       .lock()
-      .unwrap()
+      .unwrap_or_else(|e| e.into_inner())
       .append_detectables(detectable);
   }
 
-  /**
-   * Remove a detectable process by name.
-   */
+  /// Remove a detectable process by name.
   pub fn remove_detectable_by_name(&mut self, name: &str) {
     if self.connectors.is_none() {
       log!("[RPC Server] Cannot remove detectable, connectors are not initialized");
       return;
     }
 
-    self
-      .connectors
-      .as_mut()
-      .unwrap()
+    let Some(connectors) = self.connectors.as_mut() else {
+      log!("[RPC Server] Cannot remove detectable, connectors are not initialized");
+      return;
+    };
+    connectors
       .process_server
       .lock()
-      .unwrap()
+      .unwrap_or_else(|e| e.into_inner())
       .remove_detectable_by_name(name);
   }
 
-  /**
-   * Manually trigger a scan for processes. This should be run AFTER start().
-   */
+  /// Manually trigger a scan for processes. This should be run AFTER start().
+  /// Logs (instead of failing) when connectors are missing or the scan
+  /// errors; never panics.
   pub fn scan_for_processes(&mut self) {
     if self.connectors.is_none() {
       log!("[RPC Server] Cannot scan processes, connectors are not initialized");
       return;
     }
 
-    let process_server = self
-      .connectors
-      .as_mut()
-      .unwrap()
+    let Some(connectors) = self.connectors.as_mut() else {
+      log!("[RPC Server] Cannot scan processes, connectors are not initialized");
+      return;
+    };
+    let process_server = connectors
       .process_server
       .lock()
-      .unwrap();
+      .unwrap_or_else(|e| e.into_inner());
 
     match process_server.scan_for_processes() {
       Ok(_) => {}
@@ -336,8 +433,15 @@ impl RPCServer {
   fn take_detectables(&mut self) -> Vec<Arc<DetectableActivity>> {
     std::mem::take(&mut *self.detectable.lock().unwrap_or_else(|e| e.into_inner()))
   }
-
-  pub fn start(&mut self) {
+  /// Binds bridge ports and spawns every connector thread.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`RsrpcError`](crate::error::RsrpcError) when no bridge or
+  /// websocket port in the configured ranges can be bound (all in use).
+  /// No process is killed: the caller (e.g. `cli/src/main.rs`) decides
+  /// whether to exit. Never panics.
+  pub fn start(&mut self) -> crate::error::Result<()> {
     let (proc_event_sender, proc_event_receiver) = mpsc::channel();
     let (ipc_event_sender, ipc_event_receiver) = mpsc::channel();
     let (ws_event_sender, ws_event_reciever) = mpsc::channel();
@@ -353,7 +457,7 @@ impl RPCServer {
       self.config.ws_port_start,
       self.config.ws_port_end,
       user.clone(),
-    );
+    )?;
     let mut client_connector = ClientConnector::new(
       self.config.port,
       self.config.bridge_port_end,
@@ -362,7 +466,7 @@ impl RPCServer {
       ipc_event_receiver,
       proc_event_receiver,
       ws_event_reciever,
-    );
+    )?;
     client_connector.set_extra_servers(ws_connector.bound_port, Some(ipc_connector.socket_path()));
 
     let connectors = Connectors {
@@ -452,5 +556,6 @@ impl RPCServer {
 
     log!("[RPC Server] Done! Watching for activity...");
     self.connectors = Some(connectors);
+    Ok(())
   }
 }

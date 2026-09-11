@@ -8,7 +8,7 @@ use simple_websockets::{Event, EventHub, Message, Responder};
 
 use crate::{
   cmd::ActivityCmd,
-  commands, debug, error, log,
+  commands, debug, log,
   state::{self, StateActivity, StateServer, StateServers, StateSnapshot},
   url_params::get_url_params,
   user::RpcUser,
@@ -19,17 +19,17 @@ use super::process::ProcessDetectedEvent;
 
 /// How many bridge ports to scan when the first choice is taken
 /// (`port..=port_end`, arRPC scans `1337-1347` the same way).
-pub const BRIDGE_PORT_SCAN_SPAN: u16 = 10;
+pub(crate) const BRIDGE_PORT_SCAN_SPAN: u16 = 10;
 /// Cap on replayed activities (arRPC keeps 50): bounds memory when many
 /// distinct pids publish without clearing.
-pub const MAX_CACHED_ACTIVITIES: usize = 50;
+pub(crate) const MAX_CACHED_ACTIVITIES: usize = 50;
 /// How often cached activities are rebroadcast so bridge clients that
 /// missed a frame converge (arRPC refreshes every 30s).
-pub const BRIDGE_REFRESH_INTERVAL_SECS: u64 = 30;
+pub(crate) const BRIDGE_REFRESH_INTERVAL_SECS: u64 = 30;
 
 /// Which wire protocol a connected bridge client speaks.
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum BridgeProtocol {
+pub(crate) enum BridgeProtocol {
   /// JSON text frames (port 1337, the arRPC-compatible bridge).
   Json,
   /// MessagePack binary frames (port 1338).
@@ -56,7 +56,7 @@ impl BridgeProtocol {
 /// so without this the slot would stay dark until the next game switch).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ScannedGame {
-  pub(crate) id: String,
+  pub(crate) id: crate::AppId,
   pub(crate) name: String,
   pub(crate) pid: u64,
   pub(crate) start: u64,
@@ -76,10 +76,10 @@ pub(crate) struct ScannedGame {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HandoffState {
   /// App id → pid of its current IPC/WS owner (`SET_ACTIVITY` with activity).
-  live_ipc: HashMap<String, u64>,
+  live_ipc: HashMap<crate::AppId, u64>,
   /// Last games the scanner reported, by app id (a null/clear event wipes
   /// the table).
-  last_scans: HashMap<String, ScannedGame>,
+  last_scans: HashMap<crate::AppId, ScannedGame>,
 }
 
 /// Cap for the handoff tables: distinct live app-ids are tiny in practice
@@ -96,18 +96,17 @@ impl HandoffState {
     if self.live_ipc.len() >= MAX_HANDOFF_ENTRIES {
       // Purge dead owners first (the actual garbage: crashed companions
       // that never cleared). Whatever remains is live.
-      self.live_ipc.retain(|_, owner| process_alive(*owner));
+      self.live_ipc.retain(|_, owner| is_process_alive(*owner));
     }
-    self.live_ipc.insert(app_id.to_string(), pid);
+    self.live_ipc.insert(crate::AppId::from(app_id), pid);
     // Hard bound: even all-live flooding (one pid, infinite ids) stops
     // here. Evicting a live slot only desuppresses its generic until the
     // next publish re-arms it — unreachable in legitimate use (<5 ids).
     while self.live_ipc.len() > MAX_HANDOFF_ENTRIES {
-      if let Some(victim) = self.live_ipc.keys().next().cloned() {
-        self.live_ipc.remove(&victim);
-      } else {
+      let Some(victim) = self.live_ipc.keys().next().cloned() else {
         break;
-      }
+      };
+      self.live_ipc.remove(&victim);
     }
   }
 
@@ -125,15 +124,16 @@ impl HandoffState {
     match game {
       Some(game) => {
         if self.last_scans.len() >= MAX_HANDOFF_ENTRIES {
-          self.last_scans.retain(|_, known| process_alive(known.pid));
+          self
+            .last_scans
+            .retain(|_, known| is_process_alive(known.pid));
         }
         self.last_scans.insert(game.id.clone(), game);
         while self.last_scans.len() > MAX_HANDOFF_ENTRIES {
-          if let Some(victim) = self.last_scans.keys().next().cloned() {
-            self.last_scans.remove(&victim);
-          } else {
+          let Some(victim) = self.last_scans.keys().next().cloned() else {
             break;
-          }
+          };
+          self.last_scans.remove(&victim);
         }
       }
       // Null scan: the table is empty, forget every game.
@@ -142,9 +142,9 @@ impl HandoffState {
   }
 
   /// Release every slot owned by `pid` (abrupt close without CLEAR) and
-  /// return the released app ids. Without this, a dead owner suppresses
+  /// return the released app ids. Without this, a dead owner is_suppressed
   /// its slots' generics forever.
-  pub(crate) fn note_clear_pid(&mut self, pid: u64) -> Vec<String> {
+  pub(crate) fn note_clear_pid(&mut self, pid: u64) -> Vec<crate::AppId> {
     self
       .live_ipc
       .extract_if(|_, owner| *owner == pid)
@@ -153,7 +153,7 @@ impl HandoffState {
   }
 
   /// Whether generic detection must stay out of this slot right now.
-  pub(crate) fn suppresses(&self, app_id: &str) -> bool {
+  pub(crate) fn is_suppressed(&self, app_id: &str) -> bool {
     self.live_ipc.contains_key(app_id)
   }
 
@@ -179,7 +179,7 @@ impl HandoffState {
 /// Best-effort liveness probe so an IPC clear for an already-dead game
 /// doesn't flash the generic card on the way out (the scanner's null
 /// event clears the slot anyway).
-pub(crate) fn process_alive(pid: u64) -> bool {
+pub(crate) fn is_process_alive(pid: u64) -> bool {
   if pid == 0 {
     return false;
   }
@@ -203,7 +203,7 @@ pub(crate) fn generic_payload(game: &ScannedGame) -> commands::CachedActivity {
       flags: 0,
     },
     pid: game.pid,
-    socket_id: game.id.clone(),
+    socket_id: crate::SocketId::from(game.id.clone()),
   };
   commands::CachedActivity {
     json: serde_json::to_string(&payload_struct).unwrap_or_default(),
@@ -212,7 +212,7 @@ pub(crate) fn generic_payload(game: &ScannedGame) -> commands::CachedActivity {
 }
 
 #[derive(Clone)]
-pub struct ClientConnector {
+pub(crate) struct ClientConnector {
   pub port: u16,
   pub msgpack_port: u16,
 
@@ -237,7 +237,7 @@ pub struct ClientConnector {
   /// clients that connect after the activity was set (like arRPC). Each
   /// entry carries a sequence number so the cache can evict the oldest
   /// first when it hits [`MAX_CACHED_ACTIVITIES`].
-  last_activities: Arc<Mutex<HashMap<String, (commands::CachedActivity, u64)>>>,
+  last_activities: Arc<Mutex<HashMap<crate::SocketId, (commands::CachedActivity, u64)>>>,
   /// Monotonic sequence for replay-cache recency (LRU eviction order).
   activity_seq: Arc<Mutex<u64>>,
 
@@ -248,7 +248,7 @@ pub struct ClientConnector {
   /// so IPC clears never touch this map: an entry lives exactly from its
   /// generic publication to its process clear, and every later bridge
   /// client replays only live games.
-  pub last_process: Arc<Mutex<HashMap<String, u64>>>,
+  pub last_process: Arc<Mutex<HashMap<crate::AppId, u64>>>,
   /// IPC-wins handoff state (see [`HandoffState`]).
   handoff: Arc<Mutex<HandoffState>>,
 
@@ -258,7 +258,7 @@ pub struct ClientConnector {
 }
 
 impl ClientConnector {
-  pub fn new(
+  pub(crate) fn new(
     port_start: u16,
     port_end: u16,
     msgpack_port: u16,
@@ -266,8 +266,8 @@ impl ClientConnector {
     ipc_event_rec: std::sync::mpsc::Receiver<ActivityCmd>,
     proc_event_rec: std::sync::mpsc::Receiver<ProcessDetectedEvent>,
     ws_event_rec: std::sync::mpsc::Receiver<ActivityCmd>,
-  ) -> ClientConnector {
-    let (json_server, port) = launch_in_range(port_start, port_end, None, "JSON bridge");
+  ) -> crate::error::Result<ClientConnector> {
+    let (json_server, port) = launch_in_range(port_start, port_end, None, "JSON bridge")?;
     // The MessagePack port keeps its configured value unless it collides
     // with the claimed JSON port (e.g. defaults 1337/1338 are adjacent, or
     // a custom --bridge-port lands on 1338): then scan forward instead of
@@ -278,7 +278,7 @@ impl ClientConnector {
       msgpack_port.saturating_add(BRIDGE_PORT_SCAN_SPAN),
       skip,
       "MessagePack bridge",
-    );
+    )?;
 
     // Optional presence snapshot for external tooling (arRPC-compatible
     // layout, `rsrpc-` prefix so both daemons coexist).
@@ -291,7 +291,7 @@ impl ClientConnector {
       path
     });
 
-    ClientConnector {
+    Ok(ClientConnector {
       json_server: Arc::new(Mutex::new(Some(json_server))),
       msgpack_server: Arc::new(Mutex::new(Some(msgpack_server))),
 
@@ -313,17 +313,17 @@ impl ClientConnector {
       ipc_event_rec: Arc::new(Mutex::new(Some(ipc_event_rec))),
       proc_event_rec: Arc::new(Mutex::new(Some(proc_event_rec))),
       ws_event_rec: Arc::new(Mutex::new(Some(ws_event_rec))),
-    }
+    })
   }
 
   /// Fill in the servers this struct does not bind itself (called once,
   /// before [`start`](Self::start)).
-  pub fn set_extra_servers(&mut self, ws_port: Option<u16>, ipc_path: Option<String>) {
+  pub(crate) fn set_extra_servers(&mut self, ws_port: Option<u16>, ipc_path: Option<String>) {
     self.ws_port = ws_port;
     self.ipc_path = ipc_path;
   }
 
-  pub fn start(&mut self) {
+  pub(crate) fn start(&mut self) {
     let json_server = self
       .json_server
       .lock()
@@ -411,7 +411,7 @@ impl ClientConnector {
   fn poll_loop(
     server: EventHub,
     clients: Arc<Mutex<HashMap<u64, Responder>>>,
-    last_activities: Arc<Mutex<HashMap<String, (commands::CachedActivity, u64)>>>,
+    last_activities: Arc<Mutex<HashMap<crate::SocketId, (commands::CachedActivity, u64)>>>,
     user: Arc<Mutex<RpcUser>>,
     default_protocol: BridgeProtocol,
   ) {
@@ -518,11 +518,9 @@ impl ClientConnector {
     }
   }
 
-  /**
-   * Handle activity commands coming from the IPC and WebSocket connectors.
-   * `SET_ACTIVITY` commands are translated into bridge payloads, everything
-   * else (INVITE_BROWSER, DEEP_LINK, ...) is forwarded as-is.
-   */
+  /// Handle activity commands coming from the IPC and WebSocket connectors.
+  /// `SET_ACTIVITY` commands are translated into bridge payloads, everything
+  /// else (INVITE_BROWSER, DEEP_LINK, ...) is forwarded as-is.
   fn event_loop(rec: std::sync::mpsc::Receiver<ActivityCmd>, connector: ClientConnector) {
     while let Ok(cmd) = rec.recv() {
       if cmd.cmd != "SET_ACTIVITY" {
@@ -560,7 +558,7 @@ impl ClientConnector {
               .last_activities
               .lock()
               .unwrap()
-              .get(&pid.to_string())
+              .get(&crate::SocketId::from(pid.to_string()))
               .and_then(|(cached, _)| serde_json::from_str::<Value>(&cached.json).ok())
               .and_then(|body| body.get("activity").cloned());
             let current = activity
@@ -616,7 +614,7 @@ impl ClientConnector {
               let mut handoff = connector.handoff.lock().unwrap_or_else(|e| e.into_inner());
               match cmd.application_id.clone() {
                 Some(app) if handoff.note_clear(&app, pid) => {
-                  handoff.resume_for(&app).into_iter().collect()
+                  handoff.resume_for(app.as_ref()).into_iter().collect()
                 }
                 Some(_) => Vec::new(),
                 // No app id: abrupt close (socket died without CLEAR).
@@ -625,11 +623,11 @@ impl ClientConnector {
                 None => handoff
                   .note_clear_pid(pid)
                   .into_iter()
-                  .filter_map(|app| handoff.resume_for(&app))
+                  .filter_map(|app| handoff.resume_for(app.as_ref()))
                   .collect(),
               }
             };
-            for game in resume.into_iter().filter(|game| process_alive(game.pid)) {
+            for game in resume.into_iter().filter(|game| is_process_alive(game.pid)) {
               connector.resume_generic(&game);
             }
             if changed {
@@ -638,7 +636,7 @@ impl ClientConnector {
               debug!("[Client Connector] Duplicate clear ignored (pid {})", pid);
             }
           }
-          connector.broadcast_activity(payload, pid.to_string());
+          connector.broadcast_activity(payload, crate::SocketId::from(pid.to_string()));
         }
         None => warn!("[Client Connector] Invalid activity command, skipping"),
       }
@@ -667,10 +665,11 @@ impl ClientConnector {
           continue;
         }
 
-        for (pid, socket_id) in outstanding {
+        for (pid, app_id) in outstanding {
           // Send an empty payload
           log!("[Client Connector] Sending empty payload");
 
+          let socket_id = crate::SocketId::from(app_id);
           let payload = commands::empty_cached(pid, socket_id.clone());
 
           connector.broadcast_activity(payload, socket_id);
@@ -682,7 +681,7 @@ impl ClientConnector {
       // Remember the scan for the handoff: an IPC clear hands the slot
       // back to exactly this game (the scanner won't re-emit it).
       let game = ScannedGame {
-        id: proc_activity.id.clone(),
+        id: crate::AppId(proc_activity.id.clone()),
         name: proc_activity.name.clone(),
         pid: proc_activity.pid.unwrap_or_default(),
         start: proc_activity.timestamp.unwrap_or(0),
@@ -701,7 +700,7 @@ impl ClientConnector {
         .handoff
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .suppresses(&game.id)
+        .is_suppressed(game.id.as_ref())
       {
         // The armed entry carries its own pid for the clear frame.
         if let Some(pid) = connector
@@ -711,8 +710,8 @@ impl ClientConnector {
           .remove(&game.id)
         {
           connector.broadcast_activity(
-            commands::empty_cached(pid, game.id.clone()),
-            game.id.clone(),
+            commands::empty_cached(pid, crate::SocketId::from(game.id.clone())),
+            crate::SocketId::from(game.id.clone()),
           );
           debug!(
             "[Client Connector] Yielding {} to live IPC presence",
@@ -754,15 +753,16 @@ impl ClientConnector {
       );
 
       // Same bytes as the handoff resume path (one construction site).
-      connector.broadcast_activity(generic_payload(&game), game.id.clone());
+      connector.broadcast_activity(
+        generic_payload(&game),
+        crate::SocketId::from(game.id.clone()),
+      );
     }
   }
 
-  /**
-   * Re-assert generic process presence for `game` after its IPC source
-   * cleared (handoff back). The scanner only emits on *changes*, so
-   * without this the slot would stay dark until the next game switch.
-   */
+  /// Re-assert generic process presence for `game` after its IPC source
+  /// cleared (handoff back). The scanner only emits on *changes*, so
+  /// without this the slot would stay dark until the next game switch.
   fn resume_generic(&self, game: &ScannedGame) {
     self
       .last_process
@@ -773,15 +773,16 @@ impl ClientConnector {
       "[Client Connector] Resuming generic presence for {} ({})",
       game.name, game.id
     );
-    self.broadcast_activity(generic_payload(game), game.id.clone());
+    self.broadcast_activity(
+      generic_payload(game),
+      crate::SocketId::from(game.id.clone()),
+    );
   }
 
-  /**
-   * Broadcast an activity payload to all connected clients, updating the
-   * replay cache so clients connecting later catch up on the current presence.
-   */
+  /// Broadcast an activity payload to all connected clients, updating the
+  /// replay cache so clients connecting later catch up on the current presence.
   #[hotpath::measure]
-  fn broadcast_activity(&self, payload: commands::CachedActivity, socket_id: String) {
+  fn broadcast_activity(&self, payload: commands::CachedActivity, socket_id: crate::SocketId) {
     // Keep the replay cache in sync, pruning cleared activities
     let is_clear = serde_json::from_str::<Value>(&payload.json)
       .ok()
@@ -808,10 +809,8 @@ impl ClientConnector {
     self.persist_state();
   }
 
-  /**
-   * Rebroadcast every cached activity (refresh tick): no cache bookkeeping,
-   * just convergence for clients that missed a frame.
-   */
+  /// Rebroadcast every cached activity (refresh tick): no cache bookkeeping,
+  /// just convergence for clients that missed a frame.
   fn refresh_clients(&self) {
     let payloads: Vec<commands::CachedActivity> = self
       .last_activities
@@ -836,11 +835,9 @@ impl ClientConnector {
     self.persist_state();
   }
 
-  /**
-   * Persist the state snapshot when enabled (`RSRPC_STATE_FILE`).
-   * Best-effort: failures stay in debug so a full tmpfs never breaks
-   * presence.
-   */
+  /// Persist the state snapshot when enabled (`RSRPC_STATE_FILE`).
+  /// Best-effort: failures stay in debug so a full tmpfs never breaks
+  /// presence.
   fn persist_state(&self) {
     let Some(path) = self.state_path.as_ref() else {
       return;
@@ -872,9 +869,7 @@ impl ClientConnector {
     }
   }
 
-  /**
-   * Send one payload to every connected bridge client, pruning dead ones.
-   */
+  /// Send one payload to every connected bridge client, pruning dead ones.
   #[hotpath::measure]
   fn send_to_all(&self, payload: &commands::CachedActivity) {
     let json_clients = self.json_clients.lock().unwrap_or_else(|e| e.into_inner());
@@ -911,9 +906,7 @@ impl ClientConnector {
     }
   }
 
-  /**
-   * Broadcast a non-activity event (e.g. INVITE_BROWSER) as-is to all clients.
-   */
+  /// Broadcast a non-activity event (e.g. INVITE_BROWSER) as-is to all clients.
   fn broadcast_raw(&self, cmd: &ActivityCmd) {
     let json_clients = self.json_clients.lock().unwrap_or_else(|e| e.into_inner());
     let msgpack_clients = self
@@ -950,15 +943,13 @@ impl ClientConnector {
   }
 }
 
-/**
- * Consume the outstanding process publications for clearing, if any.
- * Returns `(pid, socket_id)` pairs, sorted for deterministic clears.
- * Single-shot by construction (`drain`): repeated null scans clear once
- * and then skip. IPC/WS clears never touch this map (pid-keyed vs
- * app-id-keyed keyspaces), so they cannot disarm it either.
- */
-pub(crate) fn take_process_clear(connector: &ClientConnector) -> Vec<(u64, String)> {
-  let mut outstanding: Vec<(u64, String)> = connector
+/// Consume the outstanding process publications for clearing, if any.
+/// Returns `(pid, socket_id)` pairs, sorted for deterministic clears.
+/// Single-shot by construction (`drain`): repeated null scans clear once
+/// and then skip. IPC/WS clears never touch this map (pid-keyed vs
+/// app-id-keyed keyspaces), so they cannot disarm it either.
+pub(crate) fn take_process_clear(connector: &ClientConnector) -> Vec<(u64, crate::AppId)> {
+  let mut outstanding: Vec<(u64, crate::AppId)> = connector
     .last_process
     .lock()
     .unwrap()
@@ -985,11 +976,9 @@ impl Drop for ClientConnector {
   }
 }
 
-/**
- * Whether an IPC/WS command is a genuine clear from a real connection
- * (null activity + nonzero pid, e.g. game disconnect/close). SUBSCRIBE-style
- * messages that never identified a game (pid 0) are not clears.
- */
+/// Whether an IPC/WS command is a genuine clear from a real connection
+/// (null activity + nonzero pid, e.g. game disconnect/close). SUBSCRIBE-style
+/// messages that never identified a game (pid 0) are not clears.
 pub(crate) fn is_genuine_clear(cmd: &ActivityCmd) -> bool {
   match cmd.args.as_ref().and_then(|args| args.pid) {
     Some(pid) if pid != 0 => cmd
@@ -1000,11 +989,9 @@ pub(crate) fn is_genuine_clear(cmd: &ActivityCmd) -> bool {
   }
 }
 
-/**
- * Handle a bridge control message (`SET_USER`/`RESET_USER`, arRPC parity).
- * Returns the ACK text plus the new identity when it changed, `None` for
- * anything else (the caller echoes those to the sender untouched).
- */
+/// Handle a bridge control message (`SET_USER`/`RESET_USER`, arRPC parity).
+/// Returns the ACK text plus the new identity when it changed, `None` for
+/// anything else (the caller echoes those to the sender untouched).
 pub(crate) fn handle_bridge_control(
   user: &Arc<Mutex<RpcUser>>,
   text: &str,
@@ -1038,19 +1025,17 @@ pub(crate) fn handle_bridge_control(
   Some((ack, changed))
 }
 
-/**
- * Flatten the replay cache into state-snapshot activities (best-effort:
- * unparseable entries contribute their socket id only).
- */
+/// Flatten the replay cache into state-snapshot activities (best-effort:
+/// unparseable entries contribute their socket id only).
 pub(crate) fn state_activities(
-  cache: &HashMap<String, (commands::CachedActivity, u64)>,
+  cache: &HashMap<crate::SocketId, (commands::CachedActivity, u64)>,
 ) -> Vec<StateActivity> {
   let mut out = Vec::with_capacity(cache.len());
   out.extend(cache.iter().map(|(socket_id, (payload, _))| {
     let body: Value = serde_json::from_str(&payload.json).unwrap_or(Value::Null);
     let activity = body.get("activity");
     StateActivity {
-      socket_id: socket_id.clone(),
+      socket_id: socket_id.0.clone(),
       name: activity
         .and_then(|item| item.get("name"))
         .and_then(Value::as_str)
@@ -1072,11 +1057,9 @@ pub(crate) fn state_activities(
   out
 }
 
-/**
- * Evict the oldest entries while the replay cache exceeds
- * [`MAX_CACHED_ACTIVITIES`]. Pure map operation (no locks taken here).
- */
-pub(crate) fn prune_cache(cache: &mut HashMap<String, (commands::CachedActivity, u64)>) {
+/// Evict the oldest entries while the replay cache exceeds
+/// [`MAX_CACHED_ACTIVITIES`]. Pure map operation (no locks taken here).
+pub(crate) fn prune_cache(cache: &mut HashMap<crate::SocketId, (commands::CachedActivity, u64)>) {
   while cache.len() > MAX_CACHED_ACTIVITIES {
     let oldest = cache
       .iter()
@@ -1091,7 +1074,12 @@ pub(crate) fn prune_cache(cache: &mut HashMap<String, (commands::CachedActivity,
   }
 }
 
-fn launch_in_range(start: u16, end: u16, skip: Option<u16>, name: &str) -> (EventHub, u16) {
+fn launch_in_range(
+  start: u16,
+  end: u16,
+  skip: Option<u16>,
+  name: &str,
+) -> crate::error::Result<(EventHub, u16)> {
   let end = end.max(start);
   for port in start..=end {
     if Some(port) == skip {
@@ -1100,7 +1088,7 @@ fn launch_in_range(start: u16, end: u16, skip: Option<u16>, name: &str) -> (Even
     match simple_websockets::launch(port) {
       Ok(server) => {
         log!("[Client Connector] {} on port {}", name, port);
-        return (server, port);
+        return Ok((server, port));
       }
       Err(err) => {
         warn!(
@@ -1111,11 +1099,9 @@ fn launch_in_range(start: u16, end: u16, skip: Option<u16>, name: &str) -> (Even
     }
   }
 
-  error!(
-    "[Client Connector] Failed to launch {} on ports {}-{}, exiting",
-    name, start, end
-  );
-  std::process::exit(1);
+  Err(crate::error::RsrpcError::Message(format!(
+    "[Client Connector] Failed to launch {name} on ports {start}-{end}: all in use"
+  )))
 }
 
 /// Send a raw JSON string, encoding it to MessagePack when the client speaks

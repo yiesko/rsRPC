@@ -18,7 +18,7 @@ use crate::{
 type ActivityResponder = (Option<ActivityCmd>, Option<String>, Responder);
 
 #[derive(Clone)]
-pub struct WebsocketConnector {
+pub(crate) struct WebsocketConnector {
   server: Arc<Mutex<Option<EventHub>>>,
   pub clients: Arc<Mutex<HashMap<u64, ActivityResponder>>>,
   /// Actual bound port (`None` when no port in the range was free and the
@@ -30,12 +30,12 @@ pub struct WebsocketConnector {
 }
 
 impl WebsocketConnector {
-  pub fn new(
+  pub(crate) fn new(
     event_sender: mpsc::Sender<ActivityCmd>,
     ws_port_start: u16,
     ws_port_end: u16,
     user: Arc<Mutex<RpcUser>>,
-  ) -> Self {
+  ) -> crate::error::Result<Self> {
     // Try starting websocket server on the configured range, bound to
     // loopback only (games always connect to 127.0.0.1).
     for port in ws_port_start..=ws_port_end {
@@ -59,13 +59,13 @@ impl WebsocketConnector {
       match simple_websockets::launch_from_listener(listener) {
         Ok(server) => {
           log!("[Websocket] Server started on port {}", port);
-          return Self {
+          return Ok(Self {
             server: Arc::new(Mutex::new(Some(server))),
             clients: Arc::new(Mutex::new(HashMap::new())),
             bound_port: Some(port),
             user,
             event_sender,
-          };
+          });
         }
         Err(_) => {
           warn!(
@@ -76,11 +76,13 @@ impl WebsocketConnector {
       }
     }
 
-    error!("[Websocket] Failed to start server on any port, exiting");
-    std::process::exit(1);
+    error!("[Websocket] Failed to start server on any port");
+    Err(crate::error::RsrpcError::Message(format!(
+      "failed to start websocket server on ports {ws_port_start}-{ws_port_end}: all in use"
+    )))
   }
 
-  pub fn start(&mut self, set_activity: bool, secondary_events: bool) {
+  pub(crate) fn start(&mut self, set_activity: bool, secondary_events: bool) {
     let server = self
       .server
       .lock()
@@ -202,7 +204,7 @@ impl WebsocketConnector {
                 let wanted = event.args.as_ref().and_then(|args| args.user_id.as_ref());
                 let user = user.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let matched = wanted.is_none_or(|id| *id == user.id);
-                responder.2.send(Message::Text(commands::get_user_response(
+                responder.2.send(Message::Text(commands::user_response(
                   &event,
                   matched.then_some(&user),
                 )));

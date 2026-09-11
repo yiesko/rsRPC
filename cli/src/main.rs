@@ -105,7 +105,7 @@ fn server_from_fetched(
   } else {
     detectable
   };
-  rsrpc::RPCServer::from_json_str(body, config)
+  Ok(rsrpc::RPCServer::from_json_str(body, config)?)
 }
 
 /// Split a comma-separated id list (`--ignore-ids`): trims, drops blanks.
@@ -309,8 +309,9 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     return Ok(());
   }
 
-  // Starts the other threads (process detector, client connector, etc)
-  client.start();
+  // Starts the other threads (process detector, client connector, etc).
+  // Bind failures surface here (no exit inside the library).
+  client.start()?;
 
   let (tx, rx) = std::sync::mpsc::channel();
   ctrlc::set_handler(move || {

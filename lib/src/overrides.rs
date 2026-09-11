@@ -72,6 +72,7 @@ fn config_dir() -> PathBuf {
 /// Default single-file location, compatible with rsrpc-wrapper:
 /// `$RSRPC_OVERRIDES_FILE`, else `$XDG_CONFIG_HOME/rsrpc/overrides.json`,
 /// else `~/.config/rsrpc/overrides.json`.
+#[must_use]
 pub fn default_file_path() -> PathBuf {
   if let Ok(custom) = std::env::var("RSRPC_OVERRIDES_FILE") {
     return PathBuf::from(custom);
@@ -81,6 +82,7 @@ pub fn default_file_path() -> PathBuf {
 
 /// Default directory location: `$RSRPC_OVERRIDES_DIR`, else
 /// `$XDG_CONFIG_HOME/rsrpc/overrides.d`, else `~/.config/rsrpc/overrides.d`.
+#[must_use]
 pub fn default_dir_path() -> PathBuf {
   if let Ok(custom) = std::env::var("RSRPC_OVERRIDES_DIR") {
     return PathBuf::from(custom);

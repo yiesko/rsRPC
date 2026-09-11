@@ -1081,6 +1081,7 @@ dependencies = [
  "serde_with",
  "simple-websockets",
  "sysinfo",
+ "thiserror 2.0.20",
  "ureq",
  "winapi",
 ]

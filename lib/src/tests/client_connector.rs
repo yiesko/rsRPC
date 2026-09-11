@@ -45,7 +45,8 @@ fn clones_share_detection_state() {
   let (_ipc_tx, ipc_rx) = std::sync::mpsc::channel();
   let (_proc_tx, proc_rx) = std::sync::mpsc::channel();
   let (_ws_tx, ws_rx) = std::sync::mpsc::channel();
-  let a = ClientConnector::new(45971, 45981, 45972, test_user(), ipc_rx, proc_rx, ws_rx);
+  let a = ClientConnector::new(45971, 45981, 45972, test_user(), ipc_rx, proc_rx, ws_rx)
+    .expect("test setup");
   let b = a.clone();
 
   // Shared detection state must be visible across clones (event_loop on
@@ -54,16 +55,16 @@ fn clones_share_detection_state() {
   b.last_process
     .lock()
     .unwrap()
-    .insert("123456789012345678".to_string(), 42);
+    .insert(crate::AppId("123456789012345678".to_string()), 42);
   assert_eq!(
     a.last_process.lock().unwrap().clone(),
-    [("123456789012345678".to_string(), 42)]
+    [(crate::AppId("123456789012345678".to_string()), 42)]
       .into_iter()
       .collect::<std::collections::HashMap<_, _>>()
   );
   assert_eq!(
     take_process_clear(&a),
-    vec![(42, "123456789012345678".to_string())]
+    vec![(42, crate::AppId("123456789012345678".to_string()))]
   );
   assert!(b.last_process.lock().unwrap().is_empty());
 }
@@ -74,7 +75,8 @@ fn process_clear_consumes_outstanding_publication_once() {
   let (_ipc_tx, ipc_rx) = std::sync::mpsc::channel();
   let (_proc_tx, proc_rx) = std::sync::mpsc::channel();
   let (_ws_tx, ws_rx) = std::sync::mpsc::channel();
-  let connector = ClientConnector::new(45973, 45983, 45974, test_user(), ipc_rx, proc_rx, ws_rx);
+  let connector = ClientConnector::new(45973, 45983, 45974, test_user(), ipc_rx, proc_rx, ws_rx)
+    .expect("test setup");
 
   // Nothing published: null scans skip.
   assert_eq!(take_process_clear(&connector), Vec::new());
@@ -84,10 +86,10 @@ fn process_clear_consumes_outstanding_publication_once() {
     .last_process
     .lock()
     .unwrap()
-    .insert("111111111111111111".to_string(), 1234);
+    .insert(crate::AppId("111111111111111111".to_string()), 1234);
   assert_eq!(
     take_process_clear(&connector),
-    vec![(1234, "111111111111111111".to_string())]
+    vec![(1234, crate::AppId("111111111111111111".to_string()))]
   );
   // Consumed: further null scans skip (no clear spam, no re-clear).
   assert_eq!(take_process_clear(&connector), Vec::new());
@@ -99,7 +101,10 @@ fn replay_cache_evicts_oldest_beyond_cap() {
 
   let mut cache = std::collections::HashMap::new();
   for i in 0..=(MAX_CACHED_ACTIVITIES as u64) {
-    cache.insert(format!("pid-{i}"), (empty_cached(1, format!("pid-{i}")), i));
+    cache.insert(
+      crate::SocketId(format!("pid-{i}")),
+      (empty_cached(1, crate::SocketId(format!("pid-{i}"))), i),
+    );
   }
   assert_eq!(cache.len(), MAX_CACHED_ACTIVITIES + 1);
 
@@ -108,11 +113,14 @@ fn replay_cache_evicts_oldest_beyond_cap() {
   assert_eq!(cache.len(), MAX_CACHED_ACTIVITIES);
   // Oldest (seq 0) evicted, newest kept.
   assert!(!cache.contains_key("pid-0"));
-  assert!(cache.contains_key(&format!("pid-{}", MAX_CACHED_ACTIVITIES)));
+  assert!(cache.contains_key(format!("pid-{}", MAX_CACHED_ACTIVITIES).as_str()));
 
   // Within cap: a lone entry is untouched (no-shrink control case).
   let mut small = std::collections::HashMap::new();
-  small.insert("a".to_string(), (empty_cached(1, "a".to_string()), 7));
+  small.insert(
+    crate::SocketId("a".to_string()),
+    (empty_cached(1, crate::SocketId("a".to_string())), 7),
+  );
   prune_cache(&mut small);
   assert!(small.contains_key("a"));
 }
@@ -184,7 +192,7 @@ fn state_activities_flatten_replay_cache() {
   .expect("parse");
   let payload = cached_activity(&mut cmd).expect("encodes");
   let mut cache = std::collections::HashMap::new();
-  cache.insert("9".to_string(), (payload, 1));
+  cache.insert(crate::SocketId("9".to_string()), (payload, 1));
 
   let activities = state_activities(&cache);
   assert_eq!(activities.len(), 1);
@@ -199,27 +207,27 @@ fn handoff_suppresses_while_ipc_live_and_resumes_on_owner_clear() {
   use crate::server::client_connector::{HandoffState, ScannedGame};
 
   let game = ScannedGame {
-    id: "111111111111111111".to_string(),
+    id: crate::AppId("111111111111111111".to_string()),
     name: "Game".to_string(),
     pid: 1234,
     start: 0,
   };
   let mut handoff = HandoffState::default();
-  assert!(!handoff.suppresses(&game.id));
+  assert!(!handoff.is_suppressed(game.id.as_ref()));
 
   // A live SDK presence takes the slot.
-  handoff.note_publish(&game.id, 77);
-  assert!(handoff.suppresses(&game.id));
+  handoff.note_publish(game.id.as_ref(), 77);
+  assert!(handoff.is_suppressed(game.id.as_ref()));
 
   // A clear from a *different* pid (superseded companion) is ignored.
   handoff.note_scan(Some(game.clone()));
-  assert!(!handoff.note_clear(&game.id, 78));
-  assert!(handoff.suppresses(&game.id));
+  assert!(!handoff.note_clear(game.id.as_ref(), 78));
+  assert!(handoff.is_suppressed(game.id.as_ref()));
 
   // The owner's clear releases it, and the scan still reports the game.
-  assert!(handoff.note_clear(&game.id, 77));
-  assert!(!handoff.suppresses(&game.id));
-  assert_eq!(handoff.resume_for(&game.id), Some(game));
+  assert!(handoff.note_clear(game.id.as_ref(), 77));
+  assert!(!handoff.is_suppressed(game.id.as_ref()));
+  assert_eq!(handoff.resume_for(game.id.as_ref()), Some(game));
 }
 
 #[test]
@@ -232,10 +240,10 @@ fn handoff_takeover_last_publisher_wins() {
   handoff.note_publish("1", 20);
   // A's late close must not resume the generic card under B.
   assert!(!handoff.note_clear("1", 10));
-  assert!(handoff.suppresses("1"));
+  assert!(handoff.is_suppressed("1"));
   // B's close releases.
   assert!(handoff.note_clear("1", 20));
-  assert!(!handoff.suppresses("1"));
+  assert!(!handoff.is_suppressed("1"));
 }
 
 #[test]
@@ -250,7 +258,7 @@ fn handoff_resume_only_matches_scanned_game() {
   assert_eq!(handoff.resume_for("1"), None);
 
   handoff.note_scan(Some(ScannedGame {
-    id: "2".to_string(),
+    id: crate::AppId("2".to_string()),
     name: "Other".to_string(),
     pid: 9,
     start: 0,
@@ -273,10 +281,13 @@ fn abrupt_close_releases_every_slot_of_dead_pid() {
 
   let mut released = handoff.note_clear_pid(10);
   released.sort();
-  assert_eq!(released, vec!["1".to_string(), "2".to_string()]);
+  assert_eq!(
+    released,
+    vec![crate::AppId("1".to_string()), crate::AppId("2".to_string())]
+  );
   // Other pids untouched; release is idempotent.
-  assert!(handoff.suppresses("3"));
-  assert!(!handoff.suppresses("1"));
+  assert!(handoff.is_suppressed("3"));
+  assert!(!handoff.is_suppressed("1"));
   assert!(handoff.note_clear_pid(10).is_empty());
 }
 
@@ -289,18 +300,19 @@ fn process_clear_drains_every_armed_slot_sorted() {
   let (_ipc_tx, ipc_rx) = std::sync::mpsc::channel();
   let (_proc_tx, proc_rx) = std::sync::mpsc::channel();
   let (_ws_tx, ws_rx) = std::sync::mpsc::channel();
-  let connector = ClientConnector::new(45977, 45987, 45978, test_user(), ipc_rx, proc_rx, ws_rx);
+  let connector = ClientConnector::new(45977, 45987, 45978, test_user(), ipc_rx, proc_rx, ws_rx)
+    .expect("test setup");
 
   {
     let mut armed = connector.last_process.lock().unwrap();
-    armed.insert("222222222222222222".to_string(), 22);
-    armed.insert("111111111111111111".to_string(), 11);
+    armed.insert(crate::AppId("222222222222222222".to_string()), 22);
+    armed.insert(crate::AppId("111111111111111111".to_string()), 11);
   }
   assert_eq!(
     take_process_clear(&connector),
     vec![
-      (11, "111111111111111111".to_string()),
-      (22, "222222222222222222".to_string()),
+      (11, crate::AppId("111111111111111111".to_string())),
+      (22, crate::AppId("222222222222222222".to_string())),
     ]
   );
   assert_eq!(take_process_clear(&connector), Vec::new());
@@ -313,7 +325,7 @@ fn scan_memory_is_per_slot() {
   use crate::server::client_connector::{HandoffState, ScannedGame};
 
   let game = |id: &str| ScannedGame {
-    id: id.to_string(),
+    id: crate::AppId::from(id),
     name: "Game".to_string(),
     pid: 1,
     start: 0,
@@ -330,11 +342,11 @@ fn scan_memory_is_per_slot() {
 
 #[test]
 fn process_alive_rejects_zero_and_dead_pids() {
-  use crate::server::client_connector::process_alive;
+  use crate::server::client_connector::is_process_alive;
 
-  assert!(!process_alive(0));
-  assert!(process_alive(std::process::id() as u64));
-  assert!(!process_alive(u64::MAX));
+  assert!(!is_process_alive(0));
+  assert!(is_process_alive(std::process::id() as u64));
+  assert!(!is_process_alive(u64::MAX));
 }
 
 #[test]
@@ -342,7 +354,7 @@ fn generic_payload_carries_scanned_identity() {
   use crate::server::client_connector::{ScannedGame, generic_payload};
 
   let payload = generic_payload(&ScannedGame {
-    id: "111111111111111111".to_string(),
+    id: crate::AppId("111111111111111111".to_string()),
     name: "Game".to_string(),
     pid: 1234,
     start: 7,
@@ -362,7 +374,7 @@ fn generic_payload_start_is_numeric_millis() {
   use crate::server::client_connector::{ScannedGame, generic_payload};
 
   let payload = generic_payload(&ScannedGame {
-    id: "111111111111111111".to_string(),
+    id: crate::AppId("111111111111111111".to_string()),
     name: "Game".to_string(),
     pid: 1234,
     start: 1_700_000_000_000,
@@ -386,7 +398,7 @@ fn handoff_tables_are_bounded() {
   for i in 0..(MAX_HANDOFF_ENTRIES + 10) {
     handoff.note_publish(&format!("dead-app-{i}"), u64::MAX);
     handoff.note_scan(Some(ScannedGame {
-      id: format!("dead-scan-{i}"),
+      id: crate::AppId(format!("dead-scan-{i}")),
       name: "Dead".to_string(),
       pid: u64::MAX,
       start: 1,

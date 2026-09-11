@@ -2,8 +2,7 @@ use serde_json::Value;
 
 use crate::cmd::ActivityCmd;
 use crate::commands::{
-  current_user_update, generic_ack, get_user_response, rpc_error, subscribe_ack,
-  unsupported_command,
+  current_user_update, generic_ack, rpc_error, subscribe_ack, unsupported_command, user_response,
 };
 use crate::user::RpcUser;
 
@@ -54,18 +53,18 @@ fn generic_ack_confirms_receipt_without_claiming_success() {
 }
 
 #[test]
-fn get_user_returns_identity_or_null() {
+fn user_response_returns_identity_or_null() {
   let cmd = parse_cmd(r#"{"cmd":"GET_USER","nonce":"g1","args":null}"#);
   let user = RpcUser::default();
 
-  let hit: Value = serde_json::from_str(&get_user_response(&cmd, Some(&user))).expect("valid json");
+  let hit: Value = serde_json::from_str(&user_response(&cmd, Some(&user))).expect("valid json");
   assert_eq!(hit["cmd"], "GET_USER");
   assert_eq!(hit["data"]["id"], "1045800378228281345");
   assert!(hit["evt"].is_null());
   assert_eq!(hit["nonce"], "g1");
 
   // Unknown id: official "user object or null".
-  let miss: Value = serde_json::from_str(&get_user_response(&cmd, None)).expect("valid json");
+  let miss: Value = serde_json::from_str(&user_response(&cmd, None)).expect("valid json");
   assert!(miss["data"].is_null());
 }
 

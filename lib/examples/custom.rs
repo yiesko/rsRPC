@@ -56,7 +56,7 @@ pub fn main() {
   });
 
   // Starts the other threads (process detector, client connector, etc)
-  client.lock().unwrap().start();
+  client.lock().unwrap().start().expect("example setup");
 
   // let 'er run forever
   loop {

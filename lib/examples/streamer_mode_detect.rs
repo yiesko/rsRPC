@@ -43,7 +43,7 @@ pub fn main() {
   });
 
   // Starts the other threads (process detector, client connector, etc)
-  client.start();
+  client.start().expect("example setup");
 
   // let 'er run forever
   loop {

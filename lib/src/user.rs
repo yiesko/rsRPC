@@ -43,6 +43,7 @@ impl Default for RpcUser {
 impl RpcUser {
   /// Startup identity: defaults with `RSRPC_USER_*` overrides applied.
   /// Reads the process environment (thin wrapper over `apply_env_map`).
+  #[must_use]
   pub fn from_env() -> Self {
     let mut user = Self::default();
     let env: HashMap<String, String> = std::env::vars().collect();
@@ -118,6 +119,7 @@ impl RpcUser {
   }
 
   /// The `DISPATCH`/`READY` frame sent on every new connection.
+  #[must_use]
   pub fn ready_payload(&self) -> String {
     serde_json::json!({
       "cmd": "DISPATCH",

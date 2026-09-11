@@ -24,6 +24,7 @@ pub struct ActivityCmd {
 }
 
 impl ActivityCmd {
+  #[must_use]
   pub fn empty() -> Self {
     Self {
       application_id: None,
@@ -207,6 +208,7 @@ impl Activity {
   /// Human-readable label for logs: name first, then details/state, so
   /// publishers without a name (music apps send song/artist instead)
   /// still identify themselves instead of showing `?`.
+  #[must_use]
   pub fn display_name(&self) -> &str {
     [&self.name, &self.details, &self.state]
       .into_iter()

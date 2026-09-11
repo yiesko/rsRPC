@@ -4,12 +4,13 @@ use serde::Serialize;
 use serde_json::Value;
 use serde_with::skip_serializing_none;
 
+use crate::SocketId;
 use crate::cmd::{ActivityCmd, ActivityPayload};
 
 #[skip_serializing_none]
 #[derive(Serialize)]
 pub struct ProcessActivity {
-  pub application_id: String,
+  pub application_id: crate::AppId,
   pub name: String,
   pub timestamps: ProcessTimestamps,
   pub r#type: u32,
@@ -27,10 +28,11 @@ pub struct ProcessPayload {
   pub activity: ProcessActivity,
   pub pid: u64,
   #[serde(rename = "socketId")]
-  pub socket_id: String,
+  pub socket_id: crate::SocketId,
 }
 
-pub fn empty_activity(pid: u64, socket_id: String) -> String {
+#[must_use]
+pub fn empty_activity(pid: u64, socket_id: SocketId) -> String {
   format!(
     r#"
     {{
@@ -42,24 +44,21 @@ pub fn empty_activity(pid: u64, socket_id: String) -> String {
   )
 }
 
-/**
- * An activity payload serialized for both bridge protocols (JSON text frames
- * for the 1337 port, MessagePack binary frames for the 1338 port).
- */
+/// An activity payload serialized for both bridge protocols (JSON text frames
+/// for the 1337 port, MessagePack binary frames for the 1338 port).
 #[derive(Clone, Debug)]
 pub struct CachedActivity {
   pub json: String,
   pub msgpack: Vec<u8>,
 }
 
-/**
- * Build the empty (clear) payload in both protocols.
- */
-pub fn empty_cached(pid: u64, socket_id: String) -> CachedActivity {
+/// Build the empty (clear) payload in both protocols.
+#[must_use]
+pub fn empty_cached(pid: u64, socket_id: SocketId) -> CachedActivity {
   let payload = ActivityPayload {
     activity: None,
     pid: Some(pid),
-    socket_id: Some(socket_id.clone()),
+    socket_id: Some(socket_id.0.clone()),
   };
 
   CachedActivity {
@@ -68,12 +67,11 @@ pub fn empty_cached(pid: u64, socket_id: String) -> CachedActivity {
   }
 }
 
-/**
- * Turn a `SET_ACTIVITY` command into the bridge payload in both protocols.
- *
- * Returns `None` when the command cannot be converted into a valid payload
- * (e.g. it is missing its arguments entirely).
- */
+/// Turn a `SET_ACTIVITY` command into the bridge payload in both protocols.
+///
+/// Returns `None` when the command cannot be converted into a valid payload
+/// (e.g. it is missing its arguments entirely).
+#[must_use]
 pub fn cached_activity(cmd: &mut ActivityCmd) -> Option<CachedActivity> {
   cmd.fix();
 
@@ -81,7 +79,7 @@ pub fn cached_activity(cmd: &mut ActivityCmd) -> Option<CachedActivity> {
 
   if args.activity.is_none() {
     let pid = args.pid.unwrap_or_default();
-    return Some(empty_cached(pid, pid.to_string()));
+    return Some(empty_cached(pid, crate::SocketId::from(pid.to_string())));
   }
 
   let activity = args.activity.as_mut()?;
@@ -99,11 +97,10 @@ pub fn cached_activity(cmd: &mut ActivityCmd) -> Option<CachedActivity> {
   })
 }
 
-/**
- * Build the arRPC-shaped acknowledgement for a `SUBSCRIBE`/`UNSUBSCRIBE`
- * command: echoes `cmd`/`nonce`, reports the subscribed event name in
- * `data.evt` (arRPC blind-ACKs subscriptions the same way).
- */
+/// Build the arRPC-shaped acknowledgement for a `SUBSCRIBE`/`UNSUBSCRIBE`
+/// command: echoes `cmd`/`nonce`, reports the subscribed event name in
+/// `data.evt` (arRPC blind-ACKs subscriptions the same way).
+#[must_use]
 pub fn subscribe_ack(cmd: &ActivityCmd) -> String {
   serde_json::to_string(&serde_json::json!({
     "cmd": cmd.cmd,
@@ -114,12 +111,11 @@ pub fn subscribe_ack(cmd: &ActivityCmd) -> String {
   .unwrap_or_else(|_| format!(r#"{{"cmd":"{}","evt":"ERROR"}}"#, cmd.cmd))
 }
 
-/**
- * Build the reply for a `GET_USER` command: the current identity, or
- * `null` when the requested id names somebody else (the official
- * response is "an RPC user object or null").
- */
-pub fn get_user_response(cmd: &ActivityCmd, user: Option<&crate::user::RpcUser>) -> String {
+/// Build the reply for a `GET_USER` command: the current identity, or
+/// `null` when the requested id names somebody else (the official
+/// response is "an RPC user object or null").
+#[must_use]
+pub fn user_response(cmd: &ActivityCmd, user: Option<&crate::user::RpcUser>) -> String {
   let data = user
     .and_then(|user| serde_json::to_value(user).ok())
     .unwrap_or(Value::Null);
@@ -132,11 +128,16 @@ pub fn get_user_response(cmd: &ActivityCmd, user: Option<&crate::user::RpcUser>)
   .unwrap_or_else(|_| format!(r#"{{"cmd":"{}","evt":"ERROR"}}"#, cmd.cmd))
 }
 
-/**
- * Build the `CURRENT_USER_UPDATE` dispatch emitted when the local
- * identity changes (`SET_USER`/`RESET_USER`). The inner payload is the
- * user object itself, per the official event shape.
- */
+/// Previous name of [`user_response`]: kept for one release cycle.
+#[deprecated(since = "0.33.0", note = "renamed to `user_response`")]
+pub fn get_user_response(cmd: &ActivityCmd, user: Option<&crate::user::RpcUser>) -> String {
+  user_response(cmd, user)
+}
+
+/// Build the `CURRENT_USER_UPDATE` dispatch emitted when the local
+/// identity changes (`SET_USER`/`RESET_USER`). The inner payload is the
+/// user object itself, per the official event shape.
+#[must_use]
 pub fn current_user_update(user: &crate::user::RpcUser) -> String {
   let data = serde_json::to_value(user).unwrap_or(Value::Null);
   serde_json::json!({
@@ -148,13 +149,12 @@ pub fn current_user_update(user: &crate::user::RpcUser) -> String {
   .to_string()
 }
 
-/**
- * Official error for a known command that has no backend here (OAuth,
- * voice, guilds, overlay, store...). Returns `(code, message)` so the IPC
- * and WebSocket dispatches share one table instead of drifting apart;
- * `None` means "not a known-unbacked command" (handled elsewhere, or
- * genuinely unknown).
- */
+/// Official error for a known command that has no backend here (OAuth,
+/// voice, guilds, overlay, store...). Returns `(code, message)` so the IPC
+/// and WebSocket dispatches share one table instead of drifting apart;
+/// `None` means "not a known-unbacked command" (handled elsewhere, or
+/// genuinely unknown).
+#[must_use]
 pub fn unsupported_command(cmd: &str) -> Option<(u16, &'static str)> {
   const NEEDS_CLIENT: &str = "requires the real Discord client";
   match cmd {
@@ -202,11 +202,10 @@ pub fn unsupported_command(cmd: &str) -> Option<(u16, &'static str)> {
   }
 }
 
-/**
- * Build an `evt: "ERROR"` reply for a command the server refuses
- * (unknown command, invalid invite code, unsupported callback, ...),
- * mirroring arRPC's `{cmd, data: {code, message}, evt: "ERROR", nonce}`.
- */
+/// Build an `evt: "ERROR"` reply for a command the server refuses
+/// (unknown command, invalid invite code, unsupported callback, ...),
+/// mirroring arRPC's `{cmd, data: {code, message}, evt: "ERROR", nonce}`.
+#[must_use]
 pub fn rpc_error(cmd: &str, nonce: &Value, code: u16, message: &str) -> String {
   serde_json::to_string(&serde_json::json!({
     "cmd": cmd,
@@ -217,13 +216,12 @@ pub fn rpc_error(cmd: &str, nonce: &Value, code: u16, message: &str) -> String {
   .unwrap_or_else(|_| format!(r#"{{"cmd":"{cmd}","evt":"ERROR"}}"#))
 }
 
-/**
- * Build a neutral acknowledgement for known secondary commands
- * (`INVITE_BROWSER`, `DEEP_LINK`, ...) that are forwarded to bridge
- * clients: the outcome lives downstream, so the reply only confirms
- * receipt (arRPC answers these from the bridge round-trip; without
- * bridge clients there is nothing more to report).
- */
+/// Build a neutral acknowledgement for known secondary commands
+/// (`INVITE_BROWSER`, `DEEP_LINK`, ...) that are forwarded to bridge
+/// clients: the outcome lives downstream, so the reply only confirms
+/// receipt (arRPC answers these from the bridge round-trip; without
+/// bridge clients there is nothing more to report).
+#[must_use]
 pub fn generic_ack(cmd: &ActivityCmd) -> String {
   serde_json::to_string(&serde_json::json!({
     "cmd": cmd.cmd,
@@ -233,14 +231,13 @@ pub fn generic_ack(cmd: &ActivityCmd) -> String {
   }))
   .unwrap_or_else(|_| format!(r#"{{"cmd":"{}","evt":null}}"#, cmd.cmd))
 }
-/**
- * Build the arRPC-shaped confirmation reply for a `SET_ACTIVITY` command.
- *
- * The reply echoes `cmd`/`nonce` and carries `data` with the (fixed) activity,
- * with `name` forced to an empty string and `type` forced to 0, matching what
- * arrpc/pog5-rsrpc return so RPC libraries that require a response (e.g.
- * pypresence) do not hang. Returns `None` when the command has no arguments.
- */
+/// Build the arRPC-shaped confirmation reply for a `SET_ACTIVITY` command.
+///
+/// The reply echoes `cmd`/`nonce` and carries `data` with the (fixed) activity,
+/// with `name` forced to an empty string and `type` forced to 0, matching what
+/// arrpc/pog5-rsrpc return so RPC libraries that require a response (e.g.
+/// pypresence) do not hang. Returns `None` when the command has no arguments.
+#[must_use]
 pub fn set_activity_response(cmd: &ActivityCmd) -> Option<String> {
   let args = cmd.args.as_ref()?;
 

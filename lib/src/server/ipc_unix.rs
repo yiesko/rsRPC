@@ -59,7 +59,7 @@ impl Drop for BoundListener {
 }
 
 #[derive(Clone)]
-pub struct IpcConnector {
+pub(crate) struct IpcConnector {
   socket: Arc<Mutex<BoundListener>>,
   did_handshake: bool,
   pub client_id: String,
@@ -195,7 +195,7 @@ impl IpcConnector {
   /**
    * Create a socket and return a new IpcConnector
    */
-  pub fn new(event_sender: mpsc::Sender<ActivityCmd>, user: Arc<Mutex<RpcUser>>) -> Self {
+  pub(crate) fn new(event_sender: mpsc::Sender<ActivityCmd>, user: Arc<Mutex<RpcUser>>) -> Self {
     let (socket, path) = Self::create_socket(None);
 
     Self {
@@ -210,7 +210,7 @@ impl IpcConnector {
   }
 
   /// Filesystem path of the bound socket (for the state snapshot).
-  pub fn socket_path(&self) -> String {
+  pub(crate) fn socket_path(&self) -> String {
     self
       .socket
       .lock()

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Breaking:** fallible APIs now return `rsrpc::error::RsrpcError`
+  (`thiserror`) instead of boxed errors; `ClientConnector::new`,
+  `WebsocketConnector::new` and `RPCServer::start` return `Result`
+  (bind failures surface to the caller — the library never exits the
+  process anymore); `AppId`/`SocketId` newtypes replace raw strings for
+  slot ids (same wire format); `remove_detectable_by_name(&str)`;
+  `get_user_response` renamed to `user_response` (deprecated shim kept);
+  `process_alive`/`suppresses` renamed to `is_process_alive`/
+  `is_suppressed`; over-`pub` items narrowed to `pub(crate)`.
+  Error messages are lowercase; public constructors document `# Errors`.
+
 ### Added
 - Proton-aware detection: `win32` executables from the main database are
   now indexed in a fallback automaton on Linux. Wine/Proton games whose

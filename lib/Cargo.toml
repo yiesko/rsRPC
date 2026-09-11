@@ -22,6 +22,7 @@ interprocess = "2.2"
 aho-corasick = "1.1"
 libc = "0.2"
 regex = "1.11"
+thiserror = "2.0"
 ureq = { version = "3", default-features = false, features = ["rustls", "charset"] }
 # Profiling (hotpath-rs): always compiled but fully inert unless a
 # `hotpath-*` feature is enabled — official pattern, zero runtime cost

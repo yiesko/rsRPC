@@ -123,6 +123,7 @@ pub fn write_snapshot(path: &Path, snapshot: &StateSnapshot) -> std::io::Result<
 }
 
 /// Current time as seconds since the epoch (for slot-freshness checks).
+#[must_use]
 pub fn now_secs() -> u64 {
   SystemTime::now()
     .duration_since(UNIX_EPOCH)

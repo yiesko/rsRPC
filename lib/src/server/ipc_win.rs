@@ -12,7 +12,7 @@ use crate::user::RpcUser;
 use super::ipc_utils::{IpcFacilitator, handle_stream};
 
 #[derive(Clone)]
-pub struct IpcConnector {
+pub(crate) struct IpcConnector {
   socket: Arc<Mutex<Listener>>,
   socket_path: String,
   did_handshake: bool,
@@ -113,7 +113,7 @@ impl IpcConnector {
   /**
    * Create a socket and return a new IpcConnector
    */
-  pub fn new(event_sender: mpsc::Sender<ActivityCmd>, user: Arc<Mutex<RpcUser>>) -> Self {
+  pub(crate) fn new(event_sender: mpsc::Sender<ActivityCmd>, user: Arc<Mutex<RpcUser>>) -> Self {
     let (socket, socket_path) = Self::create_socket(None);
     Self {
       socket: Arc::new(Mutex::new(socket)),
@@ -128,7 +128,7 @@ impl IpcConnector {
   }
 
   /// Named-pipe path of the bound socket (for the state snapshot).
-  pub fn socket_path(&self) -> String {
+  pub(crate) fn socket_path(&self) -> String {
     self.socket_path.clone()
   }
 
