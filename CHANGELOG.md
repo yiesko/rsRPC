@@ -164,6 +164,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and unmodeled future keys survive via a flattened catch-all instead of
   being dropped on parse — verified live against the daemon and pinned by
   a round-trip test.
+- IPC sockets in every official dir: the bound `discord-ipc-{n}` is
+  symlinked into `XDG_RUNTIME_DIR`/`TMPDIR`/`TMP`/`TEMP`/`/tmp` (Discord's
+  resolution order), so games probing any location find the bridge; stale
+  ours-shaped links repoint, foreign files are never touched, links die
+  with the socket.
 
 ## [0.32.2] - 2026-09-09
 

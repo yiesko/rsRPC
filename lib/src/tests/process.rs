@@ -1260,10 +1260,9 @@ fn vdf_parses_libraryfolders_and_manifest() {
 }
 
 /// Hermetic fake Steam root under the temp dir (unique per process, so
-/// parallel test binaries never collide). Returns the root path.
-fn fake_steam_root(tag: &str, manifests: &[(&str, &str)]) -> std::path::PathBuf {
-  let root = std::env::temp_dir().join(format!("rsrpc-steam-{}-{tag}", std::process::id()));
-  let _ = std::fs::remove_dir_all(&root);
+/// parallel test binaries never collide). Removed on drop, even on panic.
+fn fake_steam_root(tag: &str, manifests: &[(&str, &str)]) -> crate::tests::TempDir {
+  let root = crate::tests::TempDir::new(&format!("steam-{tag}"));
   let apps = root.join("steamapps");
   std::fs::create_dir_all(&apps).unwrap();
   let folders = format!(
@@ -1302,13 +1301,27 @@ fn steam_libraries_match_prefix_and_refresh() {
   // Outside every install dir: no match.
   assert!(server.steam_prefix_app_id("/usr/bin/fish").is_none());
 
-  // Rewrite the manifest under a new name with a bumped folders mtime:
+  // Rewrite the manifest under a new name with bumped mtimes:
   // the next staleness check rebuilds instead of serving the old prefix.
+  // Both mtimes are set explicitly: the fingerprint truncates to
+  // milliseconds, so relying on wall-clock advance flakes when setup
+  // and rewrite land in the same millisecond (fast machines, CI).
+  let manifest = root.join("steamapps/appmanifest_12345.acf");
   std::fs::write(
-    root.join("steamapps/appmanifest_12345.acf"),
+    &manifest,
     "\"AppState\"\n{\n\"appid\"\t\t\"12345\"\n\"installdir\"\t\t\"Renamed Game\"\n}",
   )
   .unwrap();
+  // Explicit mtimes on both files: the fingerprint truncates to
+  // milliseconds, so relying on wall-clock advance flakes when setup
+  // and rewrite land in the same millisecond (fast machines, CI).
+  let future = SystemTime::now() + std::time::Duration::from_secs(120);
+  std::fs::File::options()
+    .write(true)
+    .open(&manifest)
+    .unwrap()
+    .set_modified(future)
+    .unwrap();
   let folders = root.join("steamapps/libraryfolders.vdf");
   let future = SystemTime::now() + std::time::Duration::from_secs(60);
   std::fs::File::options()
@@ -1331,7 +1344,6 @@ fn steam_libraries_match_prefix_and_refresh() {
     server.steam_prefix_app_id(&format!("{renamed}game.exe")),
     Some("12345".to_string())
   );
-  let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1371,7 +1383,6 @@ fn match_process_prefers_vdf_over_folder() {
     )
     .expect("steam library must match");
   assert_eq!(hit.id, "999");
-  let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1434,7 +1445,6 @@ fn match_process_shortcut_id_prefers_name() {
   )
   .expect("library must match for small unknown ids");
   assert_eq!(hit.id, "999");
-  let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1443,7 +1453,8 @@ fn mount_roots_detect_partition_layouts() {
 
   // A second disk carrying a library outside every Steam root: the mount
   // table alone must surface it (pseudo filesystems never do).
-  let disk = std::env::temp_dir().join(format!("rsrpc-disk-{}", std::process::id()));
+  // TempDir guard: removed on drop, panic or not.
+  let disk = crate::tests::TempDir::new("disk");
   let lib = disk.join("SteamLibrary");
   std::fs::create_dir_all(lib.join("steamapps")).unwrap();
   let mounts = format!(
@@ -1462,7 +1473,6 @@ fn mount_roots_detect_partition_layouts() {
       .iter()
       .any(|r| r.starts_with("/proc") || r.starts_with("/sys"))
   );
-  let _ = std::fs::remove_dir_all(&disk);
 }
 
 #[test]
@@ -1484,18 +1494,14 @@ fn mount_escapes_decode_octal() {
 fn steam_cache_roundtrip_and_corrupt_fallback() {
   use crate::server::steam::SteamLibraries;
 
-  // Sole test borrowing process-global env (serialized with the
-  // overrides test via crate::tests::lock_env).
+  // Borrowed process-global env (serialized with the overrides test
+  // via lock_env); TempDir + EnvRestore guards clean up dirs and env on
+  // drop, panic or not (lock declared first, drops last).
   let _guard = crate::tests::lock_env();
   let root = fake_steam_root("cache", &[("12345", "Vdf Game")]);
-  let cache = std::env::temp_dir().join(format!("rsrpc-cache-{}", std::process::id()));
-  let _ = std::fs::remove_dir_all(&cache);
-  let previous_root = std::env::var("RSRPC_STEAM_ROOT").ok();
-  let previous_cache = std::env::var("XDG_CACHE_HOME").ok();
-  unsafe {
-    std::env::set_var("RSRPC_STEAM_ROOT", &root);
-    std::env::set_var("XDG_CACHE_HOME", &cache);
-  }
+  let cache = crate::tests::TempDir::new("cache-home");
+  let _env_root = crate::tests::EnvRestore::set("RSRPC_STEAM_ROOT", &root.to_string_lossy());
+  let _env_cache = crate::tests::EnvRestore::set("XDG_CACHE_HOME", &cache.to_string_lossy());
   // First discovery parses and persists the cache.
   let libraries = SteamLibraries::discover();
   assert_eq!(
@@ -1520,18 +1526,7 @@ fn steam_cache_roundtrip_and_corrupt_fallback() {
     )),
     Some("12345")
   );
-  unsafe {
-    match previous_root {
-      Some(value) => std::env::set_var("RSRPC_STEAM_ROOT", value),
-      None => std::env::remove_var("RSRPC_STEAM_ROOT"),
-    }
-    match previous_cache {
-      Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
-      None => std::env::remove_var("XDG_CACHE_HOME"),
-    }
-  }
-  let _ = std::fs::remove_dir_all(&root);
-  let _ = std::fs::remove_dir_all(&cache);
+  // TempDir + EnvRestore guards clean up dirs and env, panic or not.
 }
 
 #[test]

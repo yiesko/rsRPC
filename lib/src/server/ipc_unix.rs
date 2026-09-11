@@ -2,7 +2,6 @@ use interprocess::local_socket::traits::{Listener as _, Stream as _};
 use interprocess::local_socket::{
   GenericFilePath, Listener, ListenerNonblockingMode, ListenerOptions, Stream, ToFsName,
 };
-use std::env;
 use std::io::{ErrorKind, Read, Write};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -20,30 +19,119 @@ use super::ipc_utils::{IpcFacilitator, handle_stream};
 const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn get_socket_path() -> String {
-  let xdg_runtime_dir = env::var("XDG_RUNTIME_DIR").unwrap_or_default();
-  let tmpdir = env::var("TMPDIR").unwrap_or_default();
-  let tmp = env::var("TMP").unwrap_or_default();
-  let temp = env::var("TEMP").unwrap_or_default();
-  let tmp_dir = if !xdg_runtime_dir.is_empty() {
-    xdg_runtime_dir
-  } else if !tmpdir.is_empty() {
-    tmpdir
-  } else if !tmp.is_empty() {
-    tmp
-  } else if !temp.is_empty() {
-    temp
-  } else {
-    "/tmp".to_string()
-  };
+  socket_dir_candidates()
+    .first()
+    .map(|dir| format!("{}/discord-ipc", dir.display()))
+    .unwrap_or_else(|| "/tmp/discord-ipc".to_string())
+}
 
-  // Append a / to the temp dir if it doesn't have one
-  let tmp_dir = if tmp_dir.ends_with('/') {
-    tmp_dir
-  } else {
-    format!("{tmp_dir}/")
-  };
+/// Candidate IPC directories in official resolution order
+/// (`XDG_RUNTIME_DIR` → `TMPDIR` → `TMP` → `TEMP` → `/tmp`): games probe
+/// every dir × index `0..=9`, so the bound socket is symlinked into each
+/// one (see [`fanout_socket_link`]).
+fn socket_dir_candidates() -> Vec<std::path::PathBuf> {
+  candidate_dirs_from([
+    ("XDG_RUNTIME_DIR", std::env::var("XDG_RUNTIME_DIR").ok()),
+    ("TMPDIR", std::env::var("TMPDIR").ok()),
+    ("TMP", std::env::var("TMP").ok()),
+    ("TEMP", std::env::var("TEMP").ok()),
+  ])
+}
 
-  format!("{tmp_dir}discord-ipc")
+/// Pure core of [`socket_dir_candidates`]: first-seen order, blanks and
+/// duplicates dropped, `/tmp` always last. Separated for unit tests
+/// (environment mutation is process-global).
+pub(crate) fn candidate_dirs_from(vars: [(&str, Option<String>); 4]) -> Vec<std::path::PathBuf> {
+  let mut dirs = Vec::new();
+  for (_, value) in vars {
+    if let Some(dir) = value {
+      let dir = dir.trim_end_matches('/');
+      if !dir.is_empty() {
+        let path = std::path::PathBuf::from(dir);
+        if !dirs.contains(&path) {
+          dirs.push(path);
+        }
+      }
+    }
+  }
+  let fallback = std::path::PathBuf::from("/tmp");
+  if !dirs.contains(&fallback) {
+    dirs.push(fallback);
+  }
+  dirs
+}
+
+/// Symlink the bound `discord-ipc-{index}` socket into every other
+/// candidate dir so games probing any official location find it.
+/// Best-effort, never fatal: stale symlinks shaped like ours
+/// (`discord-ipc-*`) are replaced, anything else (live sockets,
+/// foreign files) is left alone, missing/unwritable dirs are skipped.
+pub(crate) fn fanout_socket_link(dirs: &[std::path::PathBuf], bound_path: &str, file_name: &str) {
+  use std::path::Path;
+  let bound = Path::new(bound_path);
+  for dir in dirs {
+    let link = dir.join(file_name);
+    if link == bound {
+      continue;
+    }
+    match std::fs::symlink_metadata(&link) {
+      Err(_) => {
+        // Absent: create unless the dir itself is missing/unwritable.
+        if let Err(err) = std::os::unix::fs::symlink(bound, &link) {
+          debug!("[IPC] Skipping socket link {}: {}", link.display(), err);
+        }
+      }
+      Ok(meta) => {
+        if !meta.file_type().is_symlink() {
+          continue; // foreign file/socket: never touch.
+        }
+        // Ours by shape (or stale): repoint at the live socket.
+        let ours = std::fs::read_link(&link)
+          .ok()
+          .and_then(|target| {
+            target
+              .file_name()
+              .and_then(|name| name.to_str())
+              .map(|name| name.starts_with("discord-ipc-"))
+          })
+          .unwrap_or(false);
+        if !ours {
+          continue;
+        }
+        let _ = std::fs::remove_file(&link);
+        if let Err(err) = std::os::unix::fs::symlink(bound, &link) {
+          debug!("[IPC] Skipping socket link {}: {}", link.display(), err);
+        }
+      }
+    }
+  }
+}
+
+/// Remove our fan-out symlinks for `bound_path` (see
+/// [`fanout_socket_link`]): keeps `/tmp` et al. clean across restarts.
+/// Best-effort; foreign files are never touched (same shape check).
+pub(crate) fn remove_socket_links(dirs: &[std::path::PathBuf], bound_path: &str) {
+  use std::path::Path;
+  let bound = Path::new(bound_path);
+  let file_name = match bound.file_name().and_then(|n| n.to_str()) {
+    Some(name) => name.to_string(),
+    None => return,
+  };
+  for dir in dirs {
+    let link = dir.join(&file_name);
+    if link == bound {
+      continue;
+    }
+    let ours = std::fs::read_link(&link).ok().and_then(|target| {
+      target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.starts_with("discord-ipc-"))
+    });
+    if ours.unwrap_or(false) {
+      let _ = std::fs::remove_file(&link);
+    }
+  }
 }
 
 struct BoundListener {
@@ -54,6 +142,7 @@ struct BoundListener {
 impl Drop for BoundListener {
   fn drop(&mut self) {
     log!("[IPC] Cleaning up socket: {}", self.path);
+    remove_socket_links(&socket_dir_candidates(), &self.path);
     let _ = std::fs::remove_file(&self.path);
   }
 }
@@ -260,6 +349,11 @@ impl IpcConnector {
                 "[IPC] Created IPC socket after cleaning stale: {}",
                 socket_path
               );
+              fanout_socket_link(
+                &socket_dir_candidates(),
+                &socket_path,
+                &socket_file_name(&socket_path),
+              );
               return Ok((socket, socket_path));
             }
           }
@@ -279,8 +373,22 @@ impl IpcConnector {
 
     log!("[IPC] Created IPC socket: {}", socket_path);
 
+    fanout_socket_link(
+      &socket_dir_candidates(),
+      &socket_path,
+      &socket_file_name(&socket_path),
+    );
     Ok((socket, socket_path))
   }
+}
+
+/// `discord-ipc-{n}` file name of a bound socket path (for fan-out links).
+pub(crate) fn socket_file_name(bound_path: &str) -> String {
+  std::path::Path::new(bound_path)
+    .file_name()
+    .and_then(|name| name.to_str())
+    .unwrap_or("discord-ipc-0")
+    .to_string()
 }
 
 /// Probe whether the process holding `socket_path` is alive: connect and
