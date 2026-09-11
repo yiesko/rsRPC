@@ -167,9 +167,12 @@ jobs:
           set -e
           # Raw (unarchived) binaries for the self-update client, plus a
           # sha256sum-compatible manifest covering everything uploaded.
-          # MVP targets only: Linux x86_64 + ARM64.
-          cp "artifacts/rsrpc-x86_64-unknown-linux-gnu/rsrpc-cli" ./rsrpc-cli-x86_64-unknown-linux-gnu
-          cp "artifacts/rsrpc-aarch64-unknown-linux-gnu/rsrpc-cli" ./rsrpc-cli-aarch64-unknown-linux-gnu
+          # MVP targets only: Linux x86_64 + ARM64. NOTE: this runs after
+          # the zip step above already removed the artifact dirs, so the
+          # binaries are pulled back out of their zips.
+          unzip -p rsrpc-x86_64-unknown-linux-gnu.zip rsrpc-cli > ./rsrpc-cli-x86_64-unknown-linux-gnu
+          unzip -p rsrpc-aarch64-unknown-linux-gnu.zip rsrpc-cli > ./rsrpc-cli-aarch64-unknown-linux-gnu
+          chmod +x rsrpc-cli-x86_64-unknown-linux-gnu rsrpc-cli-aarch64-unknown-linux-gnu
           sha256sum rsrpc-cli-x86_64-unknown-linux-gnu rsrpc-cli-aarch64-unknown-linux-gnu rsrpc*.zip > SHA256SUMS.txt
           cat SHA256SUMS.txt
 

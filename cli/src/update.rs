@@ -274,18 +274,19 @@ pub struct OtaPaths {
 }
 
 impl OtaPaths {
-  /// Resolve from `RSRPC_OTA_DIR`, then `XDG_CACHE_HOME`, then
-  /// `~/.cache`, then the temp dir (last resort, still functional).
+  /// Resolve from `RSRPC_OTA_DIR` (used verbatim), then `XDG_CACHE_HOME`,
+  /// then `~/.cache`, then the temp dir (last resort, still functional).
   #[must_use]
   pub fn from_env() -> Self {
-    let dir = std::env::var_os(OTA_DIR_ENV)
+    if let Some(dir) = std::env::var_os(OTA_DIR_ENV)
       .map(PathBuf::from)
       .filter(|path| path.is_absolute())
-      .or_else(|| {
-        std::env::var_os("XDG_CACHE_HOME")
-          .map(PathBuf::from)
-          .filter(|path| path.is_absolute())
-      })
+    {
+      return Self::with_dir(dir);
+    }
+    let dir = std::env::var_os("XDG_CACHE_HOME")
+      .map(PathBuf::from)
+      .filter(|path| path.is_absolute())
       .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
       .unwrap_or_else(std::env::temp_dir)
       .join("rsrpc")
@@ -977,5 +978,29 @@ mod tests {
     // Garbage file -> default state, never fatal.
     std::fs::write(paths.state_file(), "{nope").expect("write");
     assert_eq!(load_state(&paths), OtaState::default());
+  }
+
+  #[test]
+  fn env_override_points_verbatim_at_the_dir() {
+    // Regression: RSRPC_OTA_DIR used to gain an extra rsrpc/ota suffix,
+    // so staged state written there was never found on boot.
+    let tmp = TempDir::new("envdir");
+    let dir = tmp.path.join("custom");
+    let previous = std::env::var_os(OTA_DIR_ENV);
+    // SAFETY: single-threaded test process section touching only this
+    // variable (no other test reads RSRPC_OTA_DIR); restored below.
+    unsafe {
+      std::env::set_var(OTA_DIR_ENV, &dir);
+    }
+    let resolved = OtaPaths::from_env();
+    match previous {
+      Some(value) => unsafe {
+        std::env::set_var(OTA_DIR_ENV, value);
+      },
+      None => unsafe {
+        std::env::remove_var(OTA_DIR_ENV);
+      },
+    }
+    assert_eq!(resolved.state_file(), dir.join(STATE_FILE));
   }
 }
