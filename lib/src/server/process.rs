@@ -611,7 +611,7 @@ impl ProcessServer {
     for proc in sys.processes() {
       let mut cmd = proc.1.cmd().iter();
       processes.push(Exec {
-        pid: proc.0.to_string().parse::<u64>()?,
+        pid: u64::from(proc.0.as_u32()),
         path: proc.1.exe().unwrap_or(Path::new("")).display().to_string(),
         arguments: cmd.next().map(|_| {
           cmd
