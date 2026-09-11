@@ -1066,13 +1066,12 @@ fn spawn_proc_watcher(server: &ProcessServer) {
 /// truncation only ever cuts late arguments, never the path). Adversarial
 /// megabyte-cmdlines would otherwise multiply per process per tick.
 #[cfg(target_os = "linux")]
-fn read_exec(pid: u64) -> Option<Exec> {
+pub(crate) fn read_exec(pid: u64) -> Option<Exec> {
   const MAX_CMDLINE_BYTES: u64 = 64 * 1024;
   let path = format!("/proc/{pid}/cmdline");
-  let meta = std::fs::metadata(&path).ok()?;
-  if meta.len() == 0 {
-    return None;
-  }
+  // NOTE: no metadata size check here — /proc files report st_size 0
+  // despite having content; an early `len() == 0` return would skip
+  // EVERY process (total detection blindness).
   let file = std::fs::File::open(&path).ok()?;
   let mut cmdline = Vec::new();
   use std::io::Read;
@@ -1177,10 +1176,7 @@ fn read_steam_app_id(pid: u64) -> Option<String> {
   // whole per new pid would multiply per tick.
   const MAX_ENVIRON_BYTES: u64 = 256 * 1024;
   let path = format!("/proc/{pid}/environ");
-  let meta = std::fs::metadata(&path).ok()?;
-  if meta.len() == 0 {
-    return None;
-  }
+  // NOTE: no metadata size check — /proc files report st_size 0 (see above).
   let file = std::fs::File::open(&path).ok()?;
   let mut env = Vec::new();
   use std::io::Read;

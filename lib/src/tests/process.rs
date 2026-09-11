@@ -1287,3 +1287,17 @@ fn steam_cache_roundtrip_and_corrupt_fallback() {
   let _ = std::fs::remove_dir_all(&root);
   let _ = std::fs::remove_dir_all(&cache);
 }
+
+#[test]
+fn read_exec_sees_proc_files_despite_zero_size() {
+  use crate::server::process::read_exec;
+
+  // Regression: /proc files report st_size 0 despite having content — a
+  // metadata size check here skipped EVERY process (total blindness).
+  // Our own pid always exists with a non-empty cmdline, so this is
+  // deterministic without mocks or fixtures.
+  let here = std::process::id() as u64;
+  let exec = read_exec(here).expect("own cmdline must be readable");
+  assert_eq!(exec.pid, here);
+  assert!(!exec.path.is_empty());
+}
