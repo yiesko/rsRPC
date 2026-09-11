@@ -121,7 +121,8 @@ pub struct ProcessServer {
   /// Application IDs never published by the scan thread (coexistence with
   /// a richer publisher elsewhere). Filtered right after the scan, so an
   /// ignored-only result behaves exactly like no game: null event, clear.
-  ignored_ids: Vec<String>,
+  /// Hash set (built once): consulted per detected game per tick.
+  ignored_ids: HashSet<String>,
 
   #[cfg(not(target_os = "linux"))]
   sysinfo: Arc<Mutex<System>>,
@@ -160,7 +161,7 @@ impl ProcessServer {
       db_url,
       enable_db_update,
       initial_db_etag,
-      ignored_ids,
+      ignored_ids: ignored_ids.into_iter().collect(),
       exclusions: Arc::new(Mutex::new(Exclusions::default())),
       exclusions_url,
       steam_libraries: Arc::new(Mutex::new(SteamLibraries::discover())),
@@ -238,7 +239,7 @@ impl ProcessServer {
     self.rebuild_custom(custom);
   }
 
-  pub fn remove_detectable_by_name(&self, name: String) {
+  pub fn remove_detectable_by_name(&self, name: &str) {
     let mut custom = self
       .detectables
       .lock()
@@ -914,7 +915,8 @@ impl ProcessServer {
     // Drop memoized AppIds of dead pids (pid reuse must never serve a
     // stale id): one set build + retain per tick, replacing hundreds of
     // kilobyte environ re-reads.
-    let live: HashSet<u64> = processes.iter().map(|process| process.pid).collect();
+    let mut live = HashSet::with_capacity(processes.len());
+    live.extend(processes.iter().map(|process| process.pid));
     self
       .appid_cache
       .lock()
@@ -1264,6 +1266,7 @@ fn is_suspended(_pid: u64) -> bool {
 /// or malformed — never counted as suspended. Linux-only like its sole
 /// caller: without `/proc` there is nothing to parse.
 #[cfg(target_os = "linux")]
+#[inline]
 pub(crate) fn parse_stat_state(stat: &str) -> Option<char> {
   stat
     .rfind(')')
@@ -1271,27 +1274,31 @@ pub(crate) fn parse_stat_state(stat: &str) -> Option<char> {
     .and_then(|state| state.chars().next())
 }
 
+#[inline]
 fn normalize_name(name: &str) -> String {
-  name.to_lowercase().trim().to_string()
+  name.trim().to_lowercase()
 }
 
 /// Conservative gate for the exe-stem fallback: exact, multi-word names with
 /// a minimum length. Keeps generic stems (`fish`, `steam`, `game`, `reaper`)
 /// from ever matching same-named DB entries.
+#[inline]
 pub(crate) fn name_matchable(normalized: &str) -> bool {
   normalized.contains(' ') && normalized.chars().count() >= 6
 }
 
 /// Executable stem of an already-normalized (`/`-separated, lowercase) path,
-/// without extension: `/games/how to fish.exe` -> `how to fish`.
-pub(crate) fn exe_stem(normalized_path: &str) -> String {
+/// without extension: `/games/how to fish.exe` -> `how to fish`. Borrowed:
+/// callers only compare it against the map.
+#[inline]
+pub(crate) fn exe_stem(normalized_path: &str) -> &str {
   let base = normalized_path
     .rsplit('/')
     .next()
     .unwrap_or(normalized_path);
   match base.rfind('.') {
-    Some(dot) if dot > 0 => base[..dot].to_string(),
-    _ => base.to_string(),
+    Some(dot) if dot > 0 => &base[..dot],
+    _ => base,
   }
 }
 
@@ -1374,14 +1381,14 @@ fn live_or_none(obj: &Arc<DetectableActivity>, pid: u64) -> Option<Arc<Detectabl
 /// already turns into the normal null event (clear). Tested below.
 pub(crate) fn apply_ignore_list(
   detected: Vec<Arc<DetectableActivity>>,
-  ignored_ids: &[String],
+  ignored_ids: &HashSet<String>,
 ) -> Vec<Arc<DetectableActivity>> {
   if ignored_ids.is_empty() {
     return detected;
   }
   detected
     .into_iter()
-    .filter(|game| !ignored_ids.iter().any(|id| *id == game.id))
+    .filter(|game| !ignored_ids.contains(&game.id))
     .collect()
 }
 
@@ -1419,6 +1426,7 @@ fn finish_direct_hit(
 /// e.g. 2532755798 for "How to Fish" — verified against a live
 /// `shortcuts.vdf`); real store ids are small. Unknown to the DB +
 /// shortcut-range means a self-identified non-Steam game.
+#[inline]
 pub(crate) fn is_shortcut_id(app_id: &str) -> bool {
   app_id.parse::<u32>().is_ok_and(|id| id & 0x8000_0000 != 0)
 }
@@ -1451,8 +1459,8 @@ pub(crate) fn match_name_or_folder(
   detectable_list: &[Arc<DetectableActivity>],
 ) -> Option<Arc<DetectableActivity>> {
   let stem = exe_stem(process_path);
-  if name_matchable(&stem)
-    && let Some(&idx) = name_map.get(&stem)
+  if name_matchable(stem)
+    && let Some(&idx) = name_map.get(stem)
     && let Some(obj) = detectable_list.get(idx)
   {
     debug!(
@@ -1625,6 +1633,7 @@ pub(crate) fn path_variants_into(path: &str, out: &mut [String; 5]) -> usize {
 /// Exe file name when the normalized argv[0] carries no directories
 /// (bare exe, e.g. some Proton launches): `None` when directories are
 /// present (the direct-path match covers those) or the name is empty.
+#[inline]
 pub(crate) fn bare_exe(normalized_path: &str) -> Option<&str> {
   let trimmed = normalized_path.strip_prefix('/').unwrap_or(normalized_path);
   if trimmed.is_empty() || trimmed.contains('/') {
@@ -1718,7 +1727,7 @@ fn build_ac_patterns_with_os_filter(
     }
   }
 
-  (build_ac_automaton(exe_patterns).unwrap(), exe_indexes)
+  (build_ac_automaton(&exe_patterns).unwrap(), exe_indexes)
 }
 
 /// Build the automaton with ASCII case-insensitive matching: process
@@ -1726,7 +1735,7 @@ fn build_ac_patterns_with_os_filter(
 /// allocates a lowercased copy per process (the single hottest
 /// allocation in the profiler). Slashes/case in patterns are normalized
 /// at build time (rare), never per scan (hot).
-fn build_ac_automaton(exe_patterns: Vec<String>) -> Result<AhoCorasick, aho_corasick::BuildError> {
+fn build_ac_automaton(exe_patterns: &[String]) -> Result<AhoCorasick, aho_corasick::BuildError> {
   AhoCorasick::builder()
     .ascii_case_insensitive(true)
     .build(exe_patterns)
@@ -1785,6 +1794,9 @@ fn build_proton_ac_patterns(
       "[Process Scanner] Proton fallback: {} win32 patterns",
       exe_patterns.len()
     );
-    (Some(build_ac_automaton(exe_patterns).unwrap()), exe_indexes)
+    (
+      Some(build_ac_automaton(&exe_patterns).unwrap()),
+      exe_indexes,
+    )
   }
 }

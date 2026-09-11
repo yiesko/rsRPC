@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::detection::{DetectableActivity, ThirdPartySku};
@@ -413,10 +414,10 @@ fn apply_ignore_list_drops_only_ignored_ids() {
 
   let detected = vec![activity("1"), activity("2"), activity("3")];
   // Empty list: everything passes, order preserved.
-  let kept = apply_ignore_list(detected.clone(), &[]);
+  let kept = apply_ignore_list(detected.clone(), &HashSet::new());
   assert_eq!(kept.len(), 3);
   // Ignored ids drop; the rest keep order (first-element semantics kept).
-  let kept = apply_ignore_list(detected, &["2".to_string()]);
+  let kept = apply_ignore_list(detected, &["2".to_string()].into_iter().collect());
   let ids: Vec<_> = kept.iter().map(|game| game.id.clone()).collect();
   assert_eq!(ids, vec!["1".to_string(), "3".to_string()]);
 }

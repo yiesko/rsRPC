@@ -207,7 +207,10 @@ impl RPCServer {
     }
 
     let mut found = server.scan_for_processes()?;
-    found = server::process::apply_ignore_list(found, &self.config.ignored_ids);
+    // One-shot path: build the set once (the daemon builds it once at startup).
+    let ignored: std::collections::HashSet<String> =
+      self.config.ignored_ids.iter().cloned().collect();
+    found = server::process::apply_ignore_list(found, &ignored);
 
     Ok(
       found
@@ -273,7 +276,7 @@ impl RPCServer {
   /**
    * Remove a detectable process by name.
    */
-  pub fn remove_detectable_by_name(&mut self, name: String) {
+  pub fn remove_detectable_by_name(&mut self, name: &str) {
     if self.connectors.is_none() {
       log!("[RPC Server] Cannot remove detectable, connectors are not initialized");
       return;

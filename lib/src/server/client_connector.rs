@@ -575,24 +575,27 @@ impl ClientConnector {
           // else details/state) + app id + pid. Labels and pids only.
           match activity {
             Some(activity) => {
-              let line = format!(
-                "[Client Connector] Published: {} (app {}, pid {})",
-                activity.display_name(),
-                activity.application_id.as_deref().unwrap_or("?"),
-                pid
-              );
               if changed {
-                log!("{}", line);
+                log!(
+                  "[Client Connector] Published: {} (app {}, pid {})",
+                  activity.display_name(),
+                  activity.application_id.as_deref().unwrap_or("?"),
+                  pid
+                );
               } else {
-                debug!("{}", line);
+                debug!(
+                  "[Client Connector] Published: {} (app {}, pid {})",
+                  activity.display_name(),
+                  activity.application_id.as_deref().unwrap_or("?"),
+                  pid
+                );
               }
             }
             None => {
-              let line = format!("[Client Connector] Published clear (pid {})", pid);
               if changed {
-                log!("{}", line);
+                log!("[Client Connector] Published clear (pid {})", pid);
               } else {
-                debug!("{}", line);
+                debug!("[Client Connector] Published clear (pid {})", pid);
               }
             }
           }
@@ -839,7 +842,7 @@ impl ClientConnector {
    * presence.
    */
   fn persist_state(&self) {
-    let Some(path) = self.state_path.clone() else {
+    let Some(path) = self.state_path.as_ref() else {
       return;
     };
     let servers = StateServers {
@@ -864,7 +867,7 @@ impl ClientConnector {
         .unwrap_or_else(|e| e.into_inner()),
     );
     let snapshot = StateSnapshot::new(servers, activities);
-    if let Err(err) = state::write_snapshot(&path, &snapshot) {
+    if let Err(err) = state::write_snapshot(path, &snapshot) {
       debug!("[Client Connector] State snapshot failed: {}", err);
     }
   }
@@ -976,7 +979,7 @@ impl Drop for ClientConnector {
     }
     // State slots are owned while alive (fresh mtime blocks reuse):
     // remove ours so a later daemon reuses the slot immediately.
-    if let Some(path) = self.state_path.clone() {
+    if let Some(path) = self.state_path.as_ref() {
       let _ = std::fs::remove_file(path);
     }
   }
@@ -1042,32 +1045,31 @@ pub(crate) fn handle_bridge_control(
 pub(crate) fn state_activities(
   cache: &HashMap<String, (commands::CachedActivity, u64)>,
 ) -> Vec<StateActivity> {
-  cache
-    .iter()
-    .map(|(socket_id, (payload, _))| {
-      let body: Value = serde_json::from_str(&payload.json).unwrap_or(Value::Null);
-      let activity = body.get("activity");
-      StateActivity {
-        socket_id: socket_id.clone(),
-        name: activity
-          .and_then(|item| item.get("name"))
-          .and_then(Value::as_str)
-          .map(str::to_string),
-        application_id: activity
-          .and_then(|item| item.get("application_id"))
-          .and_then(Value::as_str)
-          .map(str::to_string),
-        pid: body.get("pid").and_then(Value::as_u64),
-        start_time: activity
-          .and_then(|item| item.get("timestamps"))
-          .and_then(|item| item.get("start"))
-          .map(|value| match value {
-            Value::String(text) => text.clone(),
-            other => other.to_string(),
-          }),
-      }
-    })
-    .collect()
+  let mut out = Vec::with_capacity(cache.len());
+  out.extend(cache.iter().map(|(socket_id, (payload, _))| {
+    let body: Value = serde_json::from_str(&payload.json).unwrap_or(Value::Null);
+    let activity = body.get("activity");
+    StateActivity {
+      socket_id: socket_id.clone(),
+      name: activity
+        .and_then(|item| item.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_string),
+      application_id: activity
+        .and_then(|item| item.get("application_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string),
+      pid: body.get("pid").and_then(Value::as_u64),
+      start_time: activity
+        .and_then(|item| item.get("timestamps"))
+        .and_then(|item| item.get("start"))
+        .map(|value| match value {
+          Value::String(text) => text.clone(),
+          other => other.to_string(),
+        }),
+    }
+  }));
+  out
 }
 
 /**

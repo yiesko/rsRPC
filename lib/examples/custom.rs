@@ -52,7 +52,7 @@ pub fn main() {
     append_client
       .lock()
       .unwrap()
-      .remove_detectable_by_name("Awesome Game!!".to_string());
+      .remove_detectable_by_name("Awesome Game!!");
   });
 
   // Starts the other threads (process detector, client connector, etc)
