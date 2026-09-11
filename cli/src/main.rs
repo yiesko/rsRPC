@@ -110,10 +110,12 @@ fn fetch_detectable(url: &str) -> Result<(String, Option<String>), Box<dyn std::
 /// skips unknown fields — zero DOM transient, ~5x less startup memory),
 /// falling back to the trimmed form for entries missing required fields.
 /// Mirrors the lib refresh path so boot never pays the DOM pass.
+/// Returns the source label for the boot inventory line (`fetched-direct`,
+/// `fetched-trimmed`, or `bundled-fallback` when the body is garbage).
 fn server_from_fetched(
   detectable: String,
   config: RPCConfig,
-) -> Result<rsrpc::RPCServer, Box<dyn std::error::Error>> {
+) -> Result<(rsrpc::RPCServer, &'static str), Box<dyn std::error::Error>> {
   let use_trimmed = serde_json::from_str::<Vec<DetectableActivity>>(&detectable).is_err();
   let body = if use_trimmed {
     trim_detectable(&detectable).unwrap_or(detectable)
@@ -125,13 +127,23 @@ fn server_from_fetched(
   // which keeps the old DB on parse errors).
   let fallback_config = config.clone();
   match rsrpc::RPCServer::from_json_str(body, config) {
-    Ok(server) => Ok(server),
+    Ok(server) => Ok((
+      server,
+      if use_trimmed {
+        "fetched-trimmed"
+      } else {
+        "fetched-direct"
+      },
+    )),
     Err(err) => {
       eprintln!(
         "[rsrpc] Fetched DB unparseable ({}), using offline bundled snapshot",
         err
       );
-      Ok(rsrpc::RPCServer::from_bundled(fallback_config)?)
+      Ok((
+        rsrpc::RPCServer::from_bundled(fallback_config)?,
+        "bundled-fallback",
+      ))
     }
   }
 }
@@ -211,10 +223,10 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[Debug] Resolved configuration: {:#?}", config);
   }
 
-  let mut client = if args.no_process_scan {
-    rsrpc::RPCServer::from_json_str("[]", config)?
+  let (mut client, db_source) = if args.no_process_scan {
+    (rsrpc::RPCServer::from_json_str("[]", config)?, "empty")
   } else if let Some(file) = args.detectable_file {
-    rsrpc::RPCServer::from_file(file, config)?
+    (rsrpc::RPCServer::from_file(file, config)?, "file")
   } else if let Some(url) = args.db_url {
     // A custom database URL was provided; fetch it with offline fallback
     match fetch_detectable(&url) {
@@ -227,7 +239,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
           "[rsrpc] Failed to fetch DB from '{}': {} - using offline bundled snapshot",
           url, err
         );
-        rsrpc::RPCServer::from_bundled(config)?
+        (rsrpc::RPCServer::from_bundled(config)?, "bundled-fallback")
       }
     }
   } else if args.enable_db_update {
@@ -242,13 +254,28 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
           "[rsrpc] Failed to fetch official DB '{}': {} - using offline bundled snapshot (background refresh continues)",
           DEFAULT_DB_URL, err
         );
-        rsrpc::RPCServer::from_bundled(config)?
+        (rsrpc::RPCServer::from_bundled(config)?, "bundled-fallback")
       }
     }
   } else {
     // Fall back to the bundled snapshot (works offline)
-    rsrpc::RPCServer::from_bundled(config)?
+    (rsrpc::RPCServer::from_bundled(config)?, "bundled")
   };
+
+  // Boot inventory: which database is live and how big it is. A silent
+  // daemon is undiagnosable without it (a degenerate fetch used to pass
+  // with only benign-looking counts downstream).
+  match client.database_summary() {
+    Ok(entries) => println!(
+      "[rsrpc] Database: {} ({} entries)",
+      db_source,
+      entries.len()
+    ),
+    Err(err) => eprintln!(
+      "[rsrpc] Database: {} (count unavailable: {})",
+      db_source, err
+    ),
+  }
 
   // Load local overrides (overrides.json + overrides.d), a feature originating from rsrpc-wrapper (Polaris).
   // Single file resolution: --overrides-file > $RSRPC_OVERRIDES_FILE > $XDG_CONFIG_HOME/rsrpc/overrides.json > ~/.config/rsrpc/overrides.json

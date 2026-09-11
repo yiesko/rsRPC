@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::detection::{DetectableActivity, ThirdPartySku};
 use crate::server::process::{
-  build_aux_maps, exe_stem, match_name_or_folder, match_steam_id, name_matchable, normalize_name,
-  undotted_names,
+  build_aux_maps, exe_stem, first_sightings, match_name_or_folder, match_steam_id, name_matchable,
+  normalize_name, undotted_names,
 };
 
 fn activity(id: &str, name: &str, steam_id: Option<&str>) -> Arc<DetectableActivity> {
@@ -81,6 +81,28 @@ fn normalize_name_drops_windows_forbidden_punctuation() {
   );
   assert_eq!(normalize_name("How to Fish"), "how to fish");
   assert_eq!(normalize_name("Fish"), "fish");
+}
+
+#[test]
+fn first_sightings_reports_each_id_once() {
+  use std::collections::HashSet;
+
+  let db = vec![
+    activity("1", "How to Fish", Some("4001890")),
+    activity("2", "Meccha Chameleon", Some("4704690")),
+  ];
+  let mut seen = HashSet::new();
+  // First tick: everything new.
+  let first = first_sightings(&mut seen, &db);
+  assert_eq!(first.len(), 2);
+  // Repeat tick: nothing new, even reordered/duplicated.
+  let again = vec![db[1].clone(), db[0].clone(), db[0].clone()];
+  assert!(first_sightings(&mut seen, &again).is_empty());
+  // A newcomer is reported alone.
+  let db2 = vec![db[0].clone(), activity("3", "Bluefin Tuna", None)];
+  let fresh = first_sightings(&mut seen, &db2);
+  assert_eq!(fresh.len(), 1);
+  assert_eq!(fresh[0].id, "3");
 }
 
 #[test]

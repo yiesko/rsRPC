@@ -574,6 +574,8 @@ impl ProcessServer {
       *clone.scan_wake.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current());
       // Idle backoff state: consecutive ticks with no games detected.
       let mut idle_ticks: u32 = 0;
+      // Game ids already announced this boot (first-sighting INFO below).
+      let mut seen_ids: HashSet<String> = HashSet::new();
       // Run the process scan repeatedly (base cadence, stretched while idle)
       loop {
         *clone.last_scan.lock().unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now();
@@ -597,6 +599,13 @@ impl ProcessServer {
             "[Process Scanner] Ignored {} detected game(s)",
             before - detected.len()
           );
+        }
+        // First sightings this boot, at INFO: without this, a daemon
+        // whose bridge path goes quiet is indistinguishable from a
+        // blind scanner except with a debug build. Bounded: one line
+        // per game id per boot, same cadence as bridge publishes.
+        for game in first_sightings(&mut seen_ids, &detected) {
+          log!("[Process Scanner] Detected: {} ({})", game.name, game.id);
         }
         // Track live game pids for the proc-events watcher: only THEIR
         // exits wake us early (a build storm's exits never cause a scan).
@@ -1516,6 +1525,20 @@ fn stamp_activity(obj: &Arc<DetectableActivity>, pid: u64) -> Arc<DetectableActi
     .unwrap_or(0);
   new_activity.timestamp = Some(start_ms);
   Arc::new(new_activity)
+}
+
+/// First sightings this boot: entries of `detected` not yet in `seen`
+/// (which is updated in place). The scan loop logs these at INFO so a
+/// silent daemon is distinguishable from a blind one without a debug
+/// build; the bridge still owns publish/dedup logging downstream.
+pub(crate) fn first_sightings<'a>(
+  seen: &mut HashSet<String>,
+  detected: &'a [Arc<DetectableActivity>],
+) -> Vec<&'a Arc<DetectableActivity>> {
+  detected
+    .iter()
+    .filter(|game| seen.insert(game.id.clone()))
+    .collect()
 }
 
 /// Auxiliary lookup maps over the main DB:
