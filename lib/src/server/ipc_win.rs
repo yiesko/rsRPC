@@ -58,16 +58,20 @@ impl IpcFacilitator for IpcConnector {
   }
 
   fn user_payload(&self) -> String {
-    self.user.lock().unwrap().ready_payload()
+    self
+      .user
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .ready_payload()
   }
 
   fn current_user(&self) -> RpcUser {
-    self.user.lock().unwrap().clone()
+    self.user.lock().unwrap_or_else(|e| e.into_inner()).clone()
   }
 
   fn recreate_socket(&mut self) {
     let (socket, socket_path) = Self::create_socket(None);
-    *self.socket.lock().unwrap() = socket;
+    *self.socket.lock().unwrap_or_else(|e| e.into_inner()) = socket;
     self.socket_path = socket_path;
   }
 
@@ -78,7 +82,7 @@ impl IpcFacilitator for IpcConnector {
     let connector = self.clone();
 
     std::thread::spawn(move || {
-      let socket = connector.socket.lock().unwrap();
+      let socket = connector.socket.lock().unwrap_or_else(|e| e.into_inner());
 
       for stream in socket.incoming() {
         // Little baby delay to keep things smooth

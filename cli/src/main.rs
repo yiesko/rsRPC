@@ -316,7 +316,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
   ctrlc::set_handler(move || {
     let _ = tx.send(());
   })
-  .map_err(|err| format!("Error setting Ctrl-C handler: {err}"))?;
+  .map_err(|err| format!("error setting Ctrl-C handler: {err}"))?;
 
   println!("Press Ctrl+C to exit");
   let _ = rx.recv();

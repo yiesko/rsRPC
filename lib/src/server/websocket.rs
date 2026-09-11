@@ -92,7 +92,7 @@ impl WebsocketConnector {
     let user = self.user.clone();
 
     std::thread::spawn(move || {
-      let mut clients = clients.lock().unwrap();
+      let mut clients = clients.lock().unwrap_or_else(|e| e.into_inner());
 
       loop {
         debug!("[Websocket] Polling for events...");
@@ -119,7 +119,12 @@ impl WebsocketConnector {
               continue;
             }
 
-            responder.send(Message::Text(user.lock().unwrap().ready_payload()));
+            responder.send(Message::Text(
+              user
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .ready_payload(),
+            ));
 
             clients.insert(client_id, (None, ws_client_id, responder));
           }
@@ -195,7 +200,7 @@ impl WebsocketConnector {
               }
               "GET_USER" => {
                 let wanted = event.args.as_ref().and_then(|args| args.user_id.as_ref());
-                let user = user.lock().unwrap().clone();
+                let user = user.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let matched = wanted.is_none_or(|id| *id == user.id);
                 responder.2.send(Message::Text(commands::get_user_response(
                   &event,

@@ -104,17 +104,21 @@ impl IpcFacilitator for IpcConnector {
   }
 
   fn user_payload(&self) -> String {
-    self.user.lock().unwrap().ready_payload()
+    self
+      .user
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .ready_payload()
   }
 
   fn current_user(&self) -> RpcUser {
-    self.user.lock().unwrap().clone()
+    self.user.lock().unwrap_or_else(|e| e.into_inner()).clone()
   }
 
   fn recreate_socket(&mut self) {
     // Delete the socket, then create a new one
     let (socket, path) = Self::create_socket(None);
-    *self.socket.lock().unwrap() = BoundListener { socket, path };
+    *self.socket.lock().unwrap_or_else(|e| e.into_inner()) = BoundListener { socket, path };
   }
 
   /**
@@ -131,7 +135,7 @@ impl IpcFacilitator for IpcConnector {
 
     thread::spawn(move || {
       if let Some(socket_arc) = weak_socket.upgrade() {
-        let socket_guard = socket_arc.lock().unwrap();
+        let socket_guard = socket_arc.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(err) = socket_guard
           .socket
           .set_nonblocking(ListenerNonblockingMode::Accept)
@@ -151,7 +155,7 @@ impl IpcFacilitator for IpcConnector {
         };
 
         let stream = {
-          let socket_guard = socket_arc.lock().unwrap();
+          let socket_guard = socket_arc.lock().unwrap_or_else(|e| e.into_inner());
           socket_guard.socket.accept()
         };
 
@@ -207,7 +211,12 @@ impl IpcConnector {
 
   /// Filesystem path of the bound socket (for the state snapshot).
   pub fn socket_path(&self) -> String {
-    self.socket.lock().unwrap().path.clone()
+    self
+      .socket
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .path
+      .clone()
   }
 
   /**

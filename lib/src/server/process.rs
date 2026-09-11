@@ -1402,7 +1402,9 @@ fn finish_direct_hit(
   exe_index: usize,
   process: &Exec,
 ) -> Option<Arc<DetectableActivity>> {
-  let executable = &obj.executables.as_ref().unwrap()[exe_index];
+  // A hit without executables (or a stale index) is corrupt input, not a
+  // game: skip the process instead of panicking the scan.
+  let executable = obj.executables.as_ref()?.get(exe_index)?;
 
   if let Some(exec_args) = &executable.arguments {
     let has_args = process
@@ -1727,7 +1729,10 @@ fn build_ac_patterns_with_os_filter(
     }
   }
 
-  (build_ac_automaton(&exe_patterns).unwrap(), exe_indexes)
+  (
+    build_ac_automaton(&exe_patterns).expect("[bug] detectable patterns exceed automaton limits"),
+    exe_indexes,
+  )
 }
 
 /// Build the automaton with ASCII case-insensitive matching: process
@@ -1795,7 +1800,10 @@ fn build_proton_ac_patterns(
       exe_patterns.len()
     );
     (
-      Some(build_ac_automaton(&exe_patterns).unwrap()),
+      Some(
+        build_ac_automaton(&exe_patterns)
+          .expect("[bug] detectable patterns exceed automaton limits"),
+      ),
       exe_indexes,
     )
   }
