@@ -177,6 +177,30 @@ fn set_activity_response_echoes_activity_intact() {
 }
 
 #[test]
+fn set_activity_response_keeps_extra_and_derived_metadata() {
+  // arRPC #141 parity: the echo carries unknown future keys (extra)
+  // and derived metadata (button_urls from buttons), not just the
+  // known activity fields.
+  let mut cmd = parse_cmd(
+    r#"{"cmd":"SET_ACTIVITY","nonce":"echo-2","args":{"pid":777,"activity":{
+      "name":"My Game","type":0,
+      "buttons":[{"label":"Play","url":"https://example.com/play"}],
+      "mystery_field_xyz":"must-survive"}}}"#,
+  );
+  cmd.application_id = Some("123".to_string());
+  cmd.fix();
+
+  let reply: Value =
+    serde_json::from_str(&set_activity_response(&cmd).expect("response")).expect("valid json");
+
+  assert_eq!(
+    reply["data"]["metadata"]["button_urls"],
+    serde_json::json!(["https://example.com/play"])
+  );
+  assert_eq!(reply["data"]["mystery_field_xyz"], "must-survive");
+}
+
+#[test]
 fn set_activity_response_clear_carries_null_data() {
   let mut cmd =
     parse_cmd(r#"{"cmd":"SET_ACTIVITY","nonce":"clear-1","args":{"pid":777,"activity":null}}"#);
