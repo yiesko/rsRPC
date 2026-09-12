@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   next daemon restart (first failure still warns, later retries stay in
   debug). The self-test now reports datagram/parsed counts, telling a
   silent kernel apart from framing drift in the log line.
+- Proc-events loss accounting: every observed message feeds a per-CPU
+  sequence tracker over the kernel `cn_msg.seq` counter (delivery is
+  officially lossy), so silent drops surface as debug gap lines plus a
+  counter. Generic across topologies (wrapping-aware, re-anchors on
+  counter restarts) and self-neutralizing where counter semantics do
+  not hold.
 
 ### Added
 - One-liner install (`scripts/install.sh`, Linux/systemd): arch

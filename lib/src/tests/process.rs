@@ -1210,6 +1210,58 @@ fn self_test_report_distinguishes_silence_from_drift() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn seq_tracker_counts_gaps_wraps_and_resets() {
+  use crate::server::proc_events::SeqTracker;
+
+  let mut tracker = SeqTracker::default();
+  // Anchoring is silent, per cpu independently.
+  assert_eq!(tracker.note(0, 100), 0);
+  assert_eq!(tracker.note(1, 5000), 0);
+  assert_eq!(tracker.note(0, 101), 0);
+  assert_eq!(tracker.missed(), 0);
+  // Forward jumps count their distance and re-anchor there.
+  assert_eq!(tracker.note(0, 105), 3);
+  assert_eq!(tracker.missed(), 3);
+  assert_eq!(tracker.note(0, 106), 0);
+  // u32 wrap is continuity, not a gap.
+  assert_eq!(tracker.note(2, u32::MAX - 1), 0);
+  assert_eq!(tracker.note(2, u32::MAX), 0);
+  assert_eq!(tracker.note(2, 0), 0);
+  assert_eq!(tracker.note(2, 2), 1);
+  // Backward jump (counter restart, e.g. CPU hotplug) re-anchors silently.
+  assert_eq!(tracker.note(3, 9000), 0);
+  assert_eq!(tracker.note(3, 12), 0);
+  assert_eq!(tracker.note(3, 13), 0);
+  assert_eq!(tracker.missed(), 4);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn walk_observes_every_message_while_parse_takes_first() {
+  use crate::server::proc_events::{ProcEvent, parse_event, walk_proc_messages};
+
+  // Two EXEC messages in one datagram, on different (cpu, seq).
+  let mut first = proc_buf(0x2, 111);
+  let mut second = proc_buf(0x2, 222);
+  first[24..28].copy_from_slice(&10u32.to_le_bytes());
+  second[24..28].copy_from_slice(&20u32.to_le_bytes());
+  second[40..44].copy_from_slice(&1u32.to_le_bytes());
+  let mut both = first;
+  both.extend_from_slice(&second);
+
+  // Forwarding keeps first-event-wins.
+  assert_eq!(parse_event(&both), Some(ProcEvent::Exec(111)));
+  // Tracking sees both (no early stop): continuity, not a gap.
+  let mut seen = Vec::new();
+  walk_proc_messages(&both, &mut |cpu, seq, event| {
+    seen.push((cpu, seq, event.is_some()));
+    true
+  });
+  assert_eq!(seen, vec![(0, 10, true), (1, 20, true)]);
+}
+
+#[test]
 fn vdf_rejects_nesting_attacks_and_truncation() {
   use crate::server::steam::parse_vdf_str;
 

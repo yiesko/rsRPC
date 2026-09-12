@@ -28,10 +28,18 @@
 //! classify chain, misses included. Build storms (`cargo build` forks
 //! thousands of short-lived processes) only cost cmdline reads + AC
 //! probes, still orders of magnitude below a full `/proc` sweep.
+//!
+//! Loss accounting: netlink delivery is officially lossy (`connector.rst`:
+//! memory pressure, queue overruns), so every observed message feeds a
+//! [`SeqTracker`] over the kernel per-CPU `cn_msg.seq` counter — silent
+//! drops surface as debug-level gap lines plus a counter instead of
+//! vanishing without a trace.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::mpsc;
 
-use crate::log;
+use crate::{debug, log};
 
 /// Netlink family for the kernel connector multiplexer.
 const NETLINK_CONNECTOR: i32 = 11;
@@ -42,7 +50,6 @@ const NLMSG_MIN_TYPE: u16 = 16;
 /// Control message types the kernel may interleave.
 const NLMSG_NOOP: u16 = 1;
 const NLMSG_ERROR: u16 = 2;
-const NLMSG_DONE: u16 = 3;
 const NLMSG_OVERRUN: u16 = 4;
 /// Request flag for the subscription message.
 const NLM_F_REQUEST: u16 = 1;
@@ -73,13 +80,33 @@ pub(crate) enum ProcEvent {
 /// Unknown/short/corrupt input is `None` (the watcher skips it — the
 /// periodic scan is the backstop, so a dropped event only costs
 /// latency, never correctness).
-pub(crate) fn parse_event(buf: &[u8]) -> Option<ProcEvent> {
+/// Walk every message in a netlink datagram, invoking `visit` for each
+/// `cn_proc` data message (valid idx/val) with `(cpu, seq, event)` —
+/// cpu first, matching [`SeqTracker::note`].
+///
+/// `event` is `None` for types we do not forward (FORK, COMM…) — the
+/// kernel counter advances per message regardless of type (verified
+/// live: consecutive per-cpu sequences span mixed types), so continuity
+/// tracking must see all of them, not just forwarded events. Returning
+/// `false` stops the walk early; short/corrupt datagrams and nonzero
+/// `ERROR`s stop it with nothing further — exactly the historical
+/// `parse_event` outcomes, which delegates here (single walk, single
+/// WHAT mapping, no duplicated parse logic).
+pub(crate) fn walk_proc_messages(
+  buf: &[u8],
+  visit: &mut impl FnMut(u32, u32, Option<ProcEvent>) -> bool,
+) {
   let mut offset = 0;
   while buf.len() - offset >= SIZE_NLMSGHDR {
-    let len = u32::from_le_bytes(buf[offset..offset + 4].try_into().ok()?) as usize;
-    let msg_type = u16::from_le_bytes(buf[offset + 4..offset + 6].try_into().ok()?);
+    let len = u32::from_le_bytes([
+      buf[offset],
+      buf[offset + 1],
+      buf[offset + 2],
+      buf[offset + 3],
+    ]) as usize;
+    let msg_type = u16::from_le_bytes([buf[offset + 4], buf[offset + 5]]);
     if len < SIZE_NLMSGHDR || buf.len() - offset < len {
-      return None;
+      return;
     }
     let body = &buf[offset + SIZE_NLMSGHDR..offset + len];
     match msg_type {
@@ -87,21 +114,28 @@ pub(crate) fn parse_event(buf: &[u8]) -> Option<ProcEvent> {
       NLMSG_ERROR => {
         // Error acks carry a nonzero code in the first 4 bytes; a zero
         // code is the subscription acknowledgement — both skipped.
-        if body.len() >= 4 && i32::from_le_bytes(body[..4].try_into().ok()?) != 0 {
-          return None;
+        if body.len() >= 4 && i32::from_le_bytes([body[0], body[1], body[2], body[3]]) != 0 {
+          return;
         }
       }
-      // The kernel wraps cn_proc traffic — events AND the subscription
-      // acknowledgement — in NLMSG_DONE (verified live).
-      NLMSG_DONE => {
-        if let Some(event) = parse_proc_event(body) {
-          return Some(event);
-        }
-      }
-      // Unknown data types: attempt the parse anyway (forward-compatible).
+      // Data messages: the kernel wraps cn_proc traffic — events AND the
+      // subscription acknowledgement — in NLMSG_DONE (type 3, verified
+      // live), and unknown future types attempt the same parse
+      // (forward-compatible).
       _ => {
-        if let Some(event) = parse_proc_event(body) {
-          return Some(event);
+        // Sequence + cpu ride in every cn_proc header; the event itself
+        // only when the full body is present (historical rule, kept in
+        // `parse_proc_event` below).
+        if body.len() >= SIZE_CN_MSG + 8 {
+          let idx = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+          let val = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+          if idx == CN_IDX_PROC && val == CN_VAL_PROC {
+            let seq = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+            let cpu = u32::from_le_bytes([body[24], body[25], body[26], body[27]]);
+            if !visit(cpu, seq, parse_proc_event(body)) {
+              return;
+            }
+          }
         }
       }
     }
@@ -111,7 +145,15 @@ pub(crate) fn parse_event(buf: &[u8]) -> Option<ProcEvent> {
       break;
     }
   }
-  None
+}
+
+pub(crate) fn parse_event(buf: &[u8]) -> Option<ProcEvent> {
+  let mut found = None;
+  walk_proc_messages(buf, &mut |_, _, event| {
+    found = found.or(event);
+    true
+  });
+  found
 }
 
 /// Parse the `cn_msg` + `proc_event` body of one data message.
@@ -131,6 +173,65 @@ fn parse_proc_event(body: &[u8]) -> Option<ProcEvent> {
     PROC_EVENT_EXEC => Some(ProcEvent::Exec(pid)),
     PROC_EVENT_EXIT => Some(ProcEvent::Exit(pid)),
     _ => None,
+  }
+}
+
+/// Tracks the kernel per-CPU event sequence (`cn_msg.seq`) to detect
+/// silently lost netlink traffic at runtime: delivery is officially
+/// lossy (memory pressure, queue overruns — see `connector.rst`), and a
+/// stall leaves no other trace.
+///
+/// Generic by construction: no assumed CPU count, topology, counter
+/// phase or kernel version — each cpu anchors on first sight with
+/// wrapping arithmetic throughout. Self-neutralizing where the counter
+/// semantics do not hold: a constant seq re-anchors every datagram
+/// (backward jump, no alarm), so the worst case on exotic kernels is a
+/// quiet no-op, never false alarms.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SeqTracker {
+  last: HashMap<u32, u32>,
+  missed: u64,
+}
+
+impl SeqTracker {
+  /// Observe one `(cpu, seq)` pair. Returns missed events since the last
+  /// observation on that cpu: 0 when continuous, on first anchoring, or
+  /// on re-anchoring after a counter restart (e.g. CPU hotplug).
+  /// Forward jumps — including across the u32 wrap — count their
+  /// wrapping distance.
+  pub fn note(&mut self, cpu: u32, seq: u32) -> u64 {
+    match self.last.entry(cpu) {
+      Entry::Vacant(slot) => {
+        slot.insert(seq);
+        0
+      }
+      Entry::Occupied(mut slot) => {
+        let expected = slot.get().wrapping_add(1);
+        if seq == expected {
+          // Advance the anchor: without this every later observation
+          // compares against a stale value and misfires.
+          slot.insert(seq);
+          0
+        } else {
+          // Circular comparison (TCP/RTP style): forward jumps count,
+          // backward jumps mean the counter restarted — re-anchor.
+          let missed = u64::from(seq.wrapping_sub(expected));
+          slot.insert(seq);
+          if missed <= u64::from(u32::MAX) / 2 {
+            self.missed = self.missed.saturating_add(missed);
+            missed
+          } else {
+            0
+          }
+        }
+      }
+    }
+  }
+
+  /// Total missed events observed (saturating).
+  #[must_use]
+  pub fn missed(&self) -> u64 {
+    self.missed
   }
 }
 
@@ -384,6 +485,7 @@ pub(crate) fn watch(events: mpsc::Sender<ProcEvent>) -> Result<(), String> {
   // of EXECs under load (build storms) arrive intact instead of being
   // truncated and dropped wholesale by the length guard below.
   let mut buf = [0u8; 65536];
+  let mut seqs = SeqTracker::default();
   loop {
     let received = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
     if received < 0 {
@@ -399,12 +501,29 @@ pub(crate) fn watch(events: mpsc::Sender<ProcEvent>) -> Result<(), String> {
       unsafe {
         libc::close(fd);
       }
-      return Err(format!("recv failed: {err}"));
+      return Err(format!(
+        "recv failed: {err} ({} seq gap(s) seen)",
+        seqs.missed()
+      ));
     }
     if received == 0 {
       continue;
     }
-    if let Some(event) = parse_event(&buf[..received as usize])
+    // One shared walk feeds both continuity tracking and forwarding:
+    // every message advances the per-cpu sequence (even unforwarded
+    // types), while forwarding keeps first-event-wins. Walking the whole
+    // (usually single-message) datagram costs nothing measurable.
+    let bytes = &buf[..received as usize];
+    let mut found = None;
+    walk_proc_messages(bytes, &mut |cpu, seq, event| {
+      let missed = seqs.note(cpu, seq);
+      if missed > 0 {
+        debug!("[Process Scanner] cn_proc sequence gap on cpu {cpu}: missed {missed} event(s)");
+      }
+      found = found.or(event);
+      true
+    });
+    if let Some(event) = found
       && events.send(event).is_err()
     {
       // Receiver gone (daemon shutting down): quiet exit.
