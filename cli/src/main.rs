@@ -23,6 +23,16 @@ struct Args {
     value_parser = clap::builder::BoolishValueParser::new()
   )]
   no_process_scan: bool,
+  /// Disable only the event-driven proc-events watcher (netlink
+  /// `cn_proc` EXEC/EXIT fast path); process polling continues. The
+  /// watcher is best-effort and may rarely go silent — polling
+  /// backstops it either way.
+  #[arg(
+    long,
+    env = "RSRPC_NO_PROC_EVENTS",
+    value_parser = clap::builder::BoolishValueParser::new()
+  )]
+  no_proc_events: bool,
   #[arg(
     long,
     short = 'D',
@@ -257,6 +267,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
   });
   let mut config = RPCConfig {
     enable_process_scanner: !args.no_process_scan,
+    enable_proc_events: !args.no_proc_events,
     port: args.bridge_port,
     bridge_port_end: args.bridge_port_end,
     msgpack_port: args.msgpack_port,

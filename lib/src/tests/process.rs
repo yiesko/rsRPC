@@ -1264,6 +1264,15 @@ fn walk_observes_every_message_while_parse_takes_first() {
 }
 
 #[test]
+fn proc_events_watcher_defaults_on_and_opts_out() {
+  let mut server = proton_server(Vec::new());
+  assert!(server.enable_proc_events);
+  assert!(crate::RPCConfig::default().enable_proc_events);
+  server.set_proc_events(false);
+  assert!(!server.enable_proc_events);
+}
+
+#[test]
 fn vdf_rejects_nesting_attacks_and_truncation() {
   use crate::server::steam::parse_vdf_str;
 

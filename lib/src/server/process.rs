@@ -165,6 +165,14 @@ pub(crate) struct ProcessServer {
   /// ignored-only result behaves exactly like no game: null event, clear.
   /// Hash set (built once): consulted per detected game per tick.
   ignored_ids: HashSet<String>,
+  /// Event-driven proc-events watcher (netlink `cn_proc` fast path)
+  /// on/off. Plain bool (no lock needed: written once via
+  /// [`ProcessServer::set_proc_events`] before [`ProcessServer::start`],
+  /// read once there). `true` unless `--no-proc-events` opted out.
+  /// Linux-only read (other platforms have no watcher); the allow keeps
+  /// cross-platform builds warning-free.
+  #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+  pub(crate) enable_proc_events: bool,
 
   #[cfg(not(target_os = "linux"))]
   sysinfo: Arc<Mutex<System>>,
@@ -237,6 +245,7 @@ impl ProcessServer {
       enable_db_update,
       initial_db_etag,
       ignored_ids: ignored_ids.into_iter().collect(),
+      enable_proc_events: true,
       exclusions: Arc::new(Mutex::new(Exclusions::default())),
       exclusions_url,
       steam_libraries: Arc::new(Mutex::new(SteamLibraries::discover())),
@@ -720,7 +729,17 @@ impl ProcessServer {
     // EXIT of a tracked game wakes the scan above. Best-effort — setup
     // failure keeps pure polling, silently.
     #[cfg(target_os = "linux")]
-    spawn_proc_watcher(self);
+    if self.enable_proc_events {
+      spawn_proc_watcher(self);
+    } else {
+      log!("[Process Scanner] proc-events watcher disabled by configuration, polling only");
+    }
+  }
+
+  /// Opt out of the event-driven proc-events watcher (called once,
+  /// before [`ProcessServer::start`]). Polling continues either way.
+  pub(crate) fn set_proc_events(&mut self, enable: bool) {
+    self.enable_proc_events = enable;
   }
 
   #[cfg(not(target_os = "linux"))]

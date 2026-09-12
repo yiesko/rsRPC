@@ -164,6 +164,11 @@ pub struct DetectableSummary {
 #[derive(Clone, Debug)]
 pub struct RPCConfig {
   pub enable_process_scanner: bool,
+  /// Event-driven proc-events watcher (netlink `cn_proc` EXEC/EXIT fast
+  /// path on Linux). Best-effort by kernel nature and occasionally
+  /// silent — polling backstops it either way. `false` skips the watcher
+  /// thread entirely (`--no-proc-events` / `RSRPC_NO_PROC_EVENTS`).
+  pub enable_proc_events: bool,
   pub enable_ipc_connector: bool,
   pub enable_websocket_connector: bool,
   pub enable_secondary_events: bool,
@@ -198,6 +203,7 @@ impl Default for RPCConfig {
   fn default() -> Self {
     Self {
       enable_process_scanner: true,
+      enable_proc_events: true,
       enable_ipc_connector: true,
       enable_websocket_connector: true,
       enable_secondary_events: true,
@@ -571,6 +577,11 @@ impl RPCServer {
 
     if config.enable_process_scanner {
       log!("[RPC Server] Starting process server...");
+      connectors
+        .process_server
+        .lock()
+        .map_err(|e| crate::error::RsrpcError::Poisoned("process_server", e.to_string()))?
+        .set_proc_events(config.enable_proc_events);
       connectors
         .process_server
         .lock()

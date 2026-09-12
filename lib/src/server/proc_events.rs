@@ -502,7 +502,9 @@ pub(crate) fn watch(events: mpsc::Sender<ProcEvent>) -> Result<(), String> {
       report.datagrams, report.parsed, report.timeouts, fatal, ack
     ));
   }
-  log!("[Process Scanner] proc-events watcher live (netlink cn_proc)");
+  log!(
+    "[Process Scanner] proc-events watcher live (netlink cn_proc; best-effort, may rarely go silent — polling backstops)"
+  );
   // Back to blocking: the self-test's timeout was temporary.
   set_recv_timeout(fd, None);
   // 64KiB datagrams: one netlink message is ~76B, so bursts of hundreds

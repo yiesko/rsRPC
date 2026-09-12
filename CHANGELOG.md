@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- One-liner install (`scripts/install.sh`, Linux/systemd): arch
+  detection, newest-release download with SHA256 (+ minisign when
+  available) verification, install to `~/.local/bin` +
+  `~/.config/systemd/user` with timestamped backups, service
+  enable/start/linger, optional opt-in auto-update drop-in; idempotent
+  re-runs update. `scripts/uninstall.sh` removes service + binary
+  (`--purge` also drops config/caches/backups). Ships
+  `systemd/rsrpc.service` (hardened user unit: `ProtectSystem=strict`
+  + host `/tmp` bind for the IPC fan-out, `AF_NETLINK` for the proc
+  watcher, personal overrides via commented drop-in examples).
+- Proc-events honesty knob: the `watcher live` line now states the
+  best-effort nature inline, and `--no-proc-events` /
+  `RSRPC_NO_PROC_EVENTS=1` disables the netlink watcher thread entirely
+  (process polling continues either way).
+
 ### Fixed
 - OTA rollback actually restores the previous image: it used the same
   swap helper as apply, which deleted the `.prev` source before moving
@@ -27,18 +43,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not hold. The self-test also reports timeout-vs-fatal breakdown and
   whether the subscribe ACK arrived, so the next silent window names
   its mechanism instead of just its symptom.
-
-### Added
-- One-liner install (`scripts/install.sh`, Linux/systemd): arch
-  detection, newest-release download with SHA256 (+ minisign when
-  available) verification, install to `~/.local/bin` +
-  `~/.config/systemd/user` with timestamped backups, service
-  enable/start/linger, optional opt-in auto-update drop-in; idempotent
-  re-runs update. `scripts/uninstall.sh` removes service + binary
-  (`--purge` also drops config/caches/backups). Ships
-  `systemd/rsrpc.service` (hardened user unit: `ProtectSystem=strict`
-  + host `/tmp` bind for the IPC fan-out, `AF_NETLINK` for the proc
-  watcher, personal overrides via commented drop-in examples).
 
 ## [0.33.1] - 2026-09-11
 

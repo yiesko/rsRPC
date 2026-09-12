@@ -61,7 +61,11 @@ caches and backups). Details: `docs/systemd-user-units.md`.
 ```
   -d, --detectable-file <FILE>    Path to a custom detectable games list
   -n, --no-process-scan           Disable process detection
-                                  (alias: --no-process-scanning)
+                                   (alias: --no-process-scanning)
+      --no-proc-events              Disable only the event-driven proc-events
+                                   watcher (netlink `cn_proc` fast path);
+                                   polling continues (best-effort watcher,
+                                   may rarely go silent)
       --bridge-port <PORT>        Bridge JSON port range start (default: 1337;
                                    scans up to --bridge-port-end, arRPC scans
                                    1337-1347)
@@ -115,7 +119,7 @@ caches and backups). Details: `docs/systemd-user-units.md`.
   -D, --debug                     Print the resolved configuration
 ```
 
-Every option also has a corresponding environment variable (e.g. `RSRPC_BRIDGE_PORT`, `RSRPC_MSGPACK_PORT`, `RSRPC_OVERRIDES_FILE`, `RSRPC_OVERRIDES_DIR`, `RSRPC_EXCLUSIONS_URL`, `RSRPC_STEAM_ROOT`, `RSRPC_STEAM_LIBRARIES`, `RSRPC_LIST_DETECTED`, `RSRPC_DEBUG`). Bool flags accept `1/0/true/false/yes/no/on/off`.
+Every option also has a corresponding environment variable (e.g. `RSRPC_BRIDGE_PORT`, `RSRPC_MSGPACK_PORT`, `RSRPC_OVERRIDES_FILE`, `RSRPC_OVERRIDES_DIR`, `RSRPC_EXCLUSIONS_URL`, `RSRPC_STEAM_ROOT`, `RSRPC_STEAM_LIBRARIES`, `RSRPC_LIST_DETECTED`, `RSRPC_NO_PROC_EVENTS`, `RSRPC_DEBUG`). Bool flags accept `1/0/true/false/yes/no/on/off`.
 
 ### Logging
 
@@ -145,6 +149,7 @@ Severities, chattiest first: `DEBUG` (per-tick internals, needs `--debug`/`RSRPC
 * Entries with empty `executables` are additionally matched by install-folder name (e.g. `.../Meccha Chameleon/...` → `MECCHA CHAMELEON`; multi-word names only, so generic folders never hit).
 * Launches with a bare exe name (no directories in argv[0], common under Proton) are retried joined with the process cwd.
 * Suspended (`SIGSTOP'd`) processes count as absent (a frozen frame is not gameplay); they are republished on resume.
+* Event fast path (`EXEC`/`EXIT` via netlink `cn_proc`) is best-effort by kernel nature and may rarely go silent for stretches (delivery is officially lossy); polling backstops it either way, the watcher resubscribes every 5 minutes on its own, and `--no-proc-events` / `RSRPC_NO_PROC_EVENTS=1` disables the watcher thread entirely (polling only).
 
 ### Custom overrides (`overrides.json`, `overrides.d/`)
 
