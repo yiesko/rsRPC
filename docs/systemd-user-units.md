@@ -1,5 +1,10 @@
 # Systemd user units — complete guide (rsRPC)
 
+> Shortcut: `curl -fsSL https://raw.githubusercontent.com/yiesko/rsRPC/main/scripts/install.sh | bash`
+> installs the binary, `systemd/rsrpc.service` and enables the service
+> (see `scripts/install.sh --help`). This guide explains every knob
+> underneath for manual setups and debugging.
+
 Run `rsrpc-cli` as a user service — no root needed — with every
 environment variable, flag interaction, and operational gotcha in one
 place.

@@ -8,6 +8,8 @@ on:
       - 'cli/**'
       - 'tools/**'
       - 'plugin/**'
+      - 'scripts/**'
+      - 'systemd/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rustfmt.toml'
@@ -18,6 +20,8 @@ on:
       - 'cli/**'
       - 'tools/**'
       - 'plugin/**'
+      - 'scripts/**'
+      - 'systemd/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rustfmt.toml'
@@ -27,6 +31,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  shell:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Shell syntax check
+        run: bash -n scripts/install.sh && bash -n scripts/uninstall.sh
+
   rustfmt:
     runs-on: ubuntu-latest
 

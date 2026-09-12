@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- One-liner install (`scripts/install.sh`, Linux/systemd): arch
+  detection, newest-release download with SHA256 (+ minisign when
+  available) verification, install to `~/.local/bin` +
+  `~/.config/systemd/user` with timestamped backups, service
+  enable/start/linger, optional opt-in auto-update drop-in; idempotent
+  re-runs update. `scripts/uninstall.sh` removes service + binary
+  (`--purge` also drops config/caches/backups). Ships
+  `systemd/rsrpc.service` (hardened user unit: `ProtectSystem=strict`
+  + host `/tmp` bind for the IPC fan-out, `AF_NETLINK` for the proc
+  watcher, personal overrides via commented drop-in examples).
+
 ## [0.33.1] - 2026-09-11
 
 ### Added

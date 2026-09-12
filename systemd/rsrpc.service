@@ -1,0 +1,61 @@
+[Unit]
+Description=rsRPC - Discord Rich Presence bridge
+Documentation=https://github.com/yiesko/rsRPC
+# Works offline via the bundled database; network only refines it.
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=exec
+Environment=XDG_RUNTIME_DIR=%t
+Environment=RSRPC_LOGS_ENABLED=1
+# Port/cadence parametrization (clap reads RSRPC_* env). Defaults match
+# the CLI; uncomment to pin alternatives for testing.
+Environment=RSRPC_BRIDGE_PORT=1337
+Environment=RSRPC_MSGPACK_PORT=1338
+Environment=RSRPC_WS_PORT_START=6463
+Environment=RSRPC_WS_PORT_END=6472
+Environment=RSRPC_SCAN_INTERVAL=5
+# Custom game mappings (missing file = no overrides, never fatal).
+# Resolution: --overrides-file > $RSRPC_OVERRIDES_FILE >
+# $XDG_CONFIG_HOME/rsrpc/overrides.json > ~/.config/rsrpc/overrides.json
+Environment=RSRPC_OVERRIDES_FILE=%h/.config/rsrpc/overrides.json
+# Drop stale IPC sockets from crashed runs (the "-" ignores failure).
+ExecStartPre=-/bin/sh -c 'rm -f %t/discord-ipc-*; rm -f "${TMPDIR:-/tmp}/discord-ipc-*"'
+# Official detectable list with trim, hourly refresh while running,
+# offline bundled fallback. Add --auto-update (or RSRPC_AUTO_UPDATE=1
+# in a rsrpc.service.d/override.conf drop-in) to also stage verified
+# release binaries in the background.
+ExecStart=%h/.local/bin/rsrpc-cli --enable-db-update
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=5s
+KillMode=mixed
+NoNewPrivileges=yes
+# The IPC fan-out symlinks discord-ipc-{n} into host /tmp (games probing
+# the last official dir): ProtectSystem=strict mounts /tmp read-only, so
+# the host path is bound back in writable. The daemon writes nothing else
+# there (cache -> ~/.cache, sockets -> %t).
+BindPaths=/tmp
+ProtectSystem=strict
+ProtectHome=read-only
+# Steam provider + OTA caches (~/.cache/rsrpc) stay writable under the
+# read-only home; %t keeps the IPC sockets writable.
+ReadWritePaths=%h/.config/rsrpc %t %h/.cache/rsrpc
+# cn_proc watcher needs AF_NETLINK; without it the scanner silently stays
+# on polling (diagnose via the missing "watcher live" boot line).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=yes
+
+# Personal overrides live in rsrpc.service.d/override.conf (never in this
+# file), e.g.:
+#   Environment=RSRPC_AUTO_UPDATE=1
+#   Environment=RSRPC_USER_ID=123456789012345678
+#   Environment=RSRPC_USER_USERNAME=you
+#   Environment=RSRPC_USER_GLOBAL_NAME=Your Name
+#   Environment=RSRPC_IGNORE_IDS=0000000000000000000
+
+[Install]
+WantedBy=default.target

@@ -30,6 +30,22 @@
 
 # Building
 
+## Install (Linux, systemd)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/yiesko/rsRPC/main/scripts/install.sh | bash
+```
+
+This detects your arch, downloads the newest release binary (+ unit file),
+SHA256-verifies it (plus a minisign check when the tool is present),
+installs to `~/.local/bin` and `~/.config/systemd/user` (timestamped
+backups of anything replaced), then enables + starts the user service.
+Re-running it updates. Flags: `--yes`, `--force`, `--no-systemd`
+(files only), `--auto-update` (opt into background update staging),
+`--binary PATH` / `--unit PATH` / `--tag TAG` (pin sources).
+Uninstall with `scripts/uninstall.sh` (`--purge` also drops config,
+caches and backups). Details: `docs/systemd-user-units.md`.
+
 ## Requirements
 
 - [Cargo and Rust](https://www.rust-lang.org/) 1.88+ (edition 2024 + let-chains)
