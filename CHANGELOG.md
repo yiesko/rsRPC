@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- OTA rollback actually restores the previous image: it used the same
+  swap helper as apply, which deleted the `.prev` source before moving
+  it back — printing success while changing nothing and leaving no
+  backup behind. Rollback is now a true exchange (rolling back twice
+  restores the starting state), and the sidecar name is a single
+  predictable suffix (`rsrpc-cli.prev`).
 - Proc-events watcher resubscribes instead of dying on one failed
   self-test: a transient kernel stall no longer pins polling until the
   next daemon restart (first failure still warns, later retries stay in

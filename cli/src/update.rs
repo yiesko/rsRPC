@@ -525,14 +525,20 @@ pub fn stage(
   Ok(latest.clone())
 }
 
-/// Swap `new_image` over `exe`, keeping `exe.prev` as the rollback
-/// source. Falls back to copy when the OTA dir lives on another
-/// filesystem (`EXDEV`).
+/// Previous-image sidecar next to the executable (`rsrpc-cli` →
+/// `rsrpc-cli.prev`): plain suffix append, so extensionless and `.exe`
+/// binaries alike keep one predictable name from a single place.
+fn prev_path(exe: &Path) -> PathBuf {
+  let mut prev = exe.as_os_str().to_owned();
+  prev.push(PREV_SUFFIX);
+  PathBuf::from(prev)
+}
+
+/// Swap `new_image` over `exe`, keeping the previous image at
+/// [`prev_path`] as the rollback source. Falls back to copy when the OTA
+/// dir lives on another filesystem (`EXDEV`).
 fn swap_binary(exe: &Path, new_image: &Path) -> std::io::Result<()> {
-  let prev = exe.with_extension(format!(
-    "{}{PREV_SUFFIX}",
-    exe.extension().and_then(|ext| ext.to_str()).unwrap_or("")
-  ));
+  let prev = prev_path(exe);
   let _ = std::fs::remove_file(&prev);
   // Renaming the running image aside is allowed on Linux/Windows; only
   // overwriting it in place is not.
@@ -555,6 +561,23 @@ fn swap_binary(exe: &Path, new_image: &Path) -> std::io::Result<()> {
       Err(err)
     }
   }
+}
+
+/// Exchange `exe` with its [`prev_path`] image so a rollback is itself
+/// reversible (rolling back twice restores the starting state). Same
+/// directory on both sides, so plain renames suffice — no copy fallback
+/// needed, and a failed middle rename restores the original layout.
+fn swap_back(exe: &Path, prev: &Path) -> std::io::Result<()> {
+  let tmp = exe.with_extension("ota-swap");
+  std::fs::rename(exe, &tmp)?;
+  if let Err(err) = std::fs::rename(prev, exe) {
+    let _ = std::fs::rename(&tmp, exe);
+    return Err(err);
+  }
+  // exe already holds the restored image; prev is missing, but the
+  // install boots — report, do not unwind a working state.
+  std::fs::rename(&tmp, prev)?;
+  Ok(())
 }
 
 /// Re-execute this binary with the same arguments (Unix: `exec`, same
@@ -665,10 +688,7 @@ pub fn cmd_rollback() -> Result<(), Box<dyn std::error::Error>> {
     .and_then(|path| path.canonicalize())
     .map_err(|err| format!("cannot locate running binary: {err}"))?;
   check_eligibility(&exe).map_err(|refusal| format!("cannot roll back: {refusal}"))?;
-  let prev = exe.with_extension(format!(
-    "{}{PREV_SUFFIX}",
-    exe.extension().and_then(|ext| ext.to_str()).unwrap_or("")
-  ));
+  let prev = prev_path(&exe);
   if !prev.is_file() {
     return Err("no previous version kept (nothing to roll back to)".into());
   }
@@ -677,7 +697,7 @@ pub fn cmd_rollback() -> Result<(), Box<dyn std::error::Error>> {
   let paths = OtaPaths::from_env();
   let _ = std::fs::remove_file(paths.staged_file());
   save_state(&paths, &OtaState::default());
-  swap_binary(&exe, &prev).map_err(|err| format!("rollback failed: {err}"))?;
+  swap_back(&exe, &prev).map_err(|err| format!("rollback failed: {err}"))?;
   println!("[rsrpc] rolled back; restarting with the previous version");
   reexec(&exe);
 }
@@ -1002,5 +1022,63 @@ mod tests {
       },
     }
     assert_eq!(resolved.state_file(), dir.join(STATE_FILE));
+  }
+
+  #[test]
+  fn prev_path_appends_a_single_suffix() {
+    assert_eq!(
+      prev_path(Path::new("/bin/rsrpc-cli")),
+      PathBuf::from("/bin/rsrpc-cli.prev")
+    );
+    assert_eq!(
+      prev_path(Path::new("C:/x/rsrpc-cli.exe")),
+      PathBuf::from("C:/x/rsrpc-cli.exe.prev")
+    );
+  }
+
+  #[test]
+  fn swap_binary_rotates_staged_over_exe() {
+    let tmp = TempDir::new("swap");
+    let exe = tmp.path.join("rsrpc-cli");
+    let staged = tmp.path.join("rsrpc-cli.staged");
+    std::fs::write(&exe, b"v1").expect("write");
+    std::fs::write(&staged, b"v2").expect("write");
+
+    swap_binary(&exe, &staged).expect("swap");
+
+    assert_eq!(std::fs::read(&exe).expect("read"), b"v2");
+    assert_eq!(std::fs::read(prev_path(&exe)).expect("read"), b"v1");
+    assert!(!staged.exists());
+  }
+
+  #[test]
+  fn rollback_toggles_without_destroying_either_side() {
+    // Regression: the old rollback deleted the prev file before moving
+    // it back, so it printed success, changed nothing, and left no prev
+    // behind. Distinct bytes on each side catch any content loss.
+    let tmp = TempDir::new("rollback");
+    let exe = tmp.path.join("rsrpc-cli");
+    let prev = prev_path(&exe);
+    std::fs::write(&exe, b"v2-running").expect("write");
+    std::fs::write(&prev, b"v1-kept").expect("write");
+
+    swap_back(&exe, &prev).expect("first rollback");
+    assert_eq!(std::fs::read(&exe).expect("read"), b"v1-kept");
+    assert_eq!(std::fs::read(&prev).expect("read"), b"v2-running");
+
+    swap_back(&exe, &prev).expect("second rollback");
+    assert_eq!(std::fs::read(&exe).expect("read"), b"v2-running");
+    assert_eq!(std::fs::read(&prev).expect("read"), b"v1-kept");
+  }
+
+  #[test]
+  fn rollback_without_prev_fails() {
+    let tmp = TempDir::new("rollback-missing");
+    let exe = tmp.path.join("rsrpc-cli");
+    std::fs::write(&exe, b"v1").expect("write");
+
+    assert!(swap_back(&exe, &prev_path(&exe)).is_err());
+    // The running image is untouched by the failed attempt.
+    assert_eq!(std::fs::read(&exe).expect("read"), b"v1");
   }
 }
