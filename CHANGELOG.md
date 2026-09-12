@@ -18,7 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   officially lossy), so silent drops surface as debug gap lines plus a
   counter. Generic across topologies (wrapping-aware, re-anchors on
   counter restarts) and self-neutralizing where counter semantics do
-  not hold.
+  not hold. The self-test also reports timeout-vs-fatal breakdown and
+  whether the subscribe ACK arrived, so the next silent window names
+  its mechanism instead of just its symptom.
 
 ### Added
 - One-liner install (`scripts/install.sh`, Linux/systemd): arch

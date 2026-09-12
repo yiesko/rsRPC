@@ -1193,7 +1193,8 @@ fn self_test_report_distinguishes_silence_from_drift() {
   assert!(
     SelfTestReport {
       datagrams: 3,
-      parsed: 1
+      parsed: 1,
+      ..SelfTestReport::default()
     }
     .live()
   );
@@ -1201,7 +1202,8 @@ fn self_test_report_distinguishes_silence_from_drift() {
   assert!(
     !SelfTestReport {
       datagrams: 9,
-      parsed: 0
+      parsed: 0,
+      ..SelfTestReport::default()
     }
     .live()
   );

@@ -237,9 +237,11 @@ impl SeqTracker {
 
 /// Subscribe a netlink connector socket to `cn_proc` broadcasts: socket,
 /// bind (kernel-assigned pid, group member), framed LISTEN request, then
-/// read the kernel's ACK. Returns the fd, or a message when the kernel
-/// refuses (caller falls back to polling).
-fn subscribe() -> Result<i32, String> {
+/// read the kernel's ACK. Returns the fd plus whether any ack datagram
+/// arrived (an ACK proves the LISTEN registered; its absence with later
+/// silence points at registration, not traffic), or a message when the
+/// kernel refuses (caller falls back to polling).
+fn subscribe() -> Result<(i32, bool), String> {
   // SAFETY: socket/bind/sendmsg/recv/close are called with valid
   // arguments; the fd is closed by the caller on every path (see `watch`).
   let fd = unsafe {
@@ -332,7 +334,9 @@ fn subscribe() -> Result<i32, String> {
   set_recv_timeout(fd, Some(std::time::Duration::from_secs(2)));
   let mut ack = [0u8; 4096];
   let received = unsafe { libc::recv(fd, ack.as_mut_ptr() as *mut libc::c_void, ack.len(), 0) };
+  let mut ack_seen = false;
   if received > 0 {
+    ack_seen = true;
     // A nonzero ERROR code refuses us; anything else (zero-ack, an early
     // event that won the race) means proceed.
     let ack = &ack[..received as usize];
@@ -354,7 +358,7 @@ fn subscribe() -> Result<i32, String> {
       }
     }
   }
-  Ok(fd)
+  Ok((fd, ack_seen))
 }
 
 fn last_os_error() -> String {
@@ -397,6 +401,11 @@ fn set_recv_timeout(fd: i32, timeout: Option<std::time::Duration>) {
 pub(crate) struct SelfTestReport {
   pub datagrams: u32,
   pub parsed: u32,
+  /// Recvs that timed out (EAGAIN) — silence, not failure.
+  pub timeouts: u32,
+  /// First fatal recv errno, if any (anything but timeout/interrupt).
+  /// Distinguishes a deaf socket (timeouts only) from a broken one.
+  pub fatal_errno: Option<i32>,
 }
 
 impl SelfTestReport {
@@ -446,8 +455,14 @@ fn self_test(fd: i32) -> SelfTestReport {
           break;
         }
         match err.kind() {
-          std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => continue,
-          _ => break,
+          std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => {
+            report.timeouts += 1;
+            continue;
+          }
+          _ => {
+            report.fatal_errno = report.fatal_errno.or(err.raw_os_error());
+            break;
+          }
         }
       }
       report.datagrams += 1;
@@ -467,15 +482,24 @@ fn self_test(fd: i32) -> SelfTestReport {
 /// Returns only on receive errors (the caller logs once and keeps
 /// polling); the fd is closed on the way out.
 pub(crate) fn watch(events: mpsc::Sender<ProcEvent>) -> Result<(), String> {
-  let fd = subscribe()?;
+  let (fd, ack_seen) = subscribe()?;
   let report = self_test(fd);
   if !report.live() {
     unsafe {
       libc::close(fd);
     }
+    let ack = if ack_seen {
+      "subscribe acked"
+    } else {
+      "no subscribe ack"
+    };
+    let fatal = report.fatal_errno.map_or_else(
+      || "none".to_string(),
+      |errno| std::io::Error::from_raw_os_error(errno).to_string(),
+    );
     return Err(format!(
-      "self-test saw {} datagram(s), {} parsed in ~10s (kernel silent or framing drift?)",
-      report.datagrams, report.parsed
+      "self-test saw {} datagram(s), {} parsed, {} timeouts, fatal errno {} in ~10s ({})",
+      report.datagrams, report.parsed, report.timeouts, fatal, ack
     ));
   }
   log!("[Process Scanner] proc-events watcher live (netlink cn_proc)");
