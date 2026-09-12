@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Proc-events watcher resubscribes instead of dying on one failed
+  self-test: a transient kernel stall no longer pins polling until the
+  next daemon restart (first failure still warns, later retries stay in
+  debug). The self-test now reports datagram/parsed counts, telling a
+  silent kernel apart from framing drift in the log line.
+
 ### Added
 - One-liner install (`scripts/install.sh`, Linux/systemd): arch
   detection, newest-release download with SHA256 (+ minisign when

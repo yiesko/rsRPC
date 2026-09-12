@@ -285,12 +285,33 @@ fn set_recv_timeout(fd: i32, timeout: Option<std::time::Duration>) {
   }
 }
 
+/// What the boot self-test observed. `live()` decides the watcher:
+///
+/// - `parsed > 0`: delivery proven (any EXEC/EXIT, need not be ours).
+/// - `datagrams > 0, parsed == 0`: the kernel talks but nothing parses
+///   (framing drift — a parser bug, reportable with these counts).
+/// - zeros: the kernel is silent for this socket (transient stall or a
+///   filtering kernel/LSM — retryable, see the caller).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SelfTestReport {
+  pub datagrams: u32,
+  pub parsed: u32,
+}
+
+impl SelfTestReport {
+  /// Delivery is proven only by a successfully parsed event.
+  #[must_use]
+  pub fn live(self) -> bool {
+    self.parsed > 0
+  }
+}
+
 /// Prove the subscription actually delivers: spawn a trivial child (its
 /// exec postdates our subscribe) and wait up to a second for ANY valid
 /// proc event. Some kernels/LSMs accept the LISTEN message yet deliver
 /// nothing — without this check the watcher would idle forever claiming
 /// to be live while polling does all the work unnoticed.
-fn self_test(fd: i32) -> bool {
+fn self_test(fd: i32) -> SelfTestReport {
   // Bound every recv below: without this, a silently non-delivering
   // kernel hangs the watcher thread forever with zero logs.
   set_recv_timeout(fd, Some(std::time::Duration::from_secs(1)));
@@ -300,14 +321,14 @@ fn self_test(fd: i32) -> bool {
   let Some(probe) = probe else {
     // Nowhere to probe with: fall back to polling (safe direction) —
     // claiming live without proof hid real outages before.
-    return false;
+    return SelfTestReport::default();
   };
   // The child must be spawned after our subscribe (its exec postdates
   // it) and reaped whatever happens next.
   let mut child = std::process::Command::new(probe).spawn().ok();
-  let live = if child.is_some() {
+  let mut report = SelfTestReport::default();
+  if child.is_some() {
     let mut buf = [0u8; 65536];
-    let mut seen = false;
     // Up to ~10s total (socket timeout bounds each recv): first valid
     // event proves delivery — it need not be ours, any exec on a live
     // desktop arrives within milliseconds.
@@ -319,7 +340,8 @@ fn self_test(fd: i32) -> bool {
         // drain) — that alone proves liveness. Anything else aborts.
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::ENOBUFS) {
-          seen = true;
+          report.datagrams += 1;
+          report.parsed += 1;
           break;
         }
         match err.kind() {
@@ -327,20 +349,17 @@ fn self_test(fd: i32) -> bool {
           _ => break,
         }
       }
+      report.datagrams += 1;
       if parse_event(&buf[..received as usize]).is_some() {
-        seen = true;
+        report.parsed += 1;
         break;
       }
     }
-    seen
-  } else {
-    // Spawn failed: unproven, fall back to polling (safe direction).
-    false
-  };
+  }
   if let Some(mut child) = child.take() {
     let _ = child.wait();
   }
-  live
+  report
 }
 
 /// Block on `cn_proc` broadcasts forever, forwarding lifecycle events.
@@ -348,11 +367,15 @@ fn self_test(fd: i32) -> bool {
 /// polling); the fd is closed on the way out.
 pub(crate) fn watch(events: mpsc::Sender<ProcEvent>) -> Result<(), String> {
   let fd = subscribe()?;
-  if !self_test(fd) {
+  let report = self_test(fd);
+  if !report.live() {
     unsafe {
       libc::close(fd);
     }
-    return Err("self-test got no exec event (kernel/LSM/caps silently drop cn_proc?)".to_string());
+    return Err(format!(
+      "self-test saw {} datagram(s), {} parsed in ~10s (kernel silent or framing drift?)",
+      report.datagrams, report.parsed
+    ));
   }
   log!("[Process Scanner] proc-events watcher live (netlink cn_proc)");
   // Back to blocking: the self-test's timeout was temporary.

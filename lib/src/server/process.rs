@@ -1257,11 +1257,30 @@ fn spawn_proc_watcher(server: &ProcessServer) {
       }
     }
   });
+  // Best-effort watcher with periodic resubscribe: a failed self-test
+  // (or a mid-run socket death) falls back to polling, but a transient
+  // kernel stall must not pin polling until the next daemon restart —
+  // delivery has been observed to resume on its own. First failure warns
+  // (the documented sandbox diagnosis), later ones stay in debug so
+  // genuinely unsupported systems do not log every 5 minutes forever.
+  // A sleeping retry never delays shutdown: process exit does not wait
+  // for this thread.
   std::thread::spawn(move || {
-    if let Err(err) = watch(tx) {
-      // Honest by design (and CHANGELOG-promised): this exact line is
-      // how operators diagnose sandboxing that blocks AF_NETLINK.
-      warn!("[Process Scanner] proc-events unavailable ({err}), polling only");
+    let mut attempts = 0u32;
+    loop {
+      match watch(tx.clone()) {
+        // Receiver gone: daemon shutting down.
+        Ok(()) => break,
+        Err(err) => {
+          attempts = attempts.saturating_add(1);
+          if attempts == 1 {
+            warn!("[Process Scanner] proc-events unavailable ({err}), polling only; retrying");
+          } else {
+            debug!("[Process Scanner] proc-events still unavailable ({err}), polling only");
+          }
+          std::thread::sleep(std::time::Duration::from_secs(5 * 60));
+        }
+      }
     }
   });
 }

@@ -1185,6 +1185,31 @@ fn proc_event_parses_exec_and_exit() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn self_test_report_distinguishes_silence_from_drift() {
+  use crate::server::proc_events::SelfTestReport;
+
+  // Proven delivery: any parsed event counts.
+  assert!(
+    SelfTestReport {
+      datagrams: 3,
+      parsed: 1
+    }
+    .live()
+  );
+  // Kernel talks but nothing parses: framing drift, not liveness.
+  assert!(
+    !SelfTestReport {
+      datagrams: 9,
+      parsed: 0
+    }
+    .live()
+  );
+  // Kernel silent: retryable stall, not proof of anything.
+  assert!(!SelfTestReport::default().live());
+}
+
+#[test]
 fn vdf_rejects_nesting_attacks_and_truncation() {
   use crate::server::steam::parse_vdf_str;
 
